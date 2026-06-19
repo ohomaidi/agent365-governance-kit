@@ -12,3 +12,9 @@ dist/
 # .NET build output
 packages/dotnet/bin/
 packages/dotnet/obj/
+
+# Python build artifacts
+__pycache__/
+*.pyc
+packages/python/build/
+packages/python/*.egg-info/
