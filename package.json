@@ -1,56 +1,19 @@
 {
-  "name": "@zaatarlabs/agent365-governance-kit",
+  "name": "agent365-governance-kit",
   "version": "0.1.0",
-  "description": "Drop-in Microsoft governance for any custom AI agent: a Purview DLP/audit guard plus Agent 365 agentic identity + observability wiring, with an auto-provisioning setup wizard.",
+  "private": true,
+  "description": "Drop-in Microsoft Purview + Agent 365 governance for custom AI agents (Node, Python, .NET), with an auto-provisioning setup wizard.",
   "type": "module",
   "bin": {
-    "agent365-govern": "bin/agent365-govern.mjs"
+    "agent365-govern": "wizard/agent365-govern.mjs"
   },
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "exports": {
-    ".": "./dist/index.js",
-    "./purview": "./dist/purview.js",
-    "./observability": "./dist/observability.js",
-    "./agentic": "./dist/agentic.js"
-  },
-  "files": [
-    "dist",
-    "bin",
-    "templates",
-    "README.md"
-  ],
   "scripts": {
-    "build": "tsc",
-    "init": "node bin/agent365-govern.mjs"
+    "init": "node wizard/agent365-govern.mjs"
   },
-  "keywords": [
-    "microsoft",
-    "purview",
-    "agent365",
-    "dlp",
-    "governance",
-    "ai-agent",
-    "claude"
+  "workspaces": [
+    "packages/typescript"
   ],
+  "keywords": ["microsoft", "purview", "agent365", "dlp", "governance", "ai-agent"],
   "license": "UNLICENSED",
-  "peerDependencies": {
-    "@microsoft/agents-hosting": "^1.5.3",
-    "@microsoft/opentelemetry": "^1.1.0"
-  },
-  "peerDependenciesMeta": {
-    "@microsoft/agents-hosting": {
-      "optional": true
-    },
-    "@microsoft/opentelemetry": {
-      "optional": true
-    }
-  },
-  "devDependencies": {
-    "@types/node": "^26.0.0",
-    "typescript": "^5.9.3"
-  },
-  "engines": {
-    "node": ">=18"
-  }
+  "engines": { "node": ">=18" }
 }

@@ -68,6 +68,7 @@ async function main() {
   const purviewAppName = await ask("App name to show in Purview audit/DSPM:", "Custom AI App");
   const attribUpn = await ask("User to attribute interactions to (UPN):", acct.user.name);
   const envPath = await ask("Path to your agent's .env to write:", join(process.cwd(), ".env"));
+  const lang = (await ask("Your agent's language (typescript / python / dotnet):", "typescript")).toLowerCase();
   const wantCreditCard = await yes("Create a DLP rule blocking Credit Card Numbers?");
   const customSitTerms = (await ask("Extra block keywords (comma-separated, e.g. salary,compensation) or blank:", "")).split(",").map((s) => s.trim()).filter(Boolean);
   const failClosed = await yes("Fail CLOSED (block when Purview is unreachable)?", false);
@@ -182,11 +183,87 @@ async function main() {
   } catch (e) { warn("Validation call failed (often just propagation): " + (e.message || e)); }
 
   rl.close();
-  console.log(`\n${C.g}${C.b}Done.${C.reset} Integrate with two calls — see the README:\n`);
-  console.log(`  ${C.d}const guard = createPurviewGuard(loadConfig().purview);`);
-  console.log(`  const v = await guard.evaluate(prompt, "uploadText", { correlationId });`);
-  console.log(`  if (v.blocked) return v.reason;   // else call your model${C.reset}\n`);
-  console.log(`  ${C.y}Note:${C.reset} DLP policies take up to ~1h to propagate before blocks fire.`);
+
+  // ---- integration snippet (per language) ----
+  console.log(`\n${C.g}${C.b}Purview governance is set up.${C.reset} Add these two calls to your agent:\n`);
+  console.log(C.d + integrationSnippet(lang) + C.reset);
+  console.log(`  ${C.y}Note:${C.reset} DLP policies take up to ~1h to propagate before blocks fire.\n`);
+
+  // ---- Agent 365 manual completion steps ----
+  if (wantObservability) {
+    const checklist = agent365Checklist({ agentName: agentName || purviewAppName, lang, blueprintId });
+    const setupPath = join(envPath.replace(/[^/\\]*$/, ""), "AGENT365_SETUP.md");
+    try { writeFileSync(setupPath, checklist); ok(`Agent 365 completion steps written to ${setupPath}`); }
+    catch { /* non-fatal */ }
+    console.log(`\n${C.b}${C.y}Agent 365 still needs these MANUAL admin steps (the wizard can't do them):${C.reset}`);
+    console.log(`  1. Create the manifest:  a365 publish --aiteammate --agent-name "${agentName || purviewAppName}"`);
+    console.log(`  2. Upload it: M365 admin center -> Integrated apps -> Upload custom apps (needs admin + Frontier)`);
+    console.log(`  3. Create the agent instance; note its live instance id`);
+    console.log(`  4. Assign the Agent 365 Frontier license to the agent's owner`);
+    console.log(`  5. Wire observability in code (Node/.NET) — see AGENT365_SETUP.md`);
+    console.log(`  6. Verify in admin center -> your agent -> Activity tab\n`);
+    console.log(`  ${C.d}Full details: AGENT365_SETUP.md${C.reset}`);
+  }
+}
+
+function integrationSnippet(lang) {
+  if (lang.startsWith("py")) {
+    return [
+      "  from agent365_governance import load_config, PurviewGuard",
+      "  guard = PurviewGuard(load_config())",
+      "  if guard.evaluate(prompt, 'uploadText', correlation_id=cid).blocked:",
+      "      return 'blocked'          # else call your model",
+    ].join("\n");
+  }
+  if (lang.startsWith("dot") || lang.startsWith("c#") || lang.startsWith("cs") || lang.startsWith("net")) {
+    return [
+      "  var guard = new PurviewGuard(PurviewConfig.FromEnvironment());",
+      "  var v = await guard.EvaluateAsync(prompt, \"uploadText\", correlationId: cid);",
+      "  if (v.Blocked) return v.Reason;   // else call your model",
+    ].join("\n");
+  }
+  return [
+    "  import { loadConfig, createPurviewGuard } from \"@zaatarlabs/agent365-governance-kit\";",
+    "  const guard = createPurviewGuard(loadConfig().purview);",
+    "  const v = await guard.evaluate(prompt, \"uploadText\", { correlationId: cid });",
+    "  if (v.blocked) return v.reason;   // else call your model",
+  ].join("\n");
+}
+
+function agent365Checklist({ agentName, lang, blueprintId }) {
+  const obsNote = lang.startsWith("py")
+    ? "Observability (Activity tab) for Python is preview — use the Node or .NET package for it, or skip."
+    : "Wire observability with initObservability() + refreshTurnObservability() + withAgentScope() (see the package README).";
+  return `# Completing Agent 365 setup for "${agentName}"
+
+The wizard provisioned Purview. These admin steps finish the Agent 365 onboarding
+(only needed for Agent 365 identity + the admin-center Activity tab):
+
+1. Create the manifest:
+     dotnet tool install -g Microsoft.Agents.A365.DevTools.Cli
+     a365 publish --aiteammate --agent-name "${agentName}"
+   (or use the Microsoft 365 Agents Toolkit VS Code extension). Keep
+   description.short <= 80 chars.
+
+2. Upload the manifest (admin):
+     M365 admin center -> Integrated apps -> Upload custom apps -> manifest.zip
+   Requires a Global/Teams admin AND Agent 365 Frontier on the tenant.
+
+3. Create the agent instance and note its LIVE INSTANCE ID (observability
+   authorizes by the instance id, not the blueprint id${blueprintId ? ` ${blueprintId}` : ""}).
+
+4. Assign the Agent 365 Frontier license to the agent's owner/user.
+   (Upload + instance creation fail without it.)
+
+5. Wire observability in code. ${obsNote}
+   The OBO token is minted per AUTHENTICATED turn — only Teams/Copilot turns
+   appear in the Activity tab. Off-channel surfaces are governed by Purview but
+   won't show there.
+
+6. Verify: message the agent in Teams, then check
+     admin center -> your agent -> Activity tab.
+   Multiple instances each have their own Activity tab — consolidate to one.
+`;
 }
 
 function buildProvisionScript({ appId, org, pfx, pfxPw, purviewAppName, wantCreditCard, customSitTerms, work }) {

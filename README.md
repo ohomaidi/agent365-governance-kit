@@ -1,115 +1,79 @@
 # Agent 365 Governance Kit
 
-Drop-in **Microsoft governance for any custom AI agent** — Claude, OpenAI, anything. Two layers:
+Drop-in **Microsoft governance for any custom AI agent** — in **TypeScript/Node, Python, and .NET**. Two layers:
 
-- **Purview guard** — runs every prompt and reply through Microsoft Purview (Graph `processContent`) so they're audited, classified, captured for DSPM-for-AI, and **blocked inline** by your DLP policies. Works on *any* channel, including non-Microsoft surfaces (web portals, APIs).
-- **Agent 365 identity + observability** — wiring so a registered agent's authenticated turns light up the admin-center **Activity tab**.
+- **Purview guard** — runs every prompt and reply through Microsoft Purview (Graph `processContent`) so they're audited, classified, captured for DSPM-for-AI, and **blocked inline** by your DLP policies. Works on *any* channel, including non-Microsoft surfaces (web portals, APIs). Available in all three languages.
+- **Agent 365 identity + observability** — wiring so a registered agent's authenticated turns light up the admin-center **Activity tab**. Node + .NET (the languages with a Microsoft Agents SDK).
 
-A setup **wizard** provisions the whole Microsoft side for you after a tenant admin signs in.
+A one-time **wizard** provisions the whole Microsoft side after a tenant admin signs in, then writes your config and prints the remaining manual Agent 365 steps.
+
+```
+agent365-governance-kit/
+├── wizard/              # shared setup wizard (Node CLI) — provisions any tenant
+├── packages/
+│   ├── typescript/      # @zaatarlabs/agent365-governance-kit  (Purview + Agent 365)
+│   ├── python/          # agent365-governance-kit              (Purview)
+│   └── dotnet/          # ZaatarLabs.Agent365.Governance       (Purview)
+├── AGENT365_SETUP.md    # manual onboarding steps the wizard can't automate
+└── README.md
+```
 
 ---
 
-## Run from source (this repo)
+## 1. Provision (one time, tenant admin)
 
-Not yet published to npm — clone and build:
-
-```bash
-git clone https://github.com/ohomaidi/agent365-governance-kit.git
-cd agent365-governance-kit
-npm install          # installs typescript + @types/node
-npm run build        # compiles src/ -> dist/
-npm run init         # launches the setup wizard (same as: node bin/agent365-govern.mjs)
-```
-
-The wizard needs **Azure CLI** (`az`), **PowerShell 7** (`pwsh`), and **openssl** on PATH, and you must sign in as a tenant **Global Admin** when prompted.
-
-## 1. Install (once published)
+From the repo root:
 
 ```bash
-npm install @zaatarlabs/agent365-governance-kit
+node wizard/agent365-govern.mjs      # or: npm run init  /  npx agent365-govern
 ```
 
-## 2. Provision (one time, tenant admin)
-
-```bash
-npx agent365-govern        # or: node bin/agent365-govern.mjs
-```
-
-The wizard signs you in (`az login` as Global Admin) and then:
+The wizard signs you in (`az login` as Global Admin), asks for your variables and your agent's language, then:
 
 1. creates a dedicated app registration + secret + certificate,
 2. grants `Content.Process.All`, `ProtectionScopes.Compute.All`, `Exchange.ManageAsApp`,
 3. assigns the **Compliance Administrator** role,
 4. creates a DLP policy + rules (Credit Card and/or your custom keywords) and a DSPM collection policy,
 5. writes all `PURVIEW_*` (and optional `agent365Observability__*`) values into your app's `.env`,
-6. runs a live validation call.
+6. runs a live validation call,
+7. prints the integration snippet for your language **and the manual Agent 365 steps** (also saved to `AGENT365_SETUP.md`).
+
+**Requirements:** Azure CLI (`az`), PowerShell 7 (`pwsh`), `openssl`, and a tenant **Global Admin**.
 
 > **Why a dedicated app, not your agent's identity?** Agentic identities can't mint app-only tokens (`AADSTS82001`). The guard uses a normal app registration with app-only client credentials.
 
-**Requirements:** Azure CLI (`az`), PowerShell 7 (`pwsh`), `openssl`, and a tenant **Global Admin** to run the wizard.
+## 2. Integrate (two calls)
 
-## 3. Integrate (two calls)
+Pick your language — full instructions in each package README:
 
-```ts
-import { loadConfig, createPurviewGuard } from "@zaatarlabs/agent365-governance-kit";
+| Language | Package | Integration |
+|---|---|---|
+| TypeScript / Node | [`packages/typescript`](packages/typescript/README.md) | `guard.evaluate(text, "uploadText", { correlationId })` |
+| Python | [`packages/python`](packages/python/README.md) | `guard.evaluate(text, "uploadText", correlation_id=cid)` |
+| .NET | [`packages/dotnet`](packages/dotnet/README.md) | `await guard.EvaluateAsync(text, "uploadText", correlationId: cid)` |
 
-const guard = createPurviewGuard(loadConfig().purview);
+The pattern is the same everywhere:
 
-async function handleTurn(userPrompt: string, conversationId: string) {
-  // 1) govern the inbound prompt — block before the model sees it
-  const inbound = await guard.evaluate(userPrompt, "uploadText", { correlationId: conversationId, sequenceNumber: 0 });
-  if (inbound.blocked) return inbound.reason;
-
-  const reply = await yourModel(userPrompt);   // Claude, OpenAI, anything
-
-  // 2) govern the outbound reply
-  const outbound = await guard.evaluate(reply, "downloadText", { correlationId: conversationId, sequenceNumber: 1 });
-  if (outbound.blocked) return outbound.reason;
-
-  return reply;
-}
+```
+inbound = guard.evaluate(prompt, "uploadText")   # block before the model sees it
+if inbound.blocked: return inbound.reason
+reply = yourModel(prompt)                          # Claude, OpenAI, anything
+outbound = guard.evaluate(reply, "downloadText")  # block before returning
+if outbound.blocked: return outbound.reason
+return reply
 ```
 
-That's it. `guard.evaluate()` returns `{ blocked, reason, evaluated }`.
+## 3. Finish Agent 365 onboarding (if you want the Activity tab)
 
-### Agent 365 observability (optional)
-
-For an agent registered in Agent 365 (extends `AgentApplication`):
-
-```ts
-import { initObservability, agenticAuthorization, refreshTurnObservability, withAgentScope } from "@zaatarlabs/agent365-governance-kit";
-
-await initObservability(loadConfig().observability);   // at startup
-
-// in the AgentApplication constructor:
-//   authorization: agenticAuthorization(["https://graph.microsoft.com/.default"])
-
-// in the turn handler:
-const details = { agentId, agentName, tenantId };
-await refreshTurnObservability(context, this.authorization, details);
-await withAgentScope(context, details, { host: "localhost", port: 3978 }, async () => {
-  // ... handle the turn ...
-});
-```
+The wizard provisions Purview but **cannot** upload a manifest or assign licenses. Those admin steps — create/upload manifest, create instance, assign **Frontier**, wire observability — are in **[AGENT365_SETUP.md](AGENT365_SETUP.md)** (the wizard also writes a copy next to your `.env`).
 
 ---
-
-## Configuration (written by the wizard)
-
-| Variable | Meaning |
-|---|---|
-| `PURVIEW_ENABLED` | turn the guard on/off |
-| `PURVIEW_TENANT_ID` | Entra tenant id |
-| `PURVIEW_CLIENT_ID` / `PURVIEW_CLIENT_SECRET` | the connector app credentials |
-| `PURVIEW_APP_LOCATION` | the Entra app id the DLP policy is scoped to (= client id) |
-| `PURVIEW_USER_ID` | Entra object id every interaction is attributed to |
-| `PURVIEW_APP_NAME` | name shown in Purview audit/DSPM |
-| `PURVIEW_FAIL_CLOSED` | `true` = block when Purview is unreachable; `false` = allow |
 
 ## Notes & limits
 
 - **Block direction:** the Application enforcement plane blocks **UploadText** (the prompt), not the model's response. Govern by blocking the *question*.
 - **Propagation:** new DLP policies can take up to ~1 hour to start enforcing.
-- **Per-user scoping:** the managed-app plane doesn't accept user/group scoping via PowerShell; scope in the Purview portal if needed. By default the policy applies tenant-wide, but only your attributed user flows through the app.
+- **Per-user scoping:** the managed-app plane doesn't accept user/group scoping via PowerShell; scope in the Purview portal if needed.
 - **Billing:** Purview API calls for custom apps are metered (pay-as-you-go on the Azure subscription).
 - **PowerShell:** the wizard pins ExchangeOnlineManagement `3.5.1` (newer 3.10.x throws on PowerShell 7.6).
+- **Verified:** the Purview guard is live-tested against a real tenant in all three languages (credit-card + salary prompts blocked, benign allowed).

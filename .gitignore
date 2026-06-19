@@ -8,3 +8,7 @@ dist/
 *.pfx
 *.pem
 *.key
+
+# .NET build output
+packages/dotnet/bin/
+packages/dotnet/obj/
