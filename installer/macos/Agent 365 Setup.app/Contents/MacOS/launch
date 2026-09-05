@@ -1,0 +1,37 @@
+#!/bin/bash
+# Agent 365 Governance Kit — macOS launcher.
+# Double-clicked by the customer. Finds Node, starts the local setup server, and
+# opens the browser. LSUIElement keeps it out of the Dock and off the screen.
+set -u
+
+dialog() { osascript -e "display dialog \"$1\" with title \"Agent 365 Setup\" buttons {\"$2\",\"$3\"} default button \"$3\"" 2>/dev/null; }
+alert()  { osascript -e "display alert \"Agent 365 Setup\" message \"$1\" as critical" >/dev/null 2>&1; }
+
+# The app bundle sits at installer/macos/, so the kit root is three levels up.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../../../../.." && pwd)"
+SERVER="$ROOT/installer/server.mjs"
+
+# Homebrew and nvm aren't on a GUI app's PATH.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+[ -s "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh" >/dev/null 2>&1
+
+if ! command -v node >/dev/null 2>&1; then
+  if dialog "Node.js is required and was not found.\n\nOpen the download page?" "Cancel" "Download" | grep -q Download; then
+    open "https://nodejs.org/en/download"
+  fi
+  exit 1
+fi
+
+MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+if [ "$MAJOR" -lt 18 ]; then
+  alert "Node.js 18 or newer is required. Found $(node -v)."
+  exit 1
+fi
+
+if [ ! -f "$SERVER" ]; then
+  alert "Could not find the kit. Keep this app inside the agent365-governance-kit folder."
+  exit 1
+fi
+
+exec node "$SERVER"

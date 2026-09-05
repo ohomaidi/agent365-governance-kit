@@ -38,13 +38,31 @@ production agent. Its defaults are chosen so that a mistake fails safe:
 Every HTTP call is bounded by a timeout and retries throttling (429) and transient
 5xx with backoff. Client secrets are redacted from all log output.
 
-## 0. Rehearse (recommended before any customer run)
+## 0. No terminal? Double-click instead
+
+| Platform | Double-click |
+|---|---|
+| macOS | `installer/macos/Agent 365 Setup.app` |
+| Windows | `installer/windows/Agent 365 Setup.vbs` |
+
+Checks prerequisites, signs you in, and runs the whole thing from a browser
+form with a live log. It drives the same CLI wizard underneath via `--answers`,
+so there is no second implementation to drift. See
+[`installer/README.md`](installer/README.md).
+
+## 0b. Rehearse (recommended before any customer run)
 
 ```bash
 node wizard/agent365-govern.mjs --dry-run     # or: npm run plan
 ```
 
 Walks the full interview and prints exactly what **would** be created. Mutates nothing.
+
+For a reproducible run, supply every answer up front:
+
+```bash
+node wizard/agent365-govern.mjs --answers answers.json --dry-run
+```
 
 ## 1. Provision (one time, tenant admin)
 
@@ -146,9 +164,10 @@ npm run test:all       # TypeScript + wizard + Python + .NET
 | TypeScript | 20 | defaults, misconfiguration, verdicts, retries, timeouts, caching, payload, redaction |
 | Python | 19 | same behaviours, mirrored |
 | .NET | 18 | same behaviours, mirrored |
-| Wizard | 17 | quoting/injection, `.env` replacement, policy mode + scope, secret handling |
+| Wizard | 40 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 payloads and call ordering |
+| Proxy | 20 | enforcement, protocol-shaped refusals, attribution, health |
 
-CI runs all four on every push ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+CI runs all of them on every push ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 ## Notes & limits
 

@@ -40,9 +40,26 @@ const ROLE_EXCHANGE_MANAGE = "dc50a0fb-09a3-484d-be87-e023b12c6440"; // Exchange
 const ROLE_COMPLIANCE_ADMIN = "17315797-102d-40b4-93e0-432062caca18"; // Compliance Administrator
 const EXO_MODULE_VERSION = "3.5.1"; // 3.10.x throws NullRef on PowerShell 7.6
 
+const IS_WINDOWS = process.platform === "win32";
 const DRY_RUN = argv.includes("--dry-run") || argv.includes("-n");
 
-const C = { reset: "\x1b[0m", b: "\x1b[1m", g: "\x1b[32m", y: "\x1b[33m", r: "\x1b[31m", d: "\x1b[2m", c: "\x1b[36m" };
+/**
+ * Non-interactive mode: `--answers file.json` supplies every response by key.
+ * The browser installer drives the wizard this way, and it makes repeat test
+ * runs reproducible instead of depending on prompt ordering.
+ */
+const ANSWERS_PATH = (() => {
+  const i = argv.indexOf("--answers");
+  return i > -1 && argv[i + 1] ? argv[i + 1] : "";
+})();
+const ANSWERS = ANSWERS_PATH ? JSON.parse(readFileSync(ANSWERS_PATH, "utf8")) : null;
+
+// Colour only when a human is watching a terminal. Piped output (the browser
+// installer, CI logs, a file) gets clean text instead of escape codes.
+const USE_COLOR = Boolean(stdout.isTTY) && !procEnv.NO_COLOR && procEnv.FORCE_COLOR !== "0";
+const C = USE_COLOR
+  ? { reset: "\x1b[0m", b: "\x1b[1m", g: "\x1b[32m", y: "\x1b[33m", r: "\x1b[31m", d: "\x1b[2m", c: "\x1b[36m" }
+  : { reset: "", b: "", g: "", y: "", r: "", d: "", c: "" };
 const ok = (m) => console.log(`${C.g}✓${C.reset} ${m}`);
 const info = (m) => console.log(`${C.d}·${C.reset} ${m}`);
 const warn = (m) => console.log(`${C.y}!${C.reset} ${m}`);
@@ -135,7 +152,9 @@ async function main(work) {
   // ---- preflight ----
   try { sh("az", ["version", "-o", "none"]); } catch { die("Azure CLI (az) not found. Install it and run `az login` as a Global Admin."); }
   try { sh("pwsh", ["-NoProfile", "-Command", "$null"]); } catch { die("PowerShell 7 (pwsh) not found. Install it (brew install powershell)."); }
-  try { sh("openssl", ["version"]); } catch { die("openssl not found."); }
+  if (!IS_WINDOWS) {
+    try { sh("openssl", ["version"]); } catch { die("openssl not found."); }
+  }
 
   // The provisioning script installs a module from the PowerShell Gallery.
   // Locked-down customer machines often block it — find out now, not 10 minutes in.
@@ -160,9 +179,9 @@ async function main(work) {
 
   // Interactive on a TTY; otherwise answers are read from stdin up front so a
   // scripted --dry-run works and a short input aborts instead of hanging forever.
-  const interactive = Boolean(stdin.isTTY);
-  const rl = interactive ? createInterface({ input: stdin, output: stdout }) : null;
-  const scripted = interactive ? null : readFileSync(0, "utf8").split("\n");
+  const interactive = Boolean(stdin.isTTY) || Boolean(ANSWERS);
+  const rl = (interactive && !ANSWERS) ? createInterface({ input: stdin, output: stdout }) : null;
+  const scripted = (interactive || ANSWERS) ? null : readFileSync(0, "utf8").split("\n");
   let scriptIdx = 0;
 
   const outOfInput = () => {
@@ -172,8 +191,14 @@ async function main(work) {
     process.exit(1);
   };
 
-  const ask = async (q, dflt) => {
+  const ask = async (q, dflt, key) => {
     const promptText = `${C.b}?${C.reset} ${q}${dflt ? ` ${C.d}[${dflt}]${C.reset}` : ""} `;
+    // Answers file wins when it names this question.
+    if (ANSWERS && key && Object.prototype.hasOwnProperty.call(ANSWERS, key)) {
+      const v = String(ANSWERS[key] ?? "");
+      stdout.write(promptText + v + "\n");
+      return v.trim() || dflt || "";
+    }
     let a;
     if (scripted) {
       if (scriptIdx >= scripted.length) outOfInput();
@@ -191,36 +216,41 @@ async function main(work) {
     return a.trim() || dflt || "";
   };
   const closeInput = () => rl?.close();
-  const yes = async (q, dflt = true) => /^y/i.test(await ask(`${q} (${dflt ? "Y/n" : "y/N"})`, dflt ? "y" : "n"));
+  const yes = async (q, dflt = true, key) => {
+    if (ANSWERS && key && Object.prototype.hasOwnProperty.call(ANSWERS, key)) {
+      return Boolean(ANSWERS[key]);
+    }
+    return /^y/i.test(await ask(`${q} (${dflt ? "Y/n" : "y/N"})`, dflt ? "y" : "n"));
+  };
 
   // ---- collect variables ----
-  const appRegName = await ask("App registration name for the Purview connector:", "Agent Purview Connector");
-  const purviewAppName = await ask("App name to show in Purview audit/DSPM:", "Custom AI App");
-  const attribUpn = await ask("User to attribute interactions to (UPN):", acct.user.name);
-  const envPath = await ask("Path to your agent's .env to write:", join(process.cwd(), ".env"));
-  const lang = (await ask("Your agent's language (typescript / python / dotnet):", "typescript")).toLowerCase();
+  const appRegName = await ask("App registration name for the Purview connector:", "Agent Purview Connector", "appRegName");
+  const purviewAppName = await ask("App name to show in Purview audit/DSPM:", "Custom AI App", "purviewAppName");
+  const attribUpn = await ask("User to attribute interactions to (UPN):", acct.user.name, "attribUpn");
+  const envPath = await ask("Path to your agent's .env to write:", join(process.cwd(), ".env"), "envPath");
+  const lang = (await ask("Your agent's language (typescript / python / dotnet):", "typescript", "lang")).toLowerCase();
 
   // --- policy scope: pilot group by default, tenant-wide only on purpose ---
   console.log(`\n${C.b}Who should this DLP policy apply to?${C.reset}`);
   console.log(`  ${C.d}1) A pilot group  (recommended — start small, expand later)`);
   console.log(`  2) Specific users`);
   console.log(`  3) Everyone in the tenant  (production-wide)${C.reset}`);
-  const scopeChoice = await ask("Choose 1/2/3:", "1");
+  const scopeChoice = await ask("Choose 1/2/3:", "1", "scopeChoice");
 
   let scopeInclusions, scopeLabel;
   if (scopeChoice === "3") {
     warn("Tenant-wide means EVERY user in this tenant is subject to the policy.");
-    if (!(await yes("Are you sure you want tenant-wide scope?", false))) { closeInput(); die("Aborted — re-run and pick a pilot group."); }
-    if ((await ask(`Type ${C.b}TENANT-WIDE${C.reset} to confirm:`, "")) !== "TENANT-WIDE") { closeInput(); die("Not confirmed. Aborted."); }
+    if (!(await yes("Are you sure you want tenant-wide scope?", false, "confirmTenantWide"))) { closeInput(); die("Aborted — re-run and pick a pilot group."); }
+    if ((await ask(`Type ${C.b}TENANT-WIDE${C.reset} to confirm:`, "", "typeTenantWide")) !== "TENANT-WIDE") { closeInput(); die("Not confirmed. Aborted."); }
     scopeInclusions = [{ Type: "Tenant", Identity: "All" }];
     scopeLabel = "ALL USERS IN TENANT";
   } else if (scopeChoice === "2") {
-    const upns = (await ask("Pilot user UPNs (comma-separated):", attribUpn)).split(",").map((s) => s.trim()).filter(Boolean);
+    const upns = (await ask("Pilot user UPNs (comma-separated):", attribUpn, "pilotUsers")).split(",").map((s) => s.trim()).filter(Boolean);
     if (!upns.length) { closeInput(); die("No users given."); }
     scopeInclusions = upns.map((u) => ({ Type: "User", Identity: u }));
     scopeLabel = `${upns.length} user(s): ${upns.join(", ")}`;
   } else {
-    const grp = await ask("Pilot group email / object id:", "");
+    const grp = await ask("Pilot group email / object id:", "", "pilotGroup");
     if (!grp) { closeInput(); die("A pilot group is required for scope 1. Create one in Entra, or pick option 2 or 3."); }
     if (!DRY_RUN) {
       try { azJson(["ad", "group", "show", "--group", grp, "--query", "id", "-o", "json"]); }
@@ -235,26 +265,26 @@ async function main(work) {
   console.log(`  ${C.d}1) Test with notifications  (recommended — audits and alerts, blocks nothing)`);
   console.log(`  2) Test without notifications  (silent audit only)`);
   console.log(`  3) Enable  (actively BLOCKS matching prompts)${C.reset}`);
-  const modeChoice = await ask("Choose 1/2/3:", "1");
+  const modeChoice = await ask("Choose 1/2/3:", "1", "modeChoice");
   let dlpMode = "TestWithNotifications";
   if (modeChoice === "3") {
     warn("Enable means matching prompts are BLOCKED for everyone in scope, in production.");
-    if (!(await yes("Turn on active blocking now?", false))) { closeInput(); die("Aborted — re-run and choose a test mode."); }
-    if ((await ask(`Type ${C.b}ENFORCE${C.reset} to confirm:`, "")) !== "ENFORCE") { closeInput(); die("Not confirmed. Aborted."); }
+    if (!(await yes("Turn on active blocking now?", false, "confirmEnforce"))) { closeInput(); die("Aborted — re-run and choose a test mode."); }
+    if ((await ask(`Type ${C.b}ENFORCE${C.reset} to confirm:`, "", "typeEnforce")) !== "ENFORCE") { closeInput(); die("Not confirmed. Aborted."); }
     dlpMode = "Enable";
   } else if (modeChoice === "2") dlpMode = "TestWithoutNotifications";
 
-  const wantCreditCard = await yes("Create a DLP rule for Credit Card Numbers?");
-  const customSitTerms = (await ask("Extra block keywords (comma-separated, e.g. salary,compensation) or blank:", "")).split(",").map((s) => s.trim()).filter(Boolean);
-  const failClosed = await yes("Fail CLOSED (block when Purview is unreachable)?", true);
+  const wantCreditCard = await yes("Create a DLP rule for Credit Card Numbers?", true, "wantCreditCard");
+  const customSitTerms = (await ask("Extra block keywords (comma-separated, e.g. salary,compensation) or blank:", "", "customSitTerms")).split(",").map((s) => s.trim()).filter(Boolean);
+  const failClosed = await yes("Fail CLOSED (block when Purview is unreachable)?", true, "failClosed");
 
   // --- DSPM ingestion is a data-residency decision, not a checkbox ---
   console.log(`\n${C.b}DSPM for AI collection policy${C.reset}`);
   console.log(`  ${C.d}Captures prompts and replies so they appear in DSPM for AI and Activity Explorer.`);
   console.log(`  This STORES the full text of user prompts and model responses in Microsoft Purview.`);
   console.log(`  Confirm with the customer's privacy/data-residency owner before enabling.${C.reset}`);
-  const wantDspm = await yes("Create the DSPM collection policy?", true);
-  const dspmIngest = wantDspm ? await yes("  Store full prompt/response content (ingestion)?", false) : false;
+  const wantDspm = await yes("Create the DSPM collection policy?", true, "wantDspm");
+  const dspmIngest = wantDspm ? await yes("  Store full prompt/response content (ingestion)?", false, "dspmIngest") : false;
 
   // --- Agent 365 registration (identity + registry + Activity tab) ---
   console.log(`\n${C.b}Agent 365 registration${C.reset}`);
@@ -262,20 +292,21 @@ async function main(work) {
   console.log(`  Agent 365 registry so admins can see, govern and secure it.`);
   console.log(`  The agent's endpoint may be ANY https URL — including a governance`);
   console.log(`  proxy in front of a third-party agent you cannot modify.${C.reset}`);
-  const wantAgent365 = await yes("Register this agent in Agent 365?", true);
+  const wantAgent365 = await yes("Register this agent in Agent 365?", true, "wantAgent365");
 
   let agentName = "", agentUrl = "", sponsorUpn = "", existingBlueprintId = "", transport = "JSONRPC";
   if (wantAgent365) {
-    agentName = await ask("  Agent display name:", purviewAppName);
-    agentUrl = await ask("  Agent endpoint URL (https):", "");
+    agentName = await ask("  Agent display name:", purviewAppName, "agentName");
+    agentUrl = await ask("  Agent endpoint URL (https):", "", "agentUrl");
     while (wantAgent365 && !/^https:\/\//i.test(agentUrl)) {
       warn("  An https endpoint is required to register an agent instance.");
-      agentUrl = await ask("  Agent endpoint URL (https):", "");
+      agentUrl = await ask("  Agent endpoint URL (https):", "", "agentUrl");
+      if (ANSWERS) die("agentUrl in the answers file is not a valid https URL.");
     }
-    transport = (await ask("  Transport (JSONRPC / HTTP+JSON / GRPC):", "JSONRPC")).toUpperCase()
+    transport = (await ask("  Transport (JSONRPC / HTTP+JSON / GRPC):", "JSONRPC", "transport")).toUpperCase()
       .replace("HTTP+JSON", "HTTP+JSON");
-    sponsorUpn = await ask("  Blueprint sponsor (UPN — required by the API):", acct.user.name);
-    existingBlueprintId = await ask("  Reuse an existing blueprint object id [blank = create new]:", "");
+    sponsorUpn = await ask("  Blueprint sponsor (UPN — required by the API):", acct.user.name, "sponsorUpn");
+    existingBlueprintId = await ask("  Reuse an existing blueprint object id [blank = create new]:", "", "existingBlueprintId");
   }
   const wantObservability = wantAgent365;
 
@@ -284,7 +315,7 @@ async function main(work) {
 
   const revokeAfter = await yes(
     "\nAfter provisioning, revoke the connector's Compliance Administrator + Exchange.ManageAsApp?\n" +
-    `  ${C.d}(Only needed to CREATE policies. Runtime needs neither. Re-grant to change policies later.)${C.reset}`, true);
+    `  ${C.d}(Only needed to CREATE policies. Runtime needs neither. Re-grant to change policies later.)${C.reset}`, true, "revokeAfter");
 
   console.log(`\n${C.b}About to provision in tenant ${tenantId}:${C.reset}`);
   console.log(`  • App registration "${appRegName}" + secret + cert`);
@@ -316,14 +347,14 @@ async function main(work) {
     closeInput();
     return;
   }
-  if (!(await yes("Proceed?"))) { closeInput(); die("Aborted."); }
+  if (!(await yes("Proceed?", true, "proceed"))) { closeInput(); die("Aborted."); }
 
   // ---- 1. app registration + SP + secret ----
   info("Creating app registration…");
   let app = azJson(["ad", "app", "list", "--filter", `displayName eq '${odata(appRegName)}'`, "--query", "[0].{appId:appId,id:id}", "-o", "json"]);
   if (app) {
     warn(`An app registration named "${appRegName}" already exists (${app.appId}) — reusing it and appending a new credential.`);
-    if (!(await yes("  Continue with the existing app?"))) { closeInput(); die("Aborted."); }
+    if (!(await yes("  Continue with the existing app?", true, "reuseExistingApp"))) { closeInput(); die("Aborted."); }
   } else {
     app = azJson(["ad", "app", "create", "--display-name", appRegName, "--sign-in-audience", "AzureADMyOrg", "--query", "{appId:appId,id:id}", "-o", "json"]);
     record(`app registration "${appRegName}" (${app.appId}) — delete with: az ad app delete --id ${app.appId}`);
@@ -357,13 +388,9 @@ async function main(work) {
 
   // ---- 3. cert + Compliance Administrator role ----
   info("Creating certificate and assigning Compliance Administrator…");
-  const certPem = join(work, "cert.pem"), keyPem = join(work, "key.pem"), pfx = join(work, "cert.pfx");
   // Random, high-entropy, and never placed on a command line or in a file.
   const pfxPw = randomBytes(24).toString("base64url");
-  sh("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-keyout", keyPem, "-out", certPem, "-days", "730", "-nodes", "-subj", `/CN=${appRegName.replace(/[^\w .-]/g, "_")}`]);
-  // -passout env: keeps the password out of the process list (ps auxww).
-  sh("openssl", ["pkcs12", "-export", "-out", pfx, "-inkey", keyPem, "-in", certPem, "-passout", "env:A365_PFX_PW"],
-    { env: { ...procEnv, A365_PFX_PW: pfxPw } });
+  const { certPem, pfxPath: pfx } = makeCertificate({ work, subjectName: appRegName, pfxPw });
   const certBody = readFileSync(certPem, "utf8");
   az(["ad", "app", "credential", "reset", "--id", appId, "--cert", certBody, "--append", "--years", "2", "-o", "none"]);
   record(`certificate credential on app ${appId}`);
@@ -437,7 +464,7 @@ async function main(work) {
         const clash = existing.find((i) => i.displayName === agentName);
         if (clash) {
           warn(`  An agent instance named "${agentName}" already exists (${clash.id}).`);
-          if (await yes("  Replace it?", false)) {
+          if (await yes("  Replace it?", false, "replaceInstance")) {
             await azGraph("DELETE", `/agentRegistry/agentInstances/${clash.id}`);
             ok("  removed the previous registration");
           } else {
@@ -583,6 +610,47 @@ async function main(work) {
     }
     console.log(`  ${C.d}Full details: AGENT365_SETUP.md${C.reset}`);
   }
+}
+
+/**
+ * Create the self-signed certificate the Security & Compliance PowerShell
+ * session authenticates with.
+ *
+ * Windows has no openssl, so it uses New-SelfSignedCertificate and exports the
+ * PFX from the user's certificate store (then removes it). POSIX uses openssl.
+ * Either way the password travels through the environment, never a command line.
+ *
+ * @returns {{ certPem: string, pfxPath: string }}
+ */
+export function makeCertificate({ work, subjectName, pfxPw, run = sh }) {
+  const safeSubject = String(subjectName).replace(/[^\w .-]/g, "_");
+  const pfx = join(work, "cert.pfx");
+  const certPem = join(work, "cert.pem");
+
+  if (IS_WINDOWS) {
+    const ps = [
+      "$ErrorActionPreference='Stop'",
+      `$c = New-SelfSignedCertificate -Subject 'CN=${safeSubject}' -CertStoreLocation Cert:\\CurrentUser\\My ` +
+        "-KeyExportPolicy Exportable -KeySpec Signature -KeyLength 2048 -NotAfter (Get-Date).AddDays(730)",
+      "$pw = ConvertTo-SecureString $env:A365_PFX_PW -AsPlainText -Force",
+      `Export-PfxCertificate -Cert $c -FilePath '${pfx}' -Password $pw | Out-Null`,
+      `Export-Certificate -Cert $c -FilePath '${join(work, "cert.cer")}' -Type CERT | Out-Null`,
+      // Hand back the base64 body in the same shape az expects from a PEM.
+      `$b = [Convert]::ToBase64String($c.RawData, 'InsertLineBreaks')`,
+      `Set-Content -Path '${certPem}' -Value ("-----BEGIN CERTIFICATE-----\`n" + $b + "\`n-----END CERTIFICATE-----")`,
+      // Don't leave the private key in the user's personal store.
+      "Remove-Item -Path (Join-Path Cert:\\CurrentUser\\My $c.Thumbprint) -Force",
+    ].join("; ");
+    run("pwsh", ["-NoProfile", "-Command", ps], { env: { ...procEnv, A365_PFX_PW: pfxPw } });
+  } else {
+    const keyPem = join(work, "key.pem");
+    run("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-keyout", keyPem, "-out", certPem,
+      "-days", "730", "-nodes", "-subj", `/CN=${safeSubject}`]);
+    // -passout env: keeps the password out of the process list (ps auxww).
+    run("openssl", ["pkcs12", "-export", "-out", pfx, "-inkey", keyPem, "-in", certPem,
+      "-passout", "env:A365_PFX_PW"], { env: { ...procEnv, A365_PFX_PW: pfxPw } });
+  }
+  return { certPem, pfxPath: pfx };
 }
 
 function printJournal() {

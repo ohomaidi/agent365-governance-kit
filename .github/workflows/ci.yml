@@ -32,7 +32,32 @@ jobs:
       - name: Syntax check
         run: node --check wizard/agent365-govern.mjs
       - name: Test
-        run: node --test wizard/test/wizard.test.mjs
+        run: node --test wizard/test/*.test.mjs
+
+  proxy:
+    name: Proxy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - name: Build the kit the proxy depends on
+        run: npm run build
+      - name: Test
+        run: node --test --test-timeout=20000 packages/proxy/test/*.test.mjs
+
+  installer:
+    name: Installer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Syntax check
+        run: node --check installer/server.mjs
 
   python:
     name: Python

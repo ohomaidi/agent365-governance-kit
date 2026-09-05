@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent 365 Governance Kit — Setup</title>
+<style>
+  :root {
+    --ground:#F4F6F4; --surface:#fff; --surface-2:#ECEFEC; --ink:#131E1B; --ink-soft:#384743;
+    --muted:#5E6D69; --rule:#D7DEDA; --accent:#16645C; --accent-soft:#E3EEEB;
+    --amber:#8A6011; --amber-soft:#F6EEDD; --rust:#97402F; --rust-soft:#F6E7E3;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --body:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  @media (prefers-color-scheme:dark){:root{
+    --ground:#0F1614;--surface:#17201E;--surface-2:#1E2926;--ink:#E7EDEA;--ink-soft:#BFCCC7;
+    --muted:#8FA09B;--rule:#2A3835;--accent:#6FBDB1;--accent-soft:#17322E;
+    --amber:#D9AE62;--amber-soft:#2E2617;--rust:#DE9382;--rust-soft:#331D18;}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ground);color:var(--ink);font:15px/1.55 var(--body)}
+  .wrap{max-width:52rem;margin:0 auto;padding:2rem 1.25rem 4rem;display:flex;flex-direction:column;gap:1.5rem}
+  h1{font-size:1.6rem;margin:0;letter-spacing:-.02em}
+  .sub{color:var(--muted);margin:.25rem 0 0;font-size:.95rem}
+  fieldset{border:1px solid var(--rule);border-radius:6px;background:var(--surface);padding:1.1rem 1.15rem;margin:0}
+  legend{font-size:.72rem;letter-spacing:.11em;text-transform:uppercase;color:var(--accent);font-weight:600;padding:0 .4rem}
+  .row{display:grid;grid-template-columns:minmax(11rem,1fr) 2fr;gap:.65rem 1rem;align-items:center}
+  .row + .row{margin-top:.7rem}
+  label{font-size:.9rem;color:var(--ink-soft)}
+  .hint{grid-column:1/-1;color:var(--muted);font-size:.82rem;margin:-.2rem 0 .2rem}
+  input[type=text],select{width:100%;padding:.5rem .6rem;border:1px solid var(--rule);border-radius:4px;
+    background:var(--ground);color:var(--ink);font:14px var(--body)}
+  input[type=text]:focus,select:focus{outline:2px solid var(--accent);outline-offset:1px}
+  .check{display:flex;align-items:flex-start;gap:.55rem;grid-column:1/-1}
+  .check input{margin-top:.25rem}
+  .danger{border-color:var(--rust);background:var(--rust-soft)}
+  .danger legend{color:var(--rust)}
+  .warn{background:var(--amber-soft);border:1px solid var(--amber);color:var(--amber);
+    padding:.6rem .75rem;border-radius:4px;font-size:.85rem;grid-column:1/-1}
+  .good{background:var(--accent-soft);border:1px solid var(--accent);color:var(--accent);
+    padding:.6rem .75rem;border-radius:4px;font-size:.85rem}
+  .bad{background:var(--rust-soft);border:1px solid var(--rust);color:var(--rust);
+    padding:.6rem .75rem;border-radius:4px;font-size:.85rem}
+  .actions{display:flex;flex-wrap:wrap;gap:.65rem;align-items:center}
+  button{font:600 14px var(--body);padding:.6rem 1.1rem;border-radius:5px;border:1px solid var(--accent);
+    background:var(--accent);color:var(--ground);cursor:pointer}
+  button.ghost{background:transparent;color:var(--accent)}
+  button:disabled{opacity:.45;cursor:default}
+  button.go{border-color:var(--rust);background:var(--rust);color:#fff}
+  pre{margin:0;background:#0d1412;color:#d6e4e0;border-radius:6px;padding:1rem;font:12.5px/1.6 var(--mono);
+    max-height:26rem;overflow:auto;white-space:pre-wrap;word-break:break-word}
+  .tool{display:flex;justify-content:space-between;gap:1rem;padding:.35rem 0;border-bottom:1px solid var(--rule);font-size:.9rem}
+  .tool:last-child{border-bottom:0}
+  .ok{color:var(--accent);font-weight:600}
+  .no{color:var(--rust);font-weight:600}
+  a{color:var(--accent)}
+  code{font:12.5px var(--mono);background:var(--surface-2);padding:.1em .35em;border-radius:3px}
+  [hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Agent 365 Governance Kit</h1>
+    <p class="sub">Provisions Microsoft Purview governance and registers your agent in Agent 365. Nothing is changed until you choose <strong>Provision</strong>.</p>
+  </header>
+
+  <fieldset>
+    <legend>1 · Before we start</legend>
+    <div id="pf">Checking…</div>
+    <div id="pfActions" class="actions" style="margin-top:.8rem" hidden>
+      <button id="btnLogin" class="ghost" type="button">Sign in to Azure</button>
+      <button id="btnRecheck" class="ghost" type="button">Re-check</button>
+    </div>
+  </fieldset>
+
+  <form id="f">
+    <fieldset>
+      <legend>2 · Your agent</legend>
+      <div class="row"><label for="purviewAppName">App name in Purview</label><input type="text" id="purviewAppName" value="Custom AI App"></div>
+      <div class="row"><label for="appRegName">Connector app registration</label><input type="text" id="appRegName" value="Agent Purview Connector"></div>
+      <div class="row"><label for="attribUpn">Attribute activity to (UPN)</label><input type="text" id="attribUpn"></div>
+      <div class="row"><label for="envPath">Write settings to</label><input type="text" id="envPath" placeholder="/path/to/your/agent/.env"></div>
+      <div class="row"><label for="lang">Language</label>
+        <select id="lang"><option>typescript</option><option>python</option><option>dotnet</option></select></div>
+    </fieldset>
+
+    <fieldset style="margin-top:1.5rem">
+      <legend>3 · Who the policy applies to</legend>
+      <div class="row"><label for="scopeChoice">Scope</label>
+        <select id="scopeChoice">
+          <option value="1">A pilot group (recommended)</option>
+          <option value="2">Specific users</option>
+          <option value="3">Everyone in the tenant</option>
+        </select></div>
+      <div class="row" id="rowGroup"><label for="pilotGroup">Pilot group</label><input type="text" id="pilotGroup" placeholder="group@contoso.com or object id"></div>
+      <div class="row" id="rowUsers" hidden><label for="pilotUsers">Pilot users</label><input type="text" id="pilotUsers" placeholder="a@contoso.com, b@contoso.com"></div>
+      <div id="scopeWarn" class="warn" hidden>Tenant-wide applies to <strong>every user</strong> in the organisation.</div>
+    </fieldset>
+
+    <fieldset style="margin-top:1.5rem">
+      <legend>4 · How it enforces</legend>
+      <div class="row"><label for="modeChoice">Mode</label>
+        <select id="modeChoice">
+          <option value="1">Test with notifications (recommended)</option>
+          <option value="2">Test silently</option>
+          <option value="3">Enable — actively block</option>
+        </select></div>
+      <div id="modeWarn" class="warn" hidden>Matching prompts will be <strong>blocked in production</strong> once the policy propagates (up to ~1 hour).</div>
+      <div class="check"><input type="checkbox" id="wantCreditCard" checked><label for="wantCreditCard">Block credit-card numbers</label></div>
+      <div class="row"><label for="customSitTerms">Extra blocked keywords</label><input type="text" id="customSitTerms" placeholder="salary, compensation"></div>
+      <div class="check"><input type="checkbox" id="failClosed" checked><label for="failClosed"><strong>Fail closed</strong> — block if Purview is unreachable. Turning this off allows ungoverned traffic during an outage.</label></div>
+    </fieldset>
+
+    <fieldset style="margin-top:1.5rem">
+      <legend>5 · Activity capture</legend>
+      <div class="check"><input type="checkbox" id="wantDspm" checked><label for="wantDspm">Create the DSPM for AI collection policy</label></div>
+      <div class="check"><input type="checkbox" id="dspmIngest"><label for="dspmIngest">Store full prompt and response text in Purview
+        <span class="hint" style="display:block">A privacy and data-residency decision — confirm with the data owner first.</span></label></div>
+    </fieldset>
+
+    <fieldset style="margin-top:1.5rem">
+      <legend>6 · Agent 365 registration</legend>
+      <div class="check"><input type="checkbox" id="wantAgent365" checked><label for="wantAgent365">Register this agent in the Agent 365 registry</label></div>
+      <div id="a365Fields">
+        <div class="row"><label for="agentName">Agent display name</label><input type="text" id="agentName"></div>
+        <div class="row"><label for="agentUrl">Agent endpoint (https)</label><input type="text" id="agentUrl" placeholder="https://your-agent.example.com/a2a">
+          <span class="hint">May be a <strong>governance proxy</strong> in front of an agent you cannot modify.</span></div>
+        <div class="row"><label for="transport">Transport</label>
+          <select id="transport"><option>JSONRPC</option><option>HTTP+JSON</option><option>GRPC</option></select></div>
+        <div class="row"><label for="sponsorUpn">Blueprint sponsor (UPN)</label><input type="text" id="sponsorUpn"></div>
+        <div class="row"><label for="existingBlueprintId">Reuse blueprint id</label><input type="text" id="existingBlueprintId" placeholder="leave blank to create a new one"></div>
+      </div>
+    </fieldset>
+
+    <fieldset style="margin-top:1.5rem">
+      <legend>7 · Afterwards</legend>
+      <div class="check"><input type="checkbox" id="revokeAfter" checked><label for="revokeAfter">Revoke the connector's Compliance Administrator and Exchange access once provisioning finishes — the runtime needs neither.</label></div>
+    </fieldset>
+  </form>
+
+  <div class="actions">
+    <button id="btnDry" class="ghost" type="button">Rehearse (changes nothing)</button>
+    <button id="btnGo" class="go" type="button">Provision</button>
+    <span id="status" class="sub"></span>
+  </div>
+
+  <pre id="log" hidden></pre>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let pf = null;
+
+async function preflight() {
+  $("pf").textContent = "Checking…";
+  pf = await (await fetch("/api/preflight")).json();
+  const rows = [
+    ["Node.js", pf.tools.node],
+    ["Azure CLI", pf.tools.az],
+    ["PowerShell 7", pf.tools.pwsh],
+    ["OpenSSL", pf.tools.openssl],
+  ].map(([n, v]) => {
+    const okv = v === true || (typeof v === "string" && v !== "false");
+    const txt = v === true ? "installed" : v === false ? "missing" : v;
+    return `<div class="tool"><span>${n}</span><span class="${okv ? "ok" : "no"}">${txt}</span></div>`;
+  }).join("");
+
+  let banner = "";
+  if (pf.missing.length) {
+    banner = `<div class="bad" style="margin-bottom:.7rem">Install these first, then re-check:<br>` +
+      pf.missing.map(m => `<a href="${m.url}" target="_blank" rel="noopener">${m.name}</a>`).join(" · ") + `</div>`;
+  } else if (!pf.signedIn) {
+    banner = `<div class="warn" style="margin-bottom:.7rem">Not signed in to Azure. Sign in as a Global Administrator of the tenant you want to configure.</div>`;
+  } else {
+    banner = `<div class="good" style="margin-bottom:.7rem">Signed in as <strong>${pf.account.user}</strong> — tenant <code>${pf.account.tenantId}</code></div>`;
+    if (!$("attribUpn").value) $("attribUpn").value = pf.account.user;
+    if (!$("sponsorUpn").value) $("sponsorUpn").value = pf.account.user;
+  }
+  $("pf").innerHTML = banner + rows;
+  $("pfActions").hidden = false;
+  $("btnLogin").hidden = pf.signedIn || pf.missing.length > 0;
+  const ready = pf.ready && pf.signedIn;
+  $("btnGo").disabled = !ready;
+  $("btnDry").disabled = !ready;
+}
+
+$("btnRecheck").onclick = preflight;
+$("btnLogin").onclick = async () => {
+  $("btnLogin").disabled = true;
+  $("status").textContent = "A browser window has opened for Azure sign-in…";
+  try { await fetch("/api/login", { method: "POST" }); } finally {
+    $("btnLogin").disabled = false; $("status").textContent = ""; preflight();
+  }
+};
+
+$("scopeChoice").onchange = (e) => {
+  const v = e.target.value;
+  $("rowGroup").hidden = v !== "1";
+  $("rowUsers").hidden = v !== "2";
+  $("scopeWarn").hidden = v !== "3";
+};
+$("modeChoice").onchange = (e) => { $("modeWarn").hidden = e.target.value !== "3"; };
+$("wantAgent365").onchange = (e) => { $("a365Fields").hidden = !e.target.checked; };
+$("purviewAppName").oninput = (e) => {
+  if (!$("agentName").dataset.touched) $("agentName").value = e.target.value;
+};
+$("agentName").oninput = (e) => { e.target.dataset.touched = "1"; };
+
+function answers() {
+  const scope = $("scopeChoice").value, mode = $("modeChoice").value;
+  return {
+    appRegName: $("appRegName").value, purviewAppName: $("purviewAppName").value,
+    attribUpn: $("attribUpn").value, envPath: $("envPath").value, lang: $("lang").value,
+    scopeChoice: scope,
+    pilotGroup: $("pilotGroup").value, pilotUsers: $("pilotUsers").value,
+    // The CLI asks for these confirmations; the UI already made them explicit choices.
+    confirmTenantWide: scope === "3", typeTenantWide: scope === "3" ? "TENANT-WIDE" : "",
+    modeChoice: mode,
+    confirmEnforce: mode === "3", typeEnforce: mode === "3" ? "ENFORCE" : "",
+    wantCreditCard: $("wantCreditCard").checked,
+    customSitTerms: $("customSitTerms").value,
+    failClosed: $("failClosed").checked,
+    wantDspm: $("wantDspm").checked, dspmIngest: $("dspmIngest").checked,
+    wantAgent365: $("wantAgent365").checked,
+    agentName: $("agentName").value, agentUrl: $("agentUrl").value,
+    transport: $("transport").value, sponsorUpn: $("sponsorUpn").value,
+    existingBlueprintId: $("existingBlueprintId").value,
+    revokeAfter: $("revokeAfter").checked,
+    reuseExistingApp: true, replaceInstance: false,
+    proceed: true,
+  };
+}
+
+function validate(a) {
+  if (!a.envPath) return "Tell me where to write your agent's .env file.";
+  if (a.scopeChoice === "1" && !a.pilotGroup) return "A pilot group is required for that scope.";
+  if (a.scopeChoice === "2" && !a.pilotUsers) return "List at least one pilot user.";
+  if (a.wantAgent365 && !/^https:\/\//i.test(a.agentUrl)) return "The agent endpoint must be an https URL.";
+  return null;
+}
+
+async function run(dryRun) {
+  const a = answers();
+  const bad = validate(a);
+  if (bad) { $("status").textContent = bad; return; }
+  if (!dryRun && !confirm(
+      `This will make changes in tenant ${pf.account.tenantId}.\n\n` +
+      `Policy mode: ${$("modeChoice").selectedOptions[0].text}\n` +
+      `Scope: ${$("scopeChoice").selectedOptions[0].text}\n\nContinue?`)) return;
+
+  $("btnGo").disabled = true; $("btnDry").disabled = true;
+  $("log").hidden = false; $("log").textContent = "";
+  $("status").textContent = dryRun ? "Rehearsing…" : "Provisioning…";
+
+  const { id } = await (await fetch("/api/run", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ answers: a, dryRun }),
+  })).json();
+
+  const es = new EventSource(`/api/log?id=${id}`);
+  es.onmessage = (e) => {
+    $("log").textContent += JSON.parse(e.data) + "\n";
+    $("log").scrollTop = $("log").scrollHeight;
+  };
+  es.addEventListener("done", (e) => {
+    es.close();
+    const { code } = JSON.parse(e.data);
+    $("status").textContent = code === 0
+      ? (dryRun ? "Rehearsal complete — nothing was changed." : "Done.")
+      : `Finished with errors (exit ${code}). Read the log above.`;
+    $("btnGo").disabled = false; $("btnDry").disabled = false;
+  });
+}
+
+$("btnDry").onclick = () => run(true);
+$("btnGo").onclick = () => run(false);
+
+fetch("/api/defaults").then(r => r.json()).then(d => {
+  if (!$("envPath").value) $("envPath").value = d.cwd + d.sep + ".env";
+});
+preflight();
+</script>
+</body>
+</html>

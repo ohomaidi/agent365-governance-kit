@@ -8,7 +8,7 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { psLit, odata, writeEnvBlock, buildProvisionScript, BEGIN, END } from "../agent365-govern.mjs";
+import { psLit, odata, writeEnvBlock, buildProvisionScript, makeCertificate, BEGIN, END } from "../agent365-govern.mjs";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "a365-wiztest-"));
 
@@ -151,5 +151,45 @@ describe("provisioning script safety", () => {
   test("does not silently change an existing policy's mode or scope", () => {
     const ps = buildProvisionScript({ ...base, dlpMode: "Enable" });
     assert.match(ps, /already exists — leaving its mode and scope untouched/);
+  });
+});
+
+describe("certificate generation", () => {
+  const capture = () => {
+    const calls = [];
+    const run = (cmd, args, opts) => { calls.push({ cmd, args, opts }); return ""; };
+    return { calls, run };
+  };
+
+  test("the PFX password never appears in argv on either platform", () => {
+    const { calls, run } = capture();
+    makeCertificate({ work: "/tmp/w", subjectName: "Abbas", pfxPw: "P@ssw0rd-secret", run });
+    for (const c of calls) {
+      const argv = (c.args || []).join(" ");
+      assert.equal(argv.includes("P@ssw0rd-secret"), false,
+        `password leaked into argv of ${c.cmd} (visible in ps auxww)`);
+    }
+  });
+
+  test("the password is handed over through the environment instead", () => {
+    const { calls, run } = capture();
+    makeCertificate({ work: "/tmp/w", subjectName: "Abbas", pfxPw: "s3cret-value", run });
+    const withEnv = calls.filter((c) => c.opts?.env?.A365_PFX_PW === "s3cret-value");
+    assert.ok(withEnv.length > 0, "no call received the password via env");
+  });
+
+  test("a hostile subject name cannot inject shell or PowerShell syntax", () => {
+    const { calls, run } = capture();
+    makeCertificate({ work: "/tmp/w", subjectName: "Ab'; Remove-Item / #", pfxPw: "x", run });
+    const all = calls.map((c) => (c.args || []).join(" ")).join("\n");
+    assert.equal(all.includes("Remove-Item / #"), false, "subject name was not sanitised");
+    assert.match(all, /Ab__ Remove-Item _ _|Ab__/);
+  });
+
+  test("returns the paths the provisioning step needs", () => {
+    const { run } = capture();
+    const r = makeCertificate({ work: "/tmp/w", subjectName: "A", pfxPw: "x", run });
+    assert.match(r.certPem, /cert\.pem$/);
+    assert.match(r.pfxPath, /cert\.pfx$/);
   });
 });
