@@ -6,7 +6,8 @@
   "main": "src/server.mjs",
   "exports": {
     ".": "./src/server.mjs",
-    "./dialects": "./src/dialects.mjs"
+    "./dialects": "./src/dialects.mjs",
+    "./teams": "./src/teams.mjs"
   },
   "bin": {
     "agent365-govern-proxy": "src/bin.mjs"
@@ -16,11 +17,15 @@
     "start": "node src/bin.mjs",
     "test": "node --test test/*.test.mjs"
   },
-  "keywords": ["microsoft", "purview", "agent365", "dlp", "governance", "proxy", "a2a"],
+  "keywords": ["microsoft", "purview", "agent365", "dlp", "governance", "proxy", "a2a", "teams"],
   "license": "UNLICENSED",
   "engines": { "node": ">=18" },
   "dependencies": {
+    "@microsoft/agents-hosting": "^1.5.3",
+    "@microsoft/opentelemetry": "^1.1.0",
+    "@opentelemetry/resources": "^2.8.0",
     "@zaatarlabs/agent365-governance-kit": "file:../typescript",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "express": "^5.1.0"
   }
 }

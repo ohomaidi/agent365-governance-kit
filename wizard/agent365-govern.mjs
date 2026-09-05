@@ -3,7 +3,7 @@
  * agent365-govern init — interactive setup wizard.
  *
  * Auto-provisions everything the Governance Kit needs in the customer's tenant,
- * after a tenant-admin signs in (Azure CLI). It:
+ * after a tenant admin signs in (device code — no Azure CLI). It:
  *   1. creates a dedicated app registration (the Purview connector) + secret,
  *   2. grants Content.Process.All + ProtectionScopes.Compute.All + Exchange.ManageAsApp,
  *   3. creates a cert, assigns the Compliance Administrator role,
@@ -18,19 +18,25 @@
  *   - Every generated credential lives in a temp dir that is shredded on exit.
  *   - `--dry-run` prints the full plan and mutates nothing.
  *
- * Requires: az (Azure CLI, logged in as Global Admin), pwsh 7, openssl.
+ *   8. publishes the agent to Teams (org app catalog, pilot installs, messaging endpoint)
+ *      and proves it by sending a hello from the agent into the admin's Teams.
+ *
+ * Requires: pwsh 7 (the installer downloads it when missing), openssl on macOS/Linux.
+ * Sign-in is built in (OAuth device code): no Azure CLI, no PowerShell modules to pre-install.
  * Pure Node built-ins — no install needed to run the wizard.
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout, argv, env as procEnv } from "node:process";
-import { writeFileSync, appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, copyFileSync, readdirSync, statSync } from "node:fs";
+import { writeFileSync, appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, copyFileSync, readdirSync, statSync } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { registerAgent, slugify, A365_RESOURCES, MESSAGING_BOT_API_APP } from "./lib/agent365.mjs";
 import { probeTenant } from "./lib/capabilities.mjs";
+import { TokenCache, startDeviceCode, pollDeviceCode, makeDelegatedGraph, makeDevPortal, CLIENTS, GRAPH_SCOPE_STRING } from "./lib/auth.mjs";
+import { buildTeamsPackage, publishToOrgCatalog, installForUsers, registerMessagingEndpoint, proactiveHello } from "./lib/teams.mjs";
 
 // --- Microsoft constants (stable GUIDs) ---
 const GRAPH_APP = "00000003-0000-0000-c000-000000000000";
@@ -88,8 +94,40 @@ const record = (what) => { journal.push(what); };
 function sh(cmd, args, opts = {}) {
   return execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...opts });
 }
-function az(args) { return sh("az", args); }
-function azJson(args) { const out = az(args).trim(); return out ? JSON.parse(out) : null; }
+const PWSH = procEnv.A365_PWSH || "pwsh";
+
+/**
+ * Delegated Graph as the signed-in administrator — set in main() after the
+ * device-code sign-in. Same contract as the app-only client below.
+ */
+let dg = async () => { throw new Error("not signed in"); };
+let account = null; // { id, upn, name, tenantId }
+const SIGNIN_CLIENT = CLIENTS.graphCli;
+const DEVPORTAL_CLIENT = CLIENTS.teamsToolkit;
+
+const isGuid = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v));
+/** Service principal by appId, or null. */
+async function spByAppId(appId, graph = dg) {
+  const r = await graph("GET", `/v1.0/servicePrincipals?$filter=appId eq '${odata(appId)}'&$select=id,appId,displayName`);
+  return r?.value?.[0] ?? null;
+}
+/** Service principal by appId, created when absent (first-party resources need this). */
+async function ensureSp(appId, graph = dg) {
+  return (await spByAppId(appId, graph)) ?? await graph("POST", "/v1.0/servicePrincipals", { appId });
+}
+/** Object id of a user given a UPN or object id; throws when not found. */
+async function userIdOf(upnOrId, graph = dg) {
+  const u = await graph("GET", `/v1.0/users/${encodeURIComponent(upnOrId)}?$select=id`);
+  if (!u?.id) throw new Error(`user "${upnOrId}" not found`);
+  return u.id;
+}
+/** A group by object id or mail address. */
+async function groupLookup(idOrMail, graph = dg) {
+  if (isGuid(idOrMail)) return graph("GET", `/v1.0/groups/${idOrMail}?$select=id,mail,displayName`);
+  const r = await graph("GET", `/v1.0/groups?$filter=mail eq '${odata(idOrMail)}'&$select=id,mail,displayName`);
+  if (!r?.value?.[0]) throw new Error(`group "${idOrMail}" not found`);
+  return r.value[0];
+}
 
 /**
  * Graph caller for Agent 365 registration, authenticated as the CONNECTOR APP.
@@ -142,6 +180,18 @@ function makeGraphClient({ tenantId, clientId, clientSecret }) {
   };
 }
 
+/** Retry a call that references an Entra object created seconds ago (404 / "does not exist"). */
+async function withReplicationLocal(fn) {
+  const delays = [0, 3000, 6000, 10000, 15000, 20000];
+  let last;
+  for (const d of delays) {
+    if (d) await new Promise((r) => setTimeout(r, d));
+    try { return await fn(); }
+    catch (e) { last = e; if (!(e?.status === 404 || (e?.status === 400 && /does not exist|not found/i.test(String(e.message))))) throw e; }
+  }
+  throw last;
+}
+
 /** Quote a value for safe embedding in a PowerShell single-quoted literal. */
 export const psLit = (v) => `'${String(v ?? "").replace(/'/g, "''")}'`;
 /** Escape a value for an OData string literal (az --filter). */
@@ -162,30 +212,24 @@ function assertEnvSafe(name, v) {
  * Idempotent on mailNickname; adds any missing members on re-run.
  * `deps` is injectable for tests.
  */
-export function ensurePilotGroup({ displayName, mailNickname, ownerId, memberIds }, deps = { azJson, az }) {
+export async function ensurePilotGroup({ displayName, mailNickname, ownerId, memberIds }, graph = dg) {
   const G = "https://graph.microsoft.com/v1.0";
-  let g = deps.azJson(["rest", "--method", "GET",
-    "--url", `${G}/groups?$filter=mailNickname eq '${odata(mailNickname)}'&$select=id,mail,displayName`,
-    "--query", "value[0]", "-o", "json"]);
+  const found = await graph("GET", `/v1.0/groups?$filter=mailNickname eq '${odata(mailNickname)}'&$select=id,mail,displayName`);
+  let g = found?.value?.[0] ?? null;
   let created = false;
   if (!g) {
-    g = deps.azJson(["rest", "--method", "POST", "--url", `${G}/groups`,
-      "--headers", "Content-Type=application/json",
-      "--body", JSON.stringify({
-        displayName, mailNickname, description: "Pilot scope for an Agent 365 Governance Kit DLP policy.",
-        groupTypes: ["Unified"], mailEnabled: true, securityEnabled: false,
-        "owners@odata.bind": [`${G}/users/${ownerId}`],
-        "members@odata.bind": [...new Set(memberIds)].map((id) => `${G}/users/${id}`),
-      }), "--query", "{id:id,mail:mail,displayName:displayName}", "-o", "json"]);
+    g = await graph("POST", "/v1.0/groups", {
+      displayName, mailNickname, description: "Pilot scope for an Agent 365 Governance Kit DLP policy.",
+      groupTypes: ["Unified"], mailEnabled: true, securityEnabled: false,
+      "owners@odata.bind": [`${G}/users/${ownerId}`],
+      "members@odata.bind": [...new Set(memberIds)].map((id) => `${G}/users/${id}`),
+    });
     created = true;
   } else {
-    const have = (deps.azJson(["rest", "--method", "GET", "--url", `${G}/groups/${g.id}/members?$select=id`,
-      "--query", "value[].id", "-o", "json"]) ?? []);
+    const have = ((await graph("GET", `/v1.0/groups/${g.id}/members?$select=id`))?.value ?? []).map((m) => m.id);
     for (const id of memberIds) {
       if (have.includes(id)) continue;
-      deps.az(["rest", "--method", "POST", "--url", `${G}/groups/${g.id}/members/$ref`,
-        "--headers", "Content-Type=application/json",
-        "--body", JSON.stringify({ "@odata.id": `${G}/directoryObjects/${id}` }), "-o", "none"]);
+      await graph("POST", `/v1.0/groups/${g.id}/members/$ref`, { "@odata.id": `${G}/directoryObjects/${id}` });
     }
   }
   if (!g?.mail) throw new Error(`pilot group "${displayName}" has no mail address; Purview cannot bind to it`);
@@ -199,35 +243,28 @@ export function ensurePilotGroup({ displayName, mailNickname, ownerId, memberIds
  * Administrator (the CLI token carries DelegatedPermissionGrant.ReadWrite.All).
  * Idempotent: merges scopes into an existing grant.
  */
-export function grantBlueprintConsent({ blueprintPrincipalId, resources = A365_RESOURCES }, deps = { azJson, az }) {
-  const G = "https://graph.microsoft.com/v1.0";
+export async function grantBlueprintConsent({ blueprintPrincipalId, resources = A365_RESOURCES }, graph = dg) {
   const out = [];
   for (const res of resources) {
     // The resource's service principal must exist in the tenant before it can be consented to.
     let rsp = null;
-    try { rsp = deps.azJson(["ad", "sp", "show", "--id", res.appId, "--query", "id", "-o", "json"]); } catch { /* absent */ }
-    if (!rsp) {
-      try { rsp = deps.azJson(["ad", "sp", "create", "--id", res.appId, "--query", "id", "-o", "json"]); }
-      catch (e) { out.push(`WARNING: ${res.name} service principal could not be created: ${String(e.stderr || e).slice(0, 100)}`); continue; }
-    }
-    const existing = deps.azJson(["rest", "--method", "GET",
-      "--url", `${G}/oauth2PermissionGrants?$filter=clientId eq '${blueprintPrincipalId}' and resourceId eq '${rsp}' and consentType eq 'AllPrincipals'`,
-      "--query", "value[0]", "-o", "json"]);
+    try { rsp = (await ensureSp(res.appId, graph))?.id ?? null; }
+    catch (e) { out.push(`WARNING: ${res.name} service principal could not be created: ${String(e.message || e).slice(0, 100)}`); continue; }
+    const found = await graph("GET",
+      `/v1.0/oauth2PermissionGrants?$filter=clientId eq '${blueprintPrincipalId}' and resourceId eq '${rsp}' and consentType eq 'AllPrincipals'`);
+    const existing = found?.value?.[0] ?? null;
     if (existing) {
       const have = new Set(String(existing.scope || "").split(" ").filter(Boolean));
       const merged = [...new Set([...have, ...res.scopes])].join(" ");
       if (merged !== String(existing.scope || "").trim()) {
-        deps.az(["rest", "--method", "PATCH", "--url", `${G}/oauth2PermissionGrants/${existing.id}`,
-          "--headers", "Content-Type=application/json", "--body", JSON.stringify({ scope: merged }), "-o", "none"]);
+        await graph("PATCH", `/v1.0/oauth2PermissionGrants/${existing.id}`, { scope: merged });
         out.push(`consent updated: ${res.name} (${merged})`);
       } else {
         out.push(`consent already present: ${res.name}`);
       }
     } else {
-      deps.az(["rest", "--method", "POST", "--url", `${G}/oauth2PermissionGrants`,
-        "--headers", "Content-Type=application/json",
-        "--body", JSON.stringify({ clientId: blueprintPrincipalId, consentType: "AllPrincipals", resourceId: rsp, scope: res.scopes.join(" ") }),
-        "-o", "none"]);
+      await graph("POST", "/v1.0/oauth2PermissionGrants",
+        { clientId: blueprintPrincipalId, consentType: "AllPrincipals", resourceId: rsp, scope: res.scopes.join(" ") });
       out.push(`consent granted: ${res.name} (${res.scopes.join(", ")})`);
     }
   }
@@ -277,7 +314,7 @@ export function writeEnvBlock(envPath, lines) {
 /** Print the tenant capability report. Returns true if provisioning can proceed. */
 async function runTenantCheck() {
   console.log(`${C.b}\n  Tenant capability check${C.reset}\n`);
-  const r = await probeTenant(azJson);
+  const r = await probeTenant(dg, account);
   const mark = { ok: `${C.g}✓${C.reset}`, warn: `${C.y}!${C.reset}`, fail: `${C.r}✗${C.reset}` };
   for (const c of r.checks) {
     console.log(`  ${mark[c.status]} ${c.name.padEnd(28)} ${c.detail}`);
@@ -296,8 +333,8 @@ async function main(work) {
   console.log("");
 
   // ---- preflight ----
-  try { sh("az", ["version", "-o", "none"]); } catch { die("Azure CLI (az) not found. Install it and run `az login` as a Global Admin."); }
-  try { sh("pwsh", ["-NoProfile", "-Command", "$null"]); } catch { die("PowerShell 7 (pwsh) not found. Install it (brew install powershell)."); }
+  try { sh(PWSH, ["-NoProfile", "-Command", "$null"]); }
+  catch { die("PowerShell 7 (pwsh) not found. The installer downloads it for you; from a terminal: brew install powershell / winget install Microsoft.PowerShell"); }
   if (!IS_WINDOWS) {
     try { sh("openssl", ["version"]); } catch { die("openssl not found."); }
   }
@@ -306,7 +343,7 @@ async function main(work) {
   // Locked-down customer machines often block it — find out now, not 10 minutes in.
   let galleryOk = true;
   try {
-    sh("pwsh", ["-NoProfile", "-Command",
+    sh(PWSH, ["-NoProfile", "-Command",
       "if (-not (Get-Module -ListAvailable ExchangeOnlineManagement | Where-Object { $_.Version -eq '" + EXO_MODULE_VERSION + "' })) { " +
       "$r = Invoke-WebRequest -Uri 'https://www.powershellgallery.com/api/v2' -UseBasicParsing -TimeoutSec 15; " +
       "if ($r.StatusCode -ge 400) { exit 1 } }"]);
@@ -317,16 +354,40 @@ async function main(work) {
     warn(`  ${C.d}Install-Module ExchangeOnlineManagement -RequiredVersion ${EXO_MODULE_VERSION} -Scope CurrentUser${C.reset}`);
   }
 
+  // ---- sign in (device code; the installer usually did this already) ----
+  const cache = new TokenCache(procEnv.A365_TOKEN_CACHE || join(work, "tokens.json"));
+  if (!cache.signedIn(SIGNIN_CLIENT)) {
+    if (ANSWERS) die("Not signed in. Run the installer (it signs you in), or run the wizard from a terminal.");
+    const tenantHint = procEnv.A365_TENANT || "organizations";
+    const dc = await startDeviceCode({ tenant: tenantHint, clientId: SIGNIN_CLIENT, scope: GRAPH_SCOPE_STRING });
+    console.log(`\n  ${C.b}Sign in as a Global Administrator:${C.reset} open ${dc.verificationUri} and enter ${C.c}${C.b}${dc.userCode}${C.reset}`);
+    console.log(`  ${C.d}Tick "Consent on behalf of your organization" when asked — it is a one-time consent for Microsoft Graph Command Line Tools.${C.reset}\n`);
+    const tok = await pollDeviceCode({ tenant: tenantHint, clientId: SIGNIN_CLIENT, deviceCode: dc.deviceCode, interval: dc.interval, expiresIn: dc.expiresIn });
+    cache.addSignIn(SIGNIN_CLIENT, tok, GRAPH_SCOPE_STRING);
+  }
+  account = cache.account(SIGNIN_CLIENT);
+  dg = makeDelegatedGraph(cache, { clientId: SIGNIN_CLIENT });
+  const devPortal = makeDevPortal(cache, { clientId: DEVPORTAL_CLIENT });
+  const devPortalSignIn = async () => {
+    if (cache.signedIn(DEVPORTAL_CLIENT)) return true;
+    if (ANSWERS) return false; // the installer handles this sign-in itself
+    const dc = await startDeviceCode({ tenant: account.tenantId, clientId: DEVPORTAL_CLIENT, scope: "https://dev.teams.microsoft.com/AppDefinitions.ReadWrite" });
+    console.log(`\n  ${C.b}One more sign-in for the Teams Developer Portal:${C.reset} open ${dc.verificationUri} and enter ${C.c}${C.b}${dc.userCode}${C.reset}\n`);
+    const tok = await pollDeviceCode({ tenant: account.tenantId, clientId: DEVPORTAL_CLIENT, deviceCode: dc.deviceCode, interval: dc.interval, expiresIn: dc.expiresIn });
+    cache.addSignIn(DEVPORTAL_CLIENT, tok, "https://dev.teams.microsoft.com/AppDefinitions.ReadWrite");
+    return true;
+  };
+  const tenantId = account.tenantId;
+  const acct = { tenantId, user: { name: account.upn } };
+  ok(`Signed in: ${account.upn}  (tenant ${tenantId})`);
+  const orgInfo = await dg("GET", "/v1.0/organization?$select=displayName,verifiedDomains");
+  const orgName = orgInfo?.value?.[0]?.displayName ?? "";
+  const org = (orgInfo?.value?.[0]?.verifiedDomains ?? []).map((d) => d.name).find((d) => /onmicrosoft\.com$/i.test(d)) ?? "";
+
   if (argv.includes("--check")) {
     const okToGo = await runTenantCheck();
     process.exit(okToGo ? 0 : 1);
   }
-
-  let acct;
-  try { acct = azJson(["account", "show", "-o", "json"]); }
-  catch { warn("Not signed in. Launching `az login` (sign in as a Global Admin)…"); execFileSync("az", ["login"], { stdio: "inherit" }); acct = azJson(["account", "show", "-o", "json"]); }
-  const tenantId = acct.tenantId;
-  ok(`Signed in: ${acct.user.name}  (tenant ${tenantId})`);
 
   // Interactive on a TTY; otherwise answers are read from stdin up front so a
   // scripted --dry-run works and a short input aborts instead of hanging forever.
@@ -387,7 +448,21 @@ async function main(work) {
   const purviewAppName = await ask("App name to show in Purview audit/DSPM:", "Custom AI App", "purviewAppName");
   const attribUpn = await ask("User to attribute interactions to (UPN):", acct.user.name, "attribUpn");
   const envPath = await ask("Path to your agent's .env to write:", join(process.cwd(), ".env"), "envPath");
-  const lang = (await ask("Your agent's language (typescript / python / dotnet):", "typescript", "lang")).toLowerCase();
+  const lang = (await ask("Your agent's language (typescript / python / dotnet / proxy = a third-party agent fronted by the governance proxy):", "typescript", "lang")).toLowerCase();
+  // A third-party agent you cannot modify: the proxy IS the agent as far as
+  // Purview, Agent 365 and Teams are concerned. Its .env gets the same block
+  // plus where the vendor lives and how it speaks.
+  let upstreamUrl = "", upstreamDialect = "auto", proxyPort = "8787";
+  if (lang === "proxy") {
+    upstreamUrl = await ask("  Vendor agent's API base URL (what the proxy forwards to):", "", "upstreamUrl");
+    while (!/^https?:\/\//i.test(upstreamUrl)) {
+      if (ANSWERS) die("upstreamUrl in the answers file must be an http(s) URL.");
+      warn("  An http(s) URL is required.");
+      upstreamUrl = await ask("  Vendor agent's API base URL:", "", "upstreamUrl");
+    }
+    upstreamDialect = (await ask("  Its wire format (a2a / openai / generic / auto):", "auto", "upstreamDialect")).toLowerCase();
+    proxyPort = await ask("  Port the proxy listens on:", "8787", "proxyPort");
+  }
 
   // --- policy scope: pilot group by default, tenant-wide only on purpose ---
   console.log(`\n${C.b}Who should this DLP policy apply to?${C.reset}`);
@@ -408,7 +483,7 @@ async function main(work) {
     if (!upns.length) { closeInput(); die("No users given."); }
     const ids = [];
     for (const u of upns) {
-      try { ids.push(azJson(["ad", "user", "show", "--id", u, "--query", "id", "-o", "json"])); }
+      try { ids.push(await userIdOf(u)); }
       catch { closeInput(); die(`User "${u}" not found in this tenant.`); }
     }
     // Purview can't bind to users, so these people go into a pilot group
@@ -425,7 +500,7 @@ async function main(work) {
     // Checked even in a dry run: it's a read-only lookup, and a rehearsal that
     // can't catch what provisioning would fail on is worthless.
     let g;
-    try { g = azJson(["ad", "group", "show", "--group", grp, "--query", "{id:id,mail:mail,displayName:displayName}", "-o", "json"]); }
+    try { g = await groupLookup(grp); }
     catch { closeInput(); die(`Group "${grp}" not found in this tenant. Pick "Just me", or create the group in Entra first.`); }
     if (!g?.mail) {
       closeInput();
@@ -470,6 +545,7 @@ async function main(work) {
   const wantAgent365 = await yes("Register this agent in Agent 365?", true, "wantAgent365");
 
   let agentName = "", agentUrl = "", sponsorUpn = "", existingBlueprintId = "", transport = "JSONRPC", messagingEndpoint = "";
+  let wantTeams = false, agentDescription = "";
   if (wantAgent365) {
     agentName = await ask("  Agent display name:", purviewAppName, "agentName");
     agentUrl = await ask("  Agent endpoint URL (https):", "", "agentUrl");
@@ -483,6 +559,8 @@ async function main(work) {
     sponsorUpn = await ask("  Blueprint sponsor (UPN — required by the API):", acct.user.name, "sponsorUpn");
     existingBlueprintId = await ask("  Reuse an existing blueprint object id [blank = create new]:", "", "existingBlueprintId");
     messagingEndpoint = await ask("  Messaging endpoint (where Teams delivers messages):", `${agentUrl.replace(/\/+$/, "")}/api/messages`, "messagingEndpoint");
+    agentDescription = await ask("  One-line description (shown in Teams):", `${agentName} — governed by Microsoft Agent 365`, "agentDescription");
+    wantTeams = await yes("  Publish to Teams (org app catalog, install for the pilot users, register the messaging endpoint)?", true, "wantTeams");
   }
   const wantObservability = wantAgent365;
 
@@ -505,6 +583,7 @@ async function main(work) {
   if (wantAgent365) {
     console.log(`  • Agent 365: ${existingBlueprintId ? `reuse blueprint ${existingBlueprintId}` : "create identity blueprint + secret"}`);
     console.log(`               register instance "${agentName}" at ${agentUrl} (${transport})`);
+    console.log(`  • Teams: ${wantTeams ? `publish "${agentName}" to the org app catalog, install it for the pilot users, register ${messagingEndpoint}` : `${C.y}not published${C.reset}`}`);
   } else {
     console.log(`  • Agent 365: ${C.y}not registered${C.reset}`);
   }
@@ -518,11 +597,16 @@ async function main(work) {
     plan("validate with token → protectionScopes/compute → processContent");
     // Render the closing output now (nothing is written) so a rehearsal
     // exercises the same reporting code a real run finishes with.
-    void integrationSnippet(lang);
+    void integrationSnippet(lang, { envPath, upstreamUrl, proxyPort, agentUrl });
     void agent365Checklist({ agentName: agentName || purviewAppName, lang, blueprintId: "", blueprintAppId: "", messagingEndpoint });
     if (wantAgent365) {
       plan(`create the agent identity blueprint and register "${agentName}" at ${agentUrl}`);
       plan("verify the registration by reading it back from the Agent 365 registry");
+      if (wantTeams) {
+        plan(`build the Teams app package (id = blueprint appId) and publish it to the org app catalog`);
+        plan("install the Teams app for the pilot users and register the messaging endpoint in the Teams Developer Portal");
+        plan("send a hello from the agent into your Teams to prove the path");
+      }
     }
     console.log(`\n${C.c}Dry run complete — nothing was changed.${C.reset}\n`);
     closeInput();
@@ -531,64 +615,65 @@ async function main(work) {
   if (!(await yes("Proceed?", true, "proceed"))) { closeInput(); die("Aborted."); }
 
   // ---- 0. pilot group (scope = specific people) ----
+  let pilotGroupId = scopeInclusions?.[0]?.Type === "Group" && scopeChoice === "1" ? (await groupLookup(scopeInclusions[0].Identity)).id : "";
   if (pilotPlan) {
     info(`Creating pilot group "${pilotPlan.displayName}"…`);
-    const ownerId = azJson(["ad", "signed-in-user", "show", "--query", "id", "-o", "json"]);
-    const g = ensurePilotGroup({ ...pilotPlan, ownerId });
+    const g = await ensurePilotGroup({ ...pilotPlan, ownerId: account.id });
     scopeInclusions = [{ Type: "Group", Identity: g.mail }];
-    if (g.created) record(`pilot group "${g.displayName}" (${g.id}) — delete with: az ad group delete --group ${g.id}`);
+    pilotGroupId = g.id;
+    if (g.created) record(`pilot group "${g.displayName}" (${g.id}) — delete in Entra → Groups`);
     ok(`Pilot group ${g.mail} ${g.created ? "created" : "reused"} — ${pilotPlan.memberIds.length} member(s)`);
   }
 
   // ---- 1. app registration + SP + secret ----
   info("Creating app registration…");
-  let app = azJson(["ad", "app", "list", "--filter", `displayName eq '${odata(appRegName)}'`, "--query", "[0].{appId:appId,id:id}", "-o", "json"]);
+  let app = (await dg("GET", `/v1.0/applications?$filter=displayName eq '${odata(appRegName)}'&$select=id,appId`))?.value?.[0] ?? null;
   if (app) {
     warn(`An app registration named "${appRegName}" already exists (${app.appId}) — reusing it and appending a new credential.`);
     if (!(await yes("  Continue with the existing app?", true, "reuseExistingApp"))) { closeInput(); die("Aborted."); }
   } else {
-    app = azJson(["ad", "app", "create", "--display-name", appRegName, "--sign-in-audience", "AzureADMyOrg", "--query", "{appId:appId,id:id}", "-o", "json"]);
-    record(`app registration "${appRegName}" (${app.appId}) — delete with: az ad app delete --id ${app.appId}`);
+    app = await dg("POST", "/v1.0/applications", { displayName: appRegName, signInAudience: "AzureADMyOrg" });
+    record(`app registration "${appRegName}" (${app.appId}) — delete in Entra → App registrations`);
   }
   const appId = app.appId;
-  try { az(["ad", "sp", "create", "--id", appId, "-o", "none"]); } catch { /* exists */ }
-  const spId = azJson(["ad", "sp", "show", "--id", appId, "--query", "id", "-o", "json"]);
-  const secretObj = azJson(["ad", "app", "credential", "reset", "--id", appId, "--display-name", "purview-daemon", "--years", "2", "--append", "--query", "{p:password}", "-o", "json"]);
-  const clientSecret = secretObj.p;
+  const spId = (await withReplicationLocal(() => ensureSp(appId))).id;
+  const secretObj = await withReplicationLocal(() => dg("POST", `/v1.0/applications/${app.id}/addPassword`,
+    { passwordCredential: { displayName: "purview-daemon", endDateTime: new Date(Date.now() + 730 * 86400e3).toISOString() } }));
+  const clientSecret = secretObj.secretText;
   record(`client secret "purview-daemon" on app ${appId}`);
   ok(`App ${appId}`);
 
   // ---- 2. graph permissions + consent (assign roles directly = reliable) ----
   info("Granting Graph + Exchange permissions…");
-  const graphSp = azJson(["ad", "sp", "show", "--id", GRAPH_APP, "--query", "id", "-o", "json"]);
-  let exoSp;
-  try { exoSp = azJson(["ad", "sp", "show", "--id", EXO_APP, "--query", "id", "-o", "json"]); }
-  catch { exoSp = azJson(["ad", "sp", "create", "--id", EXO_APP, "--query", "id", "-o", "json"]); }
-  const assignRole = (resourceId, roleId, label) => {
+  const graphSp = (await ensureSp(GRAPH_APP)).id;
+  const exoSp = (await ensureSp(EXO_APP)).id;
+  const assignRole = async (resourceId, roleId, label) => {
     try {
-      az(["rest", "--method", "POST", "--url", `https://graph.microsoft.com/v1.0/servicePrincipals/${spId}/appRoleAssignments`,
-        "--headers", "Content-Type=application/json",
-        "--body", JSON.stringify({ principalId: spId, resourceId, appRoleId: roleId }), "-o", "none"]);
+      await withReplicationLocal(() => dg("POST", `/v1.0/servicePrincipals/${spId}/appRoleAssignments`, { principalId: spId, resourceId, appRoleId: roleId }));
       record(`app role ${label} on SP ${spId}`);
-    } catch (e) { if (!/already exists/i.test(String(e.stderr || e))) throw e; }
+    } catch (e) { if (!/already exists/i.test(String(e.message || e))) throw e; }
   };
-  assignRole(graphSp, ROLE_CONTENT_PROCESS, "Content.Process.All");
-  assignRole(graphSp, ROLE_PROTECTION_SCOPES, "ProtectionScopes.Compute.All");
-  assignRole(exoSp, ROLE_EXCHANGE_MANAGE, "Exchange.ManageAsApp");
+  const roles = [
+    [graphSp, ROLE_CONTENT_PROCESS, "Content.Process.All"],
+    [graphSp, ROLE_PROTECTION_SCOPES, "ProtectionScopes.Compute.All"],
+    [exoSp, ROLE_EXCHANGE_MANAGE, "Exchange.ManageAsApp"],
+  ];
   if (wantAgent365) {
-    // Registration is performed by this app, not by the Azure CLI.
-    assignRole(graphSp, ROLE_AGENT_INSTANCE_RW, "AgentInstance.ReadWrite.All");
-    assignRole(graphSp, ROLE_AGENT_BLUEPRINT_RW, "AgentIdentityBlueprint.ReadWrite.All");
-    assignRole(graphSp, ROLE_AGENT_BLUEPRINT_CREATE, "AgentIdentityBlueprint.Create");
-    assignRole(graphSp, ROLE_AGENT_BLUEPRINT_CREDS, "AgentIdentityBlueprint.AddRemoveCreds.All");
-    assignRole(graphSp, ROLE_AGENT_CARD_RW, "AgentCardManifest.ReadWrite.All");
-    assignRole(graphSp, ROLE_AGENT_BLUEPRINT_AUTH, "AgentIdentityBlueprint.UpdateAuthProperties.All");
-    assignRole(graphSp, ROLE_AGENT_PRINCIPAL_CREATE, "AgentIdentityBlueprintPrincipal.Create");
-    assignRole(graphSp, ROLE_AGENT_IDENTITY_CREATE, "AgentIdentity.Create.All");
-    assignRole(graphSp, ROLE_AGENT_IDENTITY_READ, "AgentIdentity.Read.All");
-    assignRole(graphSp, ROLE_AGENT_REGISTRATION_RW, "AgentRegistration.ReadWrite.All");
-    assignRole(graphSp, ROLE_COPILOT_PACKAGES_RW, "CopilotPackages.ReadWrite.All");
+    // Registration is performed by this app: the admin's delegated token has no agent scopes.
+    roles.push(
+      [graphSp, ROLE_AGENT_INSTANCE_RW, "AgentInstance.ReadWrite.All"],
+      [graphSp, ROLE_AGENT_BLUEPRINT_RW, "AgentIdentityBlueprint.ReadWrite.All"],
+      [graphSp, ROLE_AGENT_BLUEPRINT_CREATE, "AgentIdentityBlueprint.Create"],
+      [graphSp, ROLE_AGENT_BLUEPRINT_CREDS, "AgentIdentityBlueprint.AddRemoveCreds.All"],
+      [graphSp, ROLE_AGENT_CARD_RW, "AgentCardManifest.ReadWrite.All"],
+      [graphSp, ROLE_AGENT_BLUEPRINT_AUTH, "AgentIdentityBlueprint.UpdateAuthProperties.All"],
+      [graphSp, ROLE_AGENT_PRINCIPAL_CREATE, "AgentIdentityBlueprintPrincipal.Create"],
+      [graphSp, ROLE_AGENT_IDENTITY_CREATE, "AgentIdentity.Create.All"],
+      [graphSp, ROLE_AGENT_IDENTITY_READ, "AgentIdentity.Read.All"],
+      [graphSp, ROLE_AGENT_REGISTRATION_RW, "AgentRegistration.ReadWrite.All"],
+      [graphSp, ROLE_COPILOT_PACKAGES_RW, "CopilotPackages.ReadWrite.All"]);
   }
+  for (const [rid, role, label] of roles) await assignRole(rid, role, label);
   ok("App-role assignments granted");
 
   // ---- 3. cert + Compliance Administrator role ----
@@ -596,25 +681,29 @@ async function main(work) {
   // Random, high-entropy, and never placed on a command line or in a file.
   const pfxPw = randomBytes(24).toString("base64url");
   const { certPem, pfxPath: pfx } = makeCertificate({ work, subjectName: appRegName, pfxPw });
-  const certBody = readFileSync(certPem, "utf8");
-  az(["ad", "app", "credential", "reset", "--id", appId, "--cert", certBody, "--append", "--years", "2", "-o", "none"]);
+  const certDer = readFileSync(certPem, "utf8").replace(/-----[A-Z ]+-----|\s+/g, "");
+  {
+    // keyCredentials is replaced wholesale on PATCH: keep what is there.
+    const cur = await dg("GET", `/v1.0/applications/${app.id}?$select=keyCredentials`);
+    const keep = (cur?.keyCredentials ?? []).map(({ keyId, type, usage, customKeyIdentifier, displayName, startDateTime, endDateTime }) =>
+      ({ keyId, type, usage, customKeyIdentifier, displayName, startDateTime, endDateTime }));
+    await dg("PATCH", `/v1.0/applications/${app.id}`, { keyCredentials: [...keep, { type: "AsymmetricX509Cert", usage: "Verify", key: certDer, displayName: "agent365-governance-kit provisioning" }] });
+  }
   record(`certificate credential on app ${appId}`);
 
   let complianceAssignmentId = "";
   try {
-    const ra = azJson(["rest", "--method", "POST", "--url", "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments",
-      "--headers", "Content-Type=application/json",
-      "--body", JSON.stringify({ principalId: spId, roleDefinitionId: ROLE_COMPLIANCE_ADMIN, directoryScopeId: "/" }), "-o", "json"]);
+    const ra = await withReplicationLocal(() => dg("POST", "/v1.0/roleManagement/directory/roleAssignments",
+      { principalId: spId, roleDefinitionId: ROLE_COMPLIANCE_ADMIN, directoryScopeId: "/" }));
     complianceAssignmentId = ra?.id ?? "";
     record(`Compliance Administrator directory role on SP ${spId}`);
   } catch (e) {
-    const msg = String(e.stderr || e);
+    const msg = String(e.message || e);
     if (/conflict|exist/i.test(msg)) {
       // Already assigned — look up the existing assignment so we can still revoke it later.
       try {
-        complianceAssignmentId = azJson(["rest", "--method", "GET", "--url",
-          `https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$filter=principalId eq '${spId}' and roleDefinitionId eq '${ROLE_COMPLIANCE_ADMIN}'`,
-          "--query", "value[0].id", "-o", "json"]) ?? "";
+        complianceAssignmentId = (await dg("GET",
+          `/v1.0/roleManagement/directory/roleAssignments?$filter=principalId eq '${spId}' and roleDefinitionId eq '${ROLE_COMPLIANCE_ADMIN}'`))?.value?.[0]?.id ?? "";
       } catch { /* non-fatal */ }
     } else {
       // Don't leave the operator guessing what already exists in their tenant.
@@ -629,9 +718,8 @@ async function main(work) {
   ok("Certificate uploaded, Compliance Administrator assigned");
 
   // ---- resolve attributed user + onmicrosoft domain ----
-  const userId = azJson(["ad", "user", "show", "--id", attribUpn, "--query", "id", "-o", "json"]);
-  const org = azJson(["rest", "--method", "GET", "--url", "https://graph.microsoft.com/v1.0/organization?$select=verifiedDomains",
-    "--query", "value[0].verifiedDomains[?contains(name,'onmicrosoft.com')].name | [0]", "-o", "json"]);
+  const userId = await userIdOf(attribUpn);
+  if (!org) die("This tenant has no *.onmicrosoft.com verified domain; Connect-IPPSSession needs one.");
 
   // ---- 4. DLP + collection policies via Security & Compliance PowerShell ----
   info("Provisioning Purview policies (this can retry while permissions propagate)…");
@@ -647,7 +735,7 @@ async function main(work) {
     // Output is forwarded line by line minus MSAL's raw token-error dump, which
     // is written to the process console (not a PowerShell stream) on a failed
     // connect attempt and would otherwise fill a customer's log with headers.
-    runFiltered("pwsh", ["-NoProfile", "-File", psPath], { ...procEnv, A365_PFX_PW: pfxPw });
+    runFiltered(PWSH, ["-NoProfile", "-File", psPath], { ...procEnv, A365_PFX_PW: pfxPw });
     record(`DLP policy "${purviewAppName} DLP" (${dlpMode}, ${scopeLabel})`);
     if (wantDspm) record("DSPM for AI collection policy");
   } catch {
@@ -663,23 +751,20 @@ async function main(work) {
   if (wantAgent365) {
     info("Registering in Agent 365 (identity blueprint + agent identity + registry)…");
     try {
-      const sponsorId = azJson(["ad", "user", "show", "--id", sponsorUpn, "--query", "id", "-o", "json"]);
-      if (!sponsorId) throw new Error(`sponsor "${sponsorUpn}" not found in this tenant`);
+      let sponsorId;
+      try { sponsorId = await userIdOf(sponsorUpn); }
+      catch { throw new Error(`sponsor "${sponsorUpn}" not found in this tenant`); }
       // The resource service principals must exist BEFORE the blueprint makes
       // their scopes inheritable: Graph accepts the POST for a missing SP and
       // silently drops it (observed live: 3 reported, 1 read back).
       for (const res of A365_RESOURCES) {
-        try { azJson(["ad", "sp", "show", "--id", res.appId, "--query", "id", "-o", "json"]); }
-        catch {
-          info(`  creating service principal for ${res.name}`);
-          try { azJson(["ad", "sp", "create", "--id", res.appId, "--query", "id", "-o", "json"]); }
-          catch (e) { warn(`  could not create ${res.name} service principal: ${String(e.stderr || e).slice(0, 100)}`); }
-        }
+        try { if (!(await spByAppId(res.appId))) { info(`  creating service principal for ${res.name}`); await ensureSp(res.appId); } }
+        catch (e) { warn(`  could not create ${res.name} service principal: ${String(e.message || e).slice(0, 100)}`); }
       }
       const graph = makeGraphClient({ tenantId, clientId: appId, clientSecret });
       a365 = await registerAgent(graph, {
         agentName,
-        agentDescription: `${agentName} — governed by the Agent 365 Governance Kit`,
+        agentDescription: agentDescription || `${agentName} — governed by the Agent 365 Governance Kit`,
         agentUrl,
         sponsorIds: [sponsorId],
         ownerIds: [sponsorId],
@@ -690,11 +775,11 @@ async function main(work) {
       for (const st of a365.steps) ok(`  ${st}`);
       // Admin consent — the step that makes the Activity tab and Teams delivery possible.
       try {
-        for (const line of grantBlueprintConsent({ blueprintPrincipalId: a365.blueprintPrincipalId })) {
+        for (const line of await grantBlueprintConsent({ blueprintPrincipalId: a365.blueprintPrincipalId })) {
           (line.startsWith("WARNING") ? warn : ok)(`  ${line}`);
         }
-      } catch (e) { warn(`  consent grants failed: ${String(e.stderr || e.message || e).slice(0, 200)}`); }
-      record(`Agent 365 blueprint ${a365.blueprintId} — delete with: az ad app delete --id ${a365.blueprintAppId}`);
+      } catch (e) { warn(`  consent grants failed: ${String(e.message || e).slice(0, 200)}`); }
+      record(`Agent 365 blueprint ${a365.blueprintId} (appId ${a365.blueprintAppId}) — delete in Entra → Agent identities`);
       record(`Agent 365 registration ${a365.registrationId} — delete with: DELETE https://graph.microsoft.com/beta/copilot/agentRegistrations/${a365.registrationId}`);
       if (!a365.verified) warn("  Registration could not be read back — check M365 admin center → Agents.");
     } catch (e) {
@@ -702,6 +787,53 @@ async function main(work) {
       warn(`Agent 365 registration failed: ${String(e.message).slice(0, 400)}`);
       warn("  The connector was granted the agent app roles; a fresh grant can take a few");
       warn("  minutes to reach a token. Re-run the wizard to retry. Purview is unaffected.");
+    }
+  }
+
+  // ---- 4c. Teams: org catalog → pilot installs → messaging endpoint ----
+  // The app id IS the blueprint appId, so registry, bot and Teams app are one identity.
+  let teams = null;
+  if (a365 && wantTeams) {
+    info("Publishing to Teams…");
+    teams = { teamsAppId: "", installed: [], endpoint: null, errors: [] };
+    try {
+      const { zip } = buildTeamsPackage({
+        blueprintAppId: a365.blueprintAppId, agentName, description: agentDescription, agentUrl,
+        developer: { name: orgName || purviewAppName },
+      });
+      const pub = await publishToOrgCatalog(dg, zip, a365.blueprintAppId);
+      teams.teamsAppId = pub.teamsAppId;
+      ok(`  Teams app ${pub.action} in the org app catalog (${pub.teamsAppId})`);
+      record(`Teams app ${pub.teamsAppId} in the org catalog — remove in Teams admin center → Manage apps`);
+    } catch (e) { teams.errors.push(`publish: ${String(e.message || e).slice(0, 300)}`); warn(`  Teams publish failed: ${String(e.message || e).slice(0, 300)}`); }
+
+    if (teams.teamsAppId) {
+      // Who gets it in their app bar: the attributed user, the admin, and the pilot group.
+      const targets = new Set([userId, account.id]);
+      if (pilotGroupId) {
+        try {
+          const members = await dg("GET", `/v1.0/groups/${pilotGroupId}/members/microsoft.graph.user?$select=id&$top=200`);
+          for (const m of members?.value ?? []) targets.add(m.id);
+        } catch (e) { warn(`  could not list pilot group members: ${String(e.message || e).slice(0, 120)}`); }
+      }
+      teams.installed = await installForUsers(dg, teams.teamsAppId, [...targets]);
+      const done = teams.installed.filter((x) => x.status !== "failed").length;
+      const failed = teams.installed.filter((x) => x.status === "failed");
+      ok(`  installed for ${done}/${teams.installed.length} user(s)`);
+      for (const f of failed) warn(`    ${f.userId}: ${f.error.slice(0, 160)}`);
+    }
+
+    try {
+      if (!(await devPortalSignIn())) throw new Error("no Teams Developer Portal sign-in (the installer asks for it)");
+      teams.endpoint = await registerMessagingEndpoint(devPortal, {
+        botId: a365.blueprintAppId, name: agentName, description: agentDescription, messagingEndpoint,
+      });
+      ok(`  messaging endpoint ${teams.endpoint.action}: ${messagingEndpoint}`);
+      record(`Developer Portal bot ${a365.blueprintAppId} — remove in Teams Developer Portal → Tools → Bot management`);
+    } catch (e) {
+      teams.errors.push(`endpoint: ${String(e.message || e).slice(0, 300)}`);
+      warn(`  messaging endpoint not registered: ${String(e.message || e).slice(0, 300)}`);
+      warn(`  Do it by hand: Teams Developer Portal → Tools → Bot management → New bot → Bot ID ${a365.blueprintAppId}, endpoint ${messagingEndpoint}`);
     }
   }
 
@@ -740,6 +872,7 @@ async function main(work) {
       `AGENT365_AGENT_URL=${agentUrl}`,
       `AGENT365_MESSAGING_ENDPOINT=${messagingEndpoint}`,
       `AGENT365_IDENTIFIER_URI=${a365.identifierUri ?? ""}`,
+      `AGENT365_TEAMS_APP_ID=${teams?.teamsAppId ?? ""}`,
       "",
       "# --- Agents SDK runtime connection (Teams / Bot Framework path) ---",
       `agent_id=${a365.blueprintAppId}`,
@@ -753,6 +886,13 @@ async function main(work) {
       "agentic_scopes=https://graph.microsoft.com/.default",
       "agentic_connectionName=AgenticAuthConnection");
   }
+  if (lang === "proxy") {
+    block.push("", "# --- governance proxy (fronts a third-party agent) ---",
+      `GOVERNANCE_UPSTREAM=${upstreamUrl}`,
+      `GOVERNANCE_DIALECT=${upstreamDialect}`,
+      `GOVERNANCE_PROXY_PORT=${proxyPort}`);
+  }
+  try { const dir = envPath.replace(/[^/\\]*$/, ""); if (dir && !existsSync(dir)) mkdirSync(dir, { recursive: true }); } catch { /* writeEnvBlock reports */ }
   const how = writeEnvBlock(envPath, block);
   record(`.env block ${how} at ${envPath}`);
   ok(`.env ${how} (${envPath})`);
@@ -767,27 +907,37 @@ async function main(work) {
     warn(`  ${e.message || e}`);
   }
 
+  // ---- 6b. prove the Teams path from the agent's side ----
+  let hello = null;
+  if (teams?.teamsAppId && a365?.blueprintSecret) {
+    info("Sending a hello from the agent into your Teams…");
+    hello = await proactiveHello({
+      tenantId, blueprintAppId: a365.blueprintAppId, blueprintSecret: a365.blueprintSecret,
+      messagingBotApiAppId: MESSAGING_BOT_API_APP, userId: account.id, agentName,
+      text: `Hi, I'm ${agentName}. I'm registered in Microsoft Agent 365 and every message here is checked by Purview. Reply to talk to me.`,
+    });
+    if (hello.ok) ok(`  ${hello.detail}`);
+    else warn(`  hello not delivered yet: ${hello.detail}`);
+  }
+
   // ---- 7. drop provisioning-only privileges ----
   if (revokeAfter && policiesOk) {
     info("Revoking provisioning-only privileges…");
     try {
-      const assignments = azJson(["rest", "--method", "GET", "--url",
-        `https://graph.microsoft.com/v1.0/servicePrincipals/${spId}/appRoleAssignments`, "-o", "json"]);
+      const assignments = await dg("GET", `/v1.0/servicePrincipals/${spId}/appRoleAssignments`);
       const exo = (assignments?.value ?? []).find((a) => a.appRoleId === ROLE_EXCHANGE_MANAGE);
       if (exo) {
-        az(["rest", "--method", "DELETE", "--url",
-          `https://graph.microsoft.com/v1.0/servicePrincipals/${spId}/appRoleAssignments/${exo.id}`, "-o", "none"]);
+        await dg("DELETE", `/v1.0/servicePrincipals/${spId}/appRoleAssignments/${exo.id}`);
         ok("  Exchange.ManageAsApp removed");
       }
       if (complianceAssignmentId) {
-        az(["rest", "--method", "DELETE", "--url",
-          `https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments/${complianceAssignmentId}`, "-o", "none"]);
+        await dg("DELETE", `/v1.0/roleManagement/directory/roleAssignments/${complianceAssignmentId}`);
         ok("  Compliance Administrator removed");
       }
       console.log(`  ${C.d}Connector retains only Content.Process.All + ProtectionScopes.Compute.All.${C.reset}`);
       console.log(`  ${C.d}To change policies later, re-run this wizard (it re-grants, then revokes again).${C.reset}`);
     } catch (e) {
-      warn(`Could not revoke automatically: ${String(e.stderr || e).trim()}`);
+      warn(`Could not revoke automatically: ${String(e.message || e).trim()}`);
       warn(`  Remove them by hand in Entra → ${appRegName} → Permissions / Assigned roles.`);
     }
   } else if (!revokeAfter) {
@@ -801,8 +951,12 @@ async function main(work) {
   closeInput();
 
   // ---- integration snippet (per language) ----
-  console.log(`\n${C.g}${C.b}Purview governance is set up.${C.reset} Add these two calls to your agent:\n`);
-  console.log(C.d + integrationSnippet(lang) + C.reset);
+  if (lang === "proxy") {
+    console.log(`\n${C.g}${C.b}Purview governance is set up.${C.reset} Nothing to change in the vendor's agent — run the proxy next to this .env:\n`);
+  } else {
+    console.log(`\n${C.g}${C.b}Purview governance is set up.${C.reset} Add these two calls to your agent:\n`);
+  }
+  console.log(C.d + integrationSnippet(lang, { envPath, upstreamUrl, proxyPort, agentUrl }) + C.reset);
   console.log(`\n  ${C.y}Note:${C.reset} DLP policies take up to ~1h to propagate before they take effect.`);
   if (dlpMode !== "Enable") {
     console.log(`  ${C.y}Note:${C.reset} the policy is in ${C.b}${dlpMode}${C.reset} — it audits but ${C.b}does not block${C.reset}.`);
@@ -815,7 +969,7 @@ async function main(work) {
   if (wantObservability) {
     const checklist = agent365Checklist({
       agentName: agentName || purviewAppName, lang, blueprintId: a365?.blueprintId ?? "",
-      blueprintAppId: a365?.blueprintAppId ?? "", messagingEndpoint,
+      blueprintAppId: a365?.blueprintAppId ?? "", messagingEndpoint, teams,
     });
     const setupPath = join(envPath.replace(/[^/\\]*$/, ""), "AGENT365_SETUP.md");
     try { writeFileSync(setupPath, checklist); ok(`Agent 365 completion steps written to ${setupPath}`); }
@@ -826,13 +980,17 @@ async function main(work) {
       console.log(`  identity     : ${a365.agentIdentityId}`);
       console.log(`  registration : ${a365.registrationId}${a365.verified ? "  (verified)" : ""}`);
       console.log(`  endpoint     : ${agentUrl}`);
-      console.log(`\n${C.b}${C.y}Two things the wizard still can't do:${C.reset}`);
-      console.log(`  1. Register the messaging endpoint. Microsoft has not exposed this API to every tenant yet —`);
-      console.log(`     its own CLI falls back to the same manual step. Teams Developer Portal -> Tools -> Bot management:`);
-      console.log(`       Bot ID           ${a365.blueprintAppId}`);
-      console.log(`       Endpoint address ${messagingEndpoint}`);
-      console.log(`  2. Assign the Agent 365 licence to the agent identity, if your tenant requires one`);
-      console.log(`\n  Then verify: M365 admin center -> Agents -> All agents -> "${agentName}"\n`);
+      if (teams) {
+        console.log(`  Teams app     : ${teams.teamsAppId || `${C.y}not published${C.reset}`}`);
+        console.log(`  installed for : ${teams.installed.filter((x) => x.status !== "failed").length} user(s)`);
+        console.log(`  endpoint      : ${teams.endpoint ? `${messagingEndpoint} (${teams.endpoint.action})` : `${C.y}NOT registered — see above${C.reset}`}`);
+        if (hello?.ok) console.log(`  ${C.g}A message from "${agentName}" is waiting in your Teams — reply to it.${C.reset}`);
+        for (const err of teams.errors) console.log(`  ${C.y}!${C.reset} ${err}`);
+      } else {
+        console.log(`\n  ${C.y}Not published to Teams.${C.reset} Re-run and answer yes to "Publish to Teams" when you want it there.`);
+      }
+      console.log(`\n  ${C.d}Blueprint-based agents need no per-agent licence (Microsoft's own CLI assigns licences only to AI-teammate users).${C.reset}`);
+      console.log(`\n  Verify: M365 admin center -> Agents -> All agents -> "${agentName}"; Teams -> Apps -> Built for your org.\n`);
     } else {
       console.log(`\n${C.b}${C.y}Agent 365 was NOT registered.${C.reset} To do it by hand, see AGENT365_SETUP.md\n`);
     }
@@ -869,7 +1027,7 @@ export function makeCertificate({ work, subjectName, pfxPw, run = sh }) {
       // Don't leave the private key in the user's personal store.
       "Remove-Item -Path (Join-Path Cert:\\CurrentUser\\My $c.Thumbprint) -Force",
     ].join("; ");
-    run("pwsh", ["-NoProfile", "-Command", ps], { env: { ...procEnv, A365_PFX_PW: pfxPw } });
+    run(PWSH, ["-NoProfile", "-Command", ps], { env: { ...procEnv, A365_PFX_PW: pfxPw } });
   } else {
     const keyPem = join(work, "key.pem");
     run("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-keyout", keyPem, "-out", certPem,
@@ -907,7 +1065,17 @@ function printJournal() {
   for (const j of journal) console.error(`  • ${j}`);
 }
 
-export function integrationSnippet(lang) {
+export function integrationSnippet(lang, ctx = {}) {
+  if (lang === "proxy") {
+    const dir = (ctx.envPath || "./.env").replace(/[^/\\]*$/, "") || "./";
+    return [
+      `  cd ${dir}`,
+      "  npx --package @zaatarlabs/agent365-governance-proxy agent365-govern-proxy",
+      `      # fronts ${ctx.upstreamUrl || "<vendor url>"} on port ${ctx.proxyPort || 8787}; Teams bridge on /api/messages`,
+      `  # expose http://localhost:${ctx.proxyPort || 8787} as ${ctx.agentUrl || "https://<your public url>"} (reverse proxy / tunnel)`,
+      "  # health: /_governance/health returns 503 until the guard is governing",
+    ].join("\n");
+  }
   if (lang.startsWith("py")) {
     return [
       "  from agent365_governance import load_config, PurviewGuard",
@@ -932,7 +1100,7 @@ export function integrationSnippet(lang) {
   ].join("\n");
 }
 
-export function agent365Checklist({ agentName, lang, blueprintId, blueprintAppId = "", messagingEndpoint = "" }) {
+export function agent365Checklist({ agentName, lang, blueprintId, blueprintAppId = "", messagingEndpoint = "", teams = null }) {
   const obsNote = lang.startsWith("py")
     ? "Observability (Activity tab) for Python is preview — use the Node or .NET package for it, or skip."
     : "Wire observability with initObservability() + refreshTurnObservability() + withAgentScope() (see the package README).";
@@ -956,29 +1124,33 @@ permissions inheritable by agent identities, and sets the blueprint's identifier
 URI (api://botid-<appId>) with an access_as_user scope — the same configuration
 \`a365 setup permissions bot\` produces.
 
-## What still needs a human
+## Teams
 
-1. **Messaging endpoint.** Microsoft has not exposed the endpoint-registration
-   API to every tenant; its own CLI falls back to this manual step too.
+${teams ? `The wizard published the app to the organisation's app catalog (Teams app id
+${teams.teamsAppId || "n/a"}), installed it for the pilot users, and registered the
+messaging endpoint ${teams.endpoint ? `(${messagingEndpoint})` : "— NOT registered, see the run log"}
+in the Teams Developer Portal (bot id = blueprint appId ${blueprintAppId}).`
+: `Not published to Teams in this run. To do it by hand:
      Teams Developer Portal -> Tools -> Bot management -> New bot
        Bot ID           ${blueprintAppId || "<blueprint appId>"}
        Endpoint address ${messagingEndpoint || "https://<your-agent>/api/messages"}
-   Until this is done, Teams cannot deliver messages to the agent. Purview
-   governance and the Agent 365 registration do not depend on it.
+     then upload the app package (M365 admin center -> Integrated apps -> Upload custom apps).`}
 
-2. **Licensing.** Viewing the agent inventory needs only the AI Reader role, but
-   applying identity governance or Conditional Access to agents requires
-   Microsoft Entra Agent ID licensing.
+## What still needs a human
+
+1. **Nothing for the Teams path.** If the hello message did not arrive, the agent
+   must accept Bot Framework activities at ${messagingEndpoint || "/api/messages"} and
+   authenticate with the blueprint credentials the wizard wrote to .env.
+
+2. **Licensing.** Blueprint-based agents (this kind) need no per-agent licence;
+   Microsoft's a365 CLI only assigns licences to AI-teammate agent users.
+   Viewing the inventory needs the AI Reader role; identity governance or
+   Conditional Access on agents needs Microsoft Entra Agent ID licensing.
 
 3. **Wire observability in code.** ${obsNote}
    The OBO token is minted per AUTHENTICATED turn, so only Teams/Copilot turns
    appear in the Activity tab. Off-channel surfaces are governed by Purview but
    won't show there.
-
-4. **Publishing to Teams** (optional, and separate from registry registration):
-     a365 publish --aiteammate --agent-name "${agentName}"
-     M365 admin center -> Integrated apps -> Upload custom apps
-   Keep description.short <= 80 chars.
 
 ## Migration note
 

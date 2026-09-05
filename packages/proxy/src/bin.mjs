@@ -10,6 +10,7 @@
 import "dotenv/config";
 import { loadConfig, createPurviewGuard } from "@zaatarlabs/agent365-governance-kit";
 import { createGovernanceProxy } from "./server.mjs";
+import { createTeamsBridge } from "./teams.mjs";
 
 function arg(name, dflt) {
   const i = process.argv.indexOf(`--${name}`);
@@ -29,9 +30,15 @@ agent365-govern-proxy — Microsoft Purview governance for an agent you can't mo
   --response-paths <a,b>  Custom dot-paths to the reply text.
   --streaming <mode>   buffer (default, governed) | passthrough (NOT governed)
   --max-body <bytes>   Request body cap (default 5242880).
+  --teams <on|off>     Teams bridge on /api/messages (default: on when the wizard
+                       wrote agent_id + connections__service_connection__* to .env).
+  --upstream-path <p>  Path the Teams bridge posts a turn to (default per dialect:
+                       a2a "/", openai "/v1/chat/completions", generic "/").
+  --upstream-model <m> Model name to send with the openai dialect.
 
-Register this proxy's public URL as the agentInstance url in Agent 365 and the
-registry points at a governed endpoint.
+Register this proxy's public URL as the agent's endpoint in Agent 365 and the
+registry points at a governed endpoint; with the Teams bridge on, Teams
+messages reach the vendor agent through the same Purview checks.
 `);
   process.exit(0);
 }
@@ -45,18 +52,32 @@ if (!upstream) {
 const guard = createPurviewGuard(loadConfig().purview);
 const list = (v) => (v ? v.split(",").map((s) => s.trim()).filter(Boolean) : undefined);
 
+const port = Number(arg("port", process.env.GOVERNANCE_PROXY_PORT ?? 8787));
+const host = arg("host", "0.0.0.0");
+
+const teamsWanted = arg("teams", process.env.agent_id || process.env.connections__service_connection__settings__clientId ? "on" : "off") !== "off";
+let teams = null;
+if (teamsWanted) {
+  const bridge = await createTeamsBridge({
+    upstream, guard, port,
+    dialect: arg("dialect", process.env.GOVERNANCE_DIALECT || "auto"),
+    upstreamPath: arg("upstream-path"), upstreamModel: arg("upstream-model", process.env.GOVERNANCE_UPSTREAM_MODEL),
+  });
+  teams = bridge.handler;
+  console.log(`[proxy] Teams bridge on /api/messages (${bridge.anonymous ? "ANONYMOUS — no agent_id configured; fine for the Playground, not for Teams" : `app ${bridge.appId}`}; observability ${bridge.observability ? "on" : "off"})`);
+}
+
 const { listen, stats } = createGovernanceProxy({
   upstream,
   guard,
-  dialect: arg("dialect", "auto"),
+  teams,
+  dialect: arg("dialect", process.env.GOVERNANCE_DIALECT || "auto"),
   requestPaths: list(arg("request-paths")),
   responsePaths: list(arg("response-paths")),
   streaming: arg("streaming", "buffer"),
   maxBodyBytes: Number(arg("max-body", 5 * 1024 * 1024)),
 });
 
-const port = Number(arg("port", process.env.GOVERNANCE_PROXY_PORT ?? 8787));
-const host = arg("host", "0.0.0.0");
 await listen(port, host);
 
 console.log(`[proxy] listening on http://${host}:${port}`);

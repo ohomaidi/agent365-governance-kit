@@ -1,288 +1,294 @@
 # Agent 365 Governance Kit
 
-## Download and run
+One installer that puts a custom AI agent under **Microsoft Agent 365** and
+**Microsoft Purview** — identity, registry, DLP, DSPM, Teams — for agents you
+built *and* for vendor agents you cannot modify.
 
-Hand a customer **one file**. They unzip it and double-click. No cloning, no terminal.
+Hand the customer **one file**. They double-click it, sign in as a Global
+Administrator, answer four questions, and their agent is registered, governed,
+published to Teams, and sends them a hello.
+
+## Download and run
 
 | Platform | Download | Then double-click |
 |---|---|---|
 | **macOS** | [Agent365-Setup-macOS.zip](https://github.com/ohomaidi/agent365-governance-kit/releases/latest/download/Agent365-Setup-macOS.zip) | **Agent 365 Setup** |
 | **Windows** | [Agent365-Setup-Windows.zip](https://github.com/ohomaidi/agent365-governance-kit/releases/latest/download/Agent365-Setup-Windows.zip) | **Agent 365 Setup.vbs** |
 
-The browser opens onto the setup wizard. It asks for three things — where the agent
-lives, what it's called, and its web address — and works the rest out itself.
+**Nothing to install first.** No Azure CLI, no PowerShell modules, no terminal.
+If Node.js or PowerShell 7 are missing, the launcher and the page offer to
+download an official copy into the user's own folder (`~/.agent365`); nothing
+system-wide changes and no admin password is asked for.
 
-**Requires** Node.js 18+, Azure CLI and PowerShell 7 on the machine running setup, plus a
-tenant Global Administrator. All three have ordinary installers; anything missing is
-named with a download link rather than a stack trace.
+**Sign-in is built in.** Two short device-code sign-ins (the page shows a code,
+Microsoft's page takes the password): one for Microsoft 365, one for the Teams
+Developer Portal. They appear in the tenant's sign-in log as *Microsoft Graph
+Command Line Tools* and *Teams Toolkit*. The first asks for a one-time
+"consent on behalf of your organization".
 
-**No terminal at any point** — signing in to Azure is a button on the first screen, with
-a tenant box and a device-code option for machines that can't pop a sign-in window.
-**Rehearse** runs the whole thing and changes nothing.
+**Rehearse** runs the whole thing and changes nothing. **Provision** names the
+tenant, mode and scope, asks once, then does it all and streams the log.
 
-> Not yet notarised for macOS: the first launch may need right-click → Open.
-
-Everything below is for working on the kit itself.
-
----
-
-Drop-in **Microsoft governance for any custom AI agent** — in **TypeScript/Node, Python, and .NET**. Three layers:
-
-- **Purview guard** — runs every prompt and reply through Microsoft Purview (Graph `processContent`) so they're audited, classified, captured for DSPM-for-AI, and **blocked inline** by your DLP policies. Works on *any* channel, including non-Microsoft surfaces (web portals, APIs). Available in all three languages.
-- **Agent 365 identity + registration** — creates the agent identity blueprint and registers the agent (and its A2A card) in the Agent 365 registry through Graph, so admins can see and govern it. Plus observability wiring so authenticated turns light up the admin-center **Activity tab**.
-- **Governance proxy** — the same Purview checks applied to an agent **you cannot modify**. A third-party or vendor agent gets governed without touching its code; register the proxy's URL and the registry itself points at a governed endpoint.
-
-A one-time **wizard** provisions the whole Microsoft side after a tenant admin signs in, writes your config, and registers the agent. It runs from a terminal or from a **browser form the customer double-clicks**.
-
-```
-agent365-governance-kit/
-├── wizard/
-│   ├── agent365-govern.mjs   # the setup wizard — provisions any tenant
-│   └── lib/
-│       ├── agent365.mjs      # Agent 365 blueprint + registry registration
-│       └── capabilities.mjs  # tenant capability probe (--check)
-├── installer/                # double-click launchers + browser wizard
-│   ├── macos/                #   Agent 365 Setup.app
-│   └── windows/              #   Agent 365 Setup.vbs
-├── packages/
-│   ├── typescript/           # @zaatarlabs/agent365-governance-kit  (Purview + Agent 365)
-│   ├── python/               # agent365-governance-kit              (Purview)
-│   ├── dotnet/               # ZaatarLabs.Agent365.Governance       (Purview)
-│   └── proxy/                # @zaatarlabs/agent365-governance-proxy
-├── AGENT365_SETUP.md         # the admin steps that genuinely still need a human
-└── README.md
-```
+> Not notarised for macOS: the first launch may need right-click → Open.
 
 ---
 
-## Safety model (read this first)
+## What it does — all of it
 
-This kit changes **tenant-wide compliance configuration** and sits in the request path of a
-production agent. Its defaults are chosen so that a mistake fails safe:
+Everything below is performed by the installer, in this order, and read back
+to verify. Nothing on this list is a manual step.
 
-| Behaviour | Default | Why |
-|---|---|---|
-| Guard enabled | **on** (`PURVIEW_ENABLED=false` to opt out) | A missing env var must not silently disable governance. |
-| Unreachable Purview | **blocks** (`PURVIEW_FAIL_CLOSED=false` to opt out) | An outage must not become an ungoverned window. |
-| Incomplete config | **blocks**, logs which vars are missing | "Misconfigured" is a failure, not "off". |
-| New DLP policy mode | **TestWithNotifications** | Audits and alerts; blocks nothing until you review results. |
-| New DLP policy scope | **a pilot group** (created for you when you name people) | Purview binds only to a tenant or a mail-enabled group; tenant-wide needs two explicit confirmations. |
-| DSPM content ingestion | **off** | Storing prompt/response text is a privacy decision, not a default. |
-| Provisioning privileges | **revoked after use** | The connector keeps only the two Graph roles it needs at runtime. |
+### In the tenant (Entra + Purview)
 
-Every HTTP call is bounded by a timeout and retries throttling (429) and transient
-5xx with backoff. Client secrets are redacted from all log output.
+1. **Checks the tenant can do it** before touching it: licences, Exchange
+   Online, the Purview and Agent 365 Graph permissions, and the admin's roles.
+2. **Pilot group.** "Just me" / "specific people" become a Microsoft 365 group
+   the installer creates and maintains — Purview binds a policy to a tenant or
+   a mail-enabled group, never to individual users.
+3. **Connector app registration** (the Purview daemon): secret, certificate,
+   `Content.Process.All`, `ProtectionScopes.Compute.All`, `Exchange.ManageAsApp`,
+   and the Agent 365 app roles it needs to register agents on the admin's behalf.
+4. **Compliance Administrator** on the connector — provisioning only, revoked
+   at the end (default on).
+5. **DLP policy** for the Applications workload, in **test mode** by default,
+   scoped to the pilot group: credit-card rule, optional custom keyword
+   sensitive-information type, notifications.
+6. **DSPM for AI collection policy** (one per tenant; a second agent is appended
+   to it). Prompt/response ingestion is **off** unless the data owner turns it on.
+7. **Validation**: connector token → `protectionScopes/compute` →
+   `processContent`, live.
+8. **Revoke** Compliance Administrator and `Exchange.ManageAsApp`.
 
-## 0. Build the installer packages
+### In Agent 365
 
-```bash
-./installer/package.sh          # -> dist-installer/*.zip
-```
+9. **Agent identity blueprint** (`applications/microsoft.graph.agentIdentityBlueprint`)
+   with a sponsor, a secret, and the identifier URI `api://botid-<appId>` with
+   an `access_as_user` scope — what Microsoft's own `a365` CLI configures.
+10. **Blueprint service principal** and **agent identity**.
+11. **Inheritable permissions** for the Messaging Bot API, the Observability
+    API and Agent 365 Tools, polled until they read back.
+12. **Tenant-wide admin consent** from the blueprint to those three resources.
+13. **Registration** in the Agent 365 registry (`copilot/agentRegistrations`)
+    with an A2A agent card, verified by reading it back. The agent appears in
+    **Microsoft 365 admin center → Agents → All agents**.
 
-Produces the two files linked at the top of this README. Each zip carries the
-launcher plus only the kit files the installer needs — the wizard and installer
-use nothing but Node built-ins, so there is nothing to install on the far side.
+### In Teams
 
-To run it from a checkout without packaging:
+14. **App package** built from the blueprint (manifest id = bot id = blueprint
+    appId, `webApplicationInfo.resource = api://botid-<appId>`, generated icons)
+    and **published to the organisation's app catalog** — a new version is
+    added if the app already exists.
+15. **Installed** in the personal scope of the admin, the attributed user and
+    every member of the pilot group, so it is in their Teams app bar.
+16. **Messaging endpoint registered** in the Teams Developer Portal (bot id =
+    blueprint appId, endpoint `https://<agent>/api/messages`).
+17. **Proof**: the installer mints a token *as the agent* and sends a hello into
+    the admin's Teams. If it arrives, the identity, consent, catalog, install
+    and endpoint all work. The admin replies to it to test the agent itself.
 
-```bash
-node installer/server.mjs
-```
+### On the agent
 
-The browser wizard drives the same CLI wizard underneath via `--answers`, so
-there is no second implementation to drift. See
-[`installer/README.md`](installer/README.md).
+18. **Writes the agent's `.env`** (backing up the old one) with everything the
+    runtime needs: `PURVIEW_*` for the guard; `agent365Observability__*` for the
+    Activity tab; `agent_id` and `connections__service_connection__*` for
+    Teams; the registry, identity, Teams app and endpoint ids for reference.
+19. For a **vendor agent**: the same `.env` plus `GOVERNANCE_UPSTREAM` and the
+    wire format, ready for the governance proxy (below).
 
-## 0b. Check the tenant can actually do it
+**Licences:** blueprint-based agents (this kind) need no per-agent licence.
+Microsoft's `a365` CLI assigns licences only to AI-teammate agent *users*.
 
-```bash
-node wizard/agent365-govern.mjs --check
-```
+---
 
-Tooling readiness ("is `az` installed?") says nothing about whether the *tenant*
-supports any of this. An unlicensed tenant passes every tooling check and then
-fails ten minutes later at `Connect-IPPSSession`, in front of the customer.
+## Two kinds of agent
 
-This asks the tenant directly — licences, `.onmicrosoft.com` domain, Exchange
-Online, the Purview Graph app roles, the Agent 365 registry, and the directory
-roles you actually hold — and prints what to fix. The wizard also runs it before
-the interview, and the installer shows it on the first screen.
+### An agent you built
 
-## 0c. Rehearse (recommended before any customer run)
-
-```bash
-node wizard/agent365-govern.mjs --dry-run     # or: npm run plan
-```
-
-Walks the full interview and prints exactly what **would** be created. Mutates nothing.
-
-For a reproducible run, supply every answer up front:
-
-```bash
-node wizard/agent365-govern.mjs --answers answers.json --dry-run
-```
-
-## 1. Provision (one time, tenant admin)
-
-From the repo root:
-
-```bash
-node wizard/agent365-govern.mjs      # or: npm run init
-```
-
-The wizard signs you in (`az login` as Global Admin), asks for your variables, your
-agent's language, **who the policy applies to**, and **whether it enforces**, then:
-
-0. when you scope to specific people, creates (or reuses) a **Microsoft 365 pilot group**
-   holding them — Purview's Applications-workload DLP binds to a tenant or a mail-enabled
-   group only; there is no per-user binding,
-1. creates a dedicated app registration + secret + certificate,
-2. grants `Content.Process.All`, `ProtectionScopes.Compute.All`, `Exchange.ManageAsApp` —
-   plus `AgentInstance.ReadWrite.All` and the blueprint roles when you ask for
-   Agent 365 registration,
-3. assigns the **Compliance Administrator** role (provisioning only — see step 8),
-4. creates a DLP policy + rules (Credit Card and/or your custom keywords) and, if you
-   ask for it, a DSPM collection policy,
-5. **registers the agent in Agent 365** — identity blueprint → credential → identifier URI
-   (`api://botid-<appId>` + `access_as_user`) → blueprint principal → agent identity →
-   inheritable permissions → `POST /beta/copilot/agentRegistrations` with the agent card,
-   read back to verify — then **grants tenant-wide admin consent** from the blueprint to
-   the Messaging Bot API, Observability API and Agent 365 Tools (what
-   `a365 setup permissions bot` does). Re-running finds and reuses each of these,
-6. writes all `PURVIEW_*`, `agent365Observability__*` and `AGENT365_INSTANCE_ID` values
-   into your app's `.env` — **replacing** any previous block it wrote, after a `.bak`,
-7. validates end to end: **token → `protectionScopes/compute` → `processContent`**,
-8. offers to **revoke** Compliance Administrator + `Exchange.ManageAsApp`, which are
-   only needed to create policies, never at runtime,
-9. prints the integration snippet for your language and writes `AGENT365_SETUP.md`.
-
-Registration is performed **app-only, as the connector app** — not through `az rest`.
-The Azure CLI is a first-party app whose token carries no agent scopes at all, so
-registry calls made through it fail in every tenant, however well licensed.
-
-**Requirements:** Azure CLI (`az`), PowerShell 7 (`pwsh`), a tenant **Global Admin**, and
-PowerShell Gallery reachability (checked up front). On macOS/Linux `openssl` is also
-needed; on Windows the certificate comes from `New-SelfSignedCertificate` instead.
-
-> **Why a dedicated app, not your agent's identity?** Agentic identities can't mint app-only tokens (`AADSTS82001`). The guard uses a normal app registration with app-only client credentials.
-
-## 2. Integrate (two calls)
-
-Pick your language — full instructions in each package README:
-
-| Language | Package | Integration |
-|---|---|---|
-| TypeScript / Node | [`packages/typescript`](packages/typescript/README.md) | `guard.evaluate(text, "uploadText", { correlationId })` |
-| Python | [`packages/python`](packages/python/README.md) | `guard.evaluate(text, "uploadText", correlation_id=cid)` |
-| .NET | [`packages/dotnet`](packages/dotnet/README.md) | `await guard.EvaluateAsync(text, "uploadText", correlationId: cid)` |
-| **Can't change the code** | [`packages/proxy`](packages/proxy/README.md) | Run the guard in a reverse proxy — no integration at all |
-
-The pattern is the same everywhere:
+Point the installer at the folder. It detects the language (Node, Python, .NET),
+writes the `.env`, and prints the two lines to add:
 
 ```
 inbound = guard.evaluate(prompt, "uploadText")   # block before the model sees it
 if inbound.blocked: return inbound.reason
-reply = yourModel(prompt)                          # Claude, OpenAI, anything
+reply = yourModel(prompt)
 outbound = guard.evaluate(reply, "downloadText")  # block before returning
 if outbound.blocked: return outbound.reason
-return reply
 ```
 
-### Checking `blocked` is not the whole story
+For Teams, the agent must accept Bot Framework activities on `/api/messages`
+and authenticate with the connection the installer wrote. The Microsoft 365
+Agents SDK does this out of the box; the sample agent in this kit's history
+(`abbas`) shows the wiring, including per-turn observability for the Activity
+tab.
 
-`evaluate()` also returns `evaluated` and `degraded`. `blocked === false` can mean
-"Purview allowed it" *or* "the guard is switched off" — tell them apart at startup:
+| Language | Package | Call |
+|---|---|---|
+| TypeScript / Node | [`packages/typescript`](packages/typescript/README.md) | `guard.evaluate(text, "uploadText", { correlationId })` |
+| Python | [`packages/python`](packages/python/README.md) | `guard.evaluate(text, "uploadText", correlation_id=cid)` |
+| .NET | [`packages/dotnet`](packages/dotnet/README.md) | `await guard.EvaluateAsync(text, "uploadText", correlationId: cid)` |
 
-```ts
-if (guard.state !== "ready") {
-  // "disabled"      → someone set PURVIEW_ENABLED=false
-  // "misconfigured" → guard.missing lists the env vars to fix
-  console.error(`Purview guard is ${guard.state}`, guard.missing);
-}
+`evaluate()` also returns `evaluated` and `degraded`; `guard.state` is
+`ready`, `disabled` or `misconfigured` (with `guard.missing`). Alert on
+`degraded === "error"` in production.
+
+### A vendor agent you cannot modify
+
+Choose *third-party agent* in the installer and give it the vendor's API
+address. The **governance proxy** becomes the agent as far as Purview,
+Agent 365 and Teams are concerned:
+
+```
+users / Teams --> [ proxy: Purview(prompt) -> vendor API -> Purview(reply) ] --> reply
 ```
 
-Alert on `degraded === "error"` in production: it means the governance plane was
-unreachable for that turn.
-
-## 3. Govern an agent you can't modify
-
-The guard is a library your agent calls, which only works when you own the source.
-For a third-party or vendor agent, run it in a proxy instead:
+- **API traffic** through the proxy is governed in the vendor's own wire format:
+  Agent2Agent JSON-RPC, OpenAI chat completions, or configurable JSON paths.
+  Refusals come back in the caller's protocol.
+- **Teams bridge** on `/api/messages`: the proxy authenticates as the agent's
+  blueprint (Microsoft 365 Agents SDK), runs the same two Purview checks, calls
+  the vendor, replies in the chat, and records each turn for the Agent 365
+  Activity tab. A blocked message is refused in Teams with the reason.
 
 ```bash
-GOVERNANCE_UPSTREAM=https://vendor.example.com node packages/proxy/src/bin.mjs --port 8787
+cd ~/.agent365/proxy-<name>           # where the installer wrote the .env
+npx --package @zaatarlabs/agent365-governance-proxy agent365-govern-proxy
+# expose http://localhost:8787 at the public https address you gave the installer
 ```
 
-Then register **the proxy's URL** as the agent's endpoint, and the Agent 365
-registry record points at a governed address. Full details, wire formats and
-limits in [`packages/proxy`](packages/proxy/README.md).
-
-## 4. What the wizard can't do for you
-
-Registration, identity, inheritable permissions and admin consent are all automated
-and read back to verify. Two things still need a person:
-
-- **The messaging endpoint.** Microsoft has not exposed the Teams endpoint-registration
-  API to every tenant — its own `a365` CLI falls back to the same manual step. The wizard
-  prints the exact values: Teams Developer Portal → Bot management → Bot ID =
-  `<blueprint appId>`, endpoint = `https://<agent>/api/messages`. Purview governance and
-  the Agent 365 registration do not depend on it.
-- **Licence assignment**, if your tenant requires one.
-
-Both are written to **[AGENT365_SETUP.md](AGENT365_SETUP.md)** next to your `.env`.
-
-> The legacy Entra agent registry API retired **15 June 2026**. Agents registered
-> before then must be re-registered; re-running the wizard does that.
+`/_governance/health` returns 503 until the guard is actually governing.
+The proxy only governs traffic that traverses it: a SaaS agent users open
+directly in a browser must be forced through it (DNS/network policy) or
+covered by endpoint DLP.
 
 ---
 
-## Configuration reference
+## Safety model
+
+- **Test mode by default.** The DLP policy is created in `TestWithNotifications`
+  (audits and alerts, blocks nothing). Active blocking needs an explicit choice
+  and a typed `ENFORCE`.
+- **Pilot scope by default.** Tenant-wide needs an explicit choice and a typed
+  `TENANT-WIDE`.
+- **Fail closed by default.** If Purview is unreachable the guard blocks
+  (`PURVIEW_FAIL_CLOSED=true`).
+- **Least privilege, briefly.** Compliance Administrator and Exchange access are
+  granted for provisioning and revoked at the end; the runtime keeps only the two
+  Purview permissions.
+- **Credentials.** The PFX password travels through the environment, never a
+  command line or a script. Generated files are shredded on exit. Tokens and
+  answers live in a `0600` temp folder and are removed when setup closes. The
+  installer page binds 127.0.0.1 only.
+- **Rehearsal first.** `--dry-run` / *Rehearse* validates users and groups but
+  creates nothing.
+- **Honest reporting.** Every write is read back; anything that could not be
+  verified is printed as a warning, not hidden behind a green tick. A stopped
+  run lists exactly what was created so it can be undone.
+
+---
+
+## For engineers
+
+```
+agent365-governance-kit/
+├── installer/                 # double-click launchers + browser page + loopback server
+│   ├── macos/Agent 365 Setup.app
+│   ├── windows/Agent 365 Setup.vbs
+│   ├── server.mjs, ui.html
+│   └── package.sh             # builds the two customer zips
+├── wizard/
+│   ├── agent365-govern.mjs    # the setup wizard the page drives (--answers, --dry-run, --check)
+│   └── lib/
+│       ├── auth.mjs           # device-code sign-in, token cache, delegated Graph + Dev Portal clients
+│       ├── agent365.mjs       # blueprint → identity → inheritable permissions → registration
+│       ├── teams.mjs          # app package, org catalog, per-user install, messaging endpoint, hello
+│       └── capabilities.mjs   # tenant capability probe
+├── packages/
+│   ├── typescript/            # @zaatarlabs/agent365-governance-kit   (Purview guard, Node)
+│   ├── python/                # agent365-governance-kit                (Purview guard)
+│   ├── dotnet/                # ZaatarLabs.Agent365.Governance         (Purview guard)
+│   └── proxy/                 # @zaatarlabs/agent365-governance-proxy  (reverse proxy + Teams bridge)
+└── .github/workflows/ci.yml
+```
+
+### Running the wizard from a terminal
+
+```bash
+node wizard/agent365-govern.mjs --check                       # can this tenant do it?
+node wizard/agent365-govern.mjs --dry-run                     # rehearse
+node wizard/agent365-govern.mjs                               # interactive
+node wizard/agent365-govern.mjs --answers answers.json        # scripted (what the page does)
+```
+
+The page never re-implements provisioning: it writes an answers file and runs
+the wizard with `--answers`, then streams its output. One code path.
+
+Environment knobs: `A365_TOKEN_CACHE` (reuse a sign-in), `A365_TENANT` (tenant
+for the device-code prompt), `A365_PWSH` (path to a PowerShell 7), `A365_INSTALLER_PORT`.
+
+### Why no Azure CLI
+
+The Azure CLI's Graph token cannot carry `AppCatalog.*` (Microsoft pre-authorises
+first-party apps per scope; AADSTS65002 refuses the rest) and the Teams
+Developer Portal rejects it outright. Both were verified live. The kit's own
+sign-in requests exactly the delegated scopes it needs under public client ids
+Microsoft ships for this purpose.
+
+### Configuration reference
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `PURVIEW_ENABLED` | `true` | `false` disables the guard entirely (allows everything). |
-| `PURVIEW_TENANT_ID` | — | Entra tenant id. **Required.** |
-| `PURVIEW_CLIENT_ID` | — | Connector app registration. **Required.** |
-| `PURVIEW_CLIENT_SECRET` | — | Its client secret. **Required.** |
+| `PURVIEW_TENANT_ID` / `PURVIEW_CLIENT_ID` / `PURVIEW_CLIENT_SECRET` | — | Connector identity. **Required.** |
 | `PURVIEW_APP_LOCATION` | `PURVIEW_CLIENT_ID` | App id the DLP policy is scoped to. |
-| `PURVIEW_USER_ID` | — | Entra **object id** interactions are attributed to. **Required.** |
+| `PURVIEW_USER_ID` | — | Entra **object id** interactions are attributed to when no per-call user is given. **Required.** |
 | `PURVIEW_APP_NAME` | `Custom AI App` | Name shown in Purview audit/DSPM. |
 | `PURVIEW_FAIL_CLOSED` | `true` | `false` allows traffic when Purview is unreachable. |
-| `PURVIEW_TIMEOUT_MS` | `10000` | Per-request timeout (1000–120000). |
-| `PURVIEW_MAX_RETRIES` | `3` | Retries for 429/5xx (0–10). |
-| `PURVIEW_DEVICE_TYPE` | `Unmanaged` | Device type reported to Purview. |
-| `PURVIEW_DEVICE_IP` | *(unset)* | Client IP. **Omitted when unset** rather than faked. |
+| `PURVIEW_TIMEOUT_MS` / `PURVIEW_MAX_RETRIES` | `10000` / `3` | Per-request timeout; retries for 429/5xx. |
+| `PURVIEW_DEVICE_TYPE` / `PURVIEW_DEVICE_IP` | `Unmanaged` / unset | Device metadata; IP is omitted when unset rather than faked. |
+| `agent365Observability__*` | written | Blueprint id/secret, agent identity id, tenant, name — for the Activity tab. |
+| `agent_id`, `connections__service_connection__settings__*` | written | Agents SDK connection: Teams replies as the blueprint. |
+| `AGENT365_REGISTRATION_ID`, `AGENT365_AGENT_IDENTITY_ID`, `AGENT365_TEAMS_APP_ID`, `AGENT365_MESSAGING_ENDPOINT`, … | written | Reference ids for the registry, identity, Teams app and endpoint. |
+| `GOVERNANCE_UPSTREAM`, `GOVERNANCE_DIALECT`, `GOVERNANCE_PROXY_PORT` | written (proxy) | Vendor API, wire format (`a2a`/`openai`/`generic`/`auto`), listen port. |
 
-## Tests
+### Tests
 
 ```bash
-npm run test:all       # TypeScript + wizard + Python + .NET
+npm run test:all       # TypeScript + wizard + Python + .NET + proxy
 ```
 
 | Suite | Count | Covers |
 |---|---|---|
-| TypeScript | 20 | defaults, misconfiguration, verdicts, retries, timeouts, caching, payload, redaction |
-| Python | 19 | same behaviours, mirrored |
-| .NET | 18 | same behaviours, mirrored |
-| Wizard | 62 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 payloads and call ordering |
-| Proxy | 20 | enforcement, protocol-shaped refusals, attribution, health |
+| TypeScript guard | 20 | defaults, misconfiguration, verdicts, retries, timeouts, caching, payload, redaction |
+| Python guard | 19 | same behaviours, mirrored |
+| .NET guard | 18 | same behaviours, mirrored |
+| Wizard | 77 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 call order + replication, inheritable permissions, consent, Teams package/catalog/install/endpoint, tenant probe |
+| Proxy | 29 | enforcement, protocol-shaped refusals, attribution, health, Teams bridge through the real Agents SDK adapter |
 
-**139 tests total.** Registration and policy creation are also verified live against a licensed tenant.
+**163 tests.** CI runs all of them on every push. The tenant-side flow
+(Purview policies, blueprint, identity, consent, registration, Teams catalog,
+installs, endpoint, hello) is also exercised live against a licensed tenant
+before each release.
 
-CI runs all of them on every push ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+### Cleaning a tenant up
+
+Reverse order: Teams app (Teams admin center → Manage apps) and the Developer
+Portal bot; the registration (`DELETE /beta/copilot/agentRegistrations/{id}`,
+with the connector's token — it owns the record); the agent identity, then the
+blueprint (Entra → Agent identities), each purged from the recycle bin; Purview
+rules → policies → sensitive-information type → DSPM policy (re-grant Compliance
+Administrator to the connector first); the pilot group; the connector app.
+
+---
 
 ## Notes & limits
 
-- **Block direction:** the Application enforcement plane blocks **UploadText** (the prompt), not the model's response. Govern by blocking the *question*.
-- **Propagation:** new DLP policies can take up to ~1 hour to start enforcing.
-- **Test mode blocks nothing.** A policy created in `TestWithNotifications` audits and alerts only. Re-run the wizard and choose *Enable* once you've reviewed the results.
-- **Attribution:** every interaction is attributed to `PURVIEW_USER_ID` unless you pass the real signed-in user per call. For a multi-user app, pass it — otherwise the DSPM/audit trail shows one identity for everyone.
-- **DSPM ingestion stores prompt and response text** in Purview. Off by default; clear it with the customer's privacy owner before turning it on.
-- **Per-user scoping:** the managed-app plane doesn't accept user/group scoping via PowerShell for *all* policy types; the wizard sets it in the policy `Locations`, and you can refine it in the Purview portal.
+- **Block direction:** the Applications enforcement plane blocks **UploadText** (the prompt), not the model's response. Govern by blocking the *question*; the reply check is belt and braces.
+- **Propagation:** a new DLP policy can take up to ~1 hour to start enforcing.
+- **Test mode blocks nothing.** Re-run and choose *Enable* once the audit results look right.
+- **Attribution:** pass the real signed-in user per call in a multi-user app; the Teams bridge and the sample agent do (`from.aadObjectId`).
+- **DSPM ingestion stores prompt and response text** in Purview. Off by default.
 - **Billing:** Purview API calls for custom apps are metered (pay-as-you-go on the Azure subscription).
-- **PowerShell:** the wizard pins ExchangeOnlineManagement `3.5.1` (newer 3.10.x throws on PowerShell 7.6).
-- **Registration uses the Agent Registration API** (`/beta/copilot/agentRegistrations`), which Microsoft labels subject to change; the identity steps are on `v1.0`. It runs app-only under the connector app — the Azure CLI's own token carries no agent scopes, so `az rest` cannot make these calls. The older `/beta/agentRegistry/*` surface retired on 15 June 2026.
-- **Scope is a tenant or a mail-enabled group.** Purview cannot bind an Applications-workload DLP policy to individual users, so "just me" / "specific people" become a Microsoft 365 pilot group the wizard creates and maintains.
-- **The proxy only governs traffic that traverses it.** A vendor SaaS agent users hit directly in a browser bypasses it; use endpoint DLP or Agent 365's block control there.
-- **Certificate:** used only for policy provisioning. The runtime authenticates with the client secret; remove the cert afterwards if you won't re-run the wizard.
-- **Not published to npm/PyPI/NuGet.** Install from this repo (see each package README); `npx agent365-govern` will not resolve.
+- **PowerShell:** ExchangeOnlineManagement `3.5.1` is pinned (3.10.x throws on PowerShell 7.6); the downloaded portable PowerShell is 7.4.6.
+- **Registration** uses `/beta/copilot/agentRegistrations`, which Microsoft labels subject to change; identity steps are on `v1.0`. The older `/beta/agentRegistry/*` surface retired on 15 June 2026 — re-running the wizard re-registers.
+- **The messaging endpoint** is registered through the Teams Developer Portal API (the same call Teams Toolkit makes). Microsoft's `a365` CLI still prints a manual step here for tenants without its automated path; the kit does not need that path.
+- **Not published to npm/PyPI/NuGet.** Install from this repo (see each package README).

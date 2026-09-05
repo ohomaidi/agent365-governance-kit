@@ -61,25 +61,30 @@
 <div class="wrap">
   <header>
     <h1>Agent 365 Governance Kit</h1>
-    <p class="sub">Provisions Microsoft Purview governance and registers your agent in Agent 365. Nothing is changed until you choose <strong>Provision</strong>.</p>
+    <p class="sub">Provisions Microsoft Purview governance, registers your agent in Agent 365 and publishes it to Teams. Nothing is changed until you choose <strong>Provision</strong>.</p>
   </header>
 
   <fieldset>
     <legend>1 · Before we start</legend>
     <div id="pf">Checking…</div>
+    <div id="pwshBox" hidden style="margin-top:.8rem">
+      <div class="warn">PowerShell 7 is needed to create the Purview policies. It can be downloaded into your user folder — nothing system-wide changes and no admin rights are needed.</div>
+      <div class="actions" style="margin-top:.5rem"><button id="btnPwsh" class="ghost" type="button">Download PowerShell 7 for me</button><span id="pwshStatus" class="sub"></span></div>
+    </div>
     <div id="loginBox" hidden style="margin-top:.8rem">
       <div class="row">
         <label for="tenantHint">Which tenant?</label>
-        <input type="text" id="tenantHint" placeholder="contoso.onmicrosoft.com — leave blank for your default">
+        <input type="text" id="tenantHint" placeholder="contoso.onmicrosoft.com — leave blank to pick during sign-in">
       </div>
-      <div class="check"><input type="checkbox" id="deviceCode"><label for="deviceCode">This machine can't open a sign-in window (remote desktop, server console)</label></div>
+      <div id="signins"></div>
     </div>
     <div id="codeBox" hidden class="good" style="margin-top:.8rem">
-      <div>Go to <a href="https://login.microsoft.com/device" target="_blank" rel="noopener"><strong>login.microsoft.com/device</strong></a> and enter:</div>
+      <div id="codeIntro">Go to <a id="codeLink" href="https://login.microsoft.com/device" target="_blank" rel="noopener"><strong>login.microsoft.com/device</strong></a> and enter:</div>
       <div id="theCode" style="font:700 2rem/1.3 var(--mono);letter-spacing:.12em;margin-top:.4rem"></div>
+      <div id="codeHint" class="hint" style="margin-top:.3rem"></div>
     </div>
     <div id="pfActions" class="actions" style="margin-top:.8rem" hidden>
-      <button id="btnLogin" class="ghost" type="button">Sign in to Azure</button>
+      <button id="btnLogin" class="ghost" type="button">Sign in</button>
       <button id="btnRecheck" class="ghost" type="button">Re-check</button>
     </div>
   </fieldset>
@@ -87,12 +92,33 @@
   <form id="f">
     <fieldset>
       <legend>2 · Your agent</legend>
-      <div class="row">
-        <label for="agentDir">Where is your agent?</label>
-        <input type="text" id="agentDir" placeholder="/path/to/your/agent — the folder containing it">
-        <span class="hint">Drag the folder from Finder or Explorer into this box.</span>
+      <div class="row"><label for="agentKind">What kind of agent?</label>
+        <select id="agentKind">
+          <option value="own">One we built (the code is on this machine)</option>
+          <option value="proxy">A third-party or vendor agent we can't modify (front it with the governance proxy)</option>
+        </select></div>
+      <div id="ownFields">
+        <div class="row">
+          <label for="agentDir">Where is your agent?</label>
+          <input type="text" id="agentDir" placeholder="/path/to/your/agent — the folder containing it">
+          <span class="hint">Drag the folder from Finder or Explorer into this box.</span>
+        </div>
+        <div id="detected"></div>
       </div>
-      <div id="detected"></div>
+      <div id="proxyFields" hidden>
+        <div class="row">
+          <label for="upstreamUrl">The vendor agent&rsquo;s API</label>
+          <input type="text" id="upstreamUrl" placeholder="https://vendor.example.com/api">
+          <span class="hint">Where the proxy forwards to. Users and Teams will talk to the proxy, never to this directly.</span>
+        </div>
+        <div class="row"><label for="upstreamDialect">How it speaks</label>
+          <select id="upstreamDialect"><option value="auto">Detect from traffic</option><option value="openai">OpenAI-compatible (chat completions)</option><option value="a2a">Agent2Agent (JSON-RPC)</option><option value="generic">Simple JSON (message / reply)</option></select></div>
+        <div class="row">
+          <label for="proxyDir">Where to keep the proxy&rsquo;s settings</label>
+          <input type="text" id="proxyDir" placeholder="auto: ~/.agent365/proxy-&lt;name&gt;">
+          <span class="hint">The proxy runs from this folder. Its public address goes in &ldquo;Its web address&rdquo; below.</span>
+        </div>
+      </div>
       <div class="row"><label for="agentName">What is it called?</label><input type="text" id="agentName" placeholder="e.g. HR Assistant"></div>
       <div class="row">
         <label for="agentUrl">Its web address</label>
@@ -141,7 +167,9 @@
       <legend>6 · Agent 365 registration</legend>
       <div class="check"><input type="checkbox" id="wantAgent365" checked><label for="wantAgent365">Register this agent in the Agent 365 registry</label></div>
       <div id="a365Fields">
-        <span class="hint">Uses the name and address from section 2. Nothing else needed.</span>
+        <span class="hint">Uses the name and address from section 2.</span>
+        <div class="row" style="margin-top:.6rem"><label for="agentDescription">One-line description</label><input type="text" id="agentDescription" placeholder="auto: &lt;name&gt; — governed by Microsoft Agent 365"><span class="hint">Shown in Teams and in the Agent 365 inventory.</span></div>
+        <div class="check"><input type="checkbox" id="wantTeams" checked><label for="wantTeams"><strong>Publish to Teams</strong> — adds the agent to your organisation&rsquo;s app catalog, installs it for the people in scope, registers its messaging endpoint, and sends you a hello from the agent so you can reply to it.</label></div>
       </div>
     </fieldset>
 
@@ -188,35 +216,59 @@ async function preflight() {
   pf = await (await fetch("/api/preflight")).json();
   const rows = [
     ["Node.js", pf.tools.node],
-    ["Azure CLI", pf.tools.az],
     ["PowerShell 7", pf.tools.pwsh],
     ["OpenSSL", pf.tools.openssl],
   ].map(([n, v]) => {
     const okv = v === true || (typeof v === "string" && v !== "false");
-    const txt = v === true ? "installed" : v === false ? "missing" : v;
+    const txt = v === true ? "installed" : v === false ? "missing" : (n === "PowerShell 7" && /agent365/.test(v) ? "downloaded" : v);
     return `<div class="tool"><span>${n}</span><span class="${okv ? "ok" : "no"}">${txt}</span></div>`;
   }).join("");
 
+  const needsPwsh = pf.missing.some(m => m.auto);
+  const other = pf.missing.filter(m => !m.auto);
   let banner = "";
-  if (pf.missing.length) {
+  if (other.length) {
     banner = `<div class="bad" style="margin-bottom:.7rem">Install these first, then re-check:<br>` +
-      pf.missing.map(m => `<a href="${m.url}" target="_blank" rel="noopener">${m.name}</a>`).join(" · ") + `</div>`;
+      other.map(m => `<a href="${m.url}" target="_blank" rel="noopener">${m.name}</a>`).join(" · ") + `</div>`;
   } else if (!pf.signedIn) {
-    banner = `<div class="warn" style="margin-bottom:.7rem">Not signed in to Azure. Sign in as a Global Administrator of the tenant you want to configure.</div>`;
+    const first = pf.signins.find(x => !x.done);
+    banner = pf.account
+      ? `<div class="warn" style="margin-bottom:.7rem">Signed in as <strong>${pf.account.user}</strong>. One more sign-in is needed: ${first.label}.</div>`
+      : `<div class="warn" style="margin-bottom:.7rem">Sign in as a <strong>Global Administrator</strong> of the tenant you want to configure. Two short sign-ins: one for Microsoft 365, one for the Teams Developer Portal.</div>`;
   } else {
     banner = `<div class="good" style="margin-bottom:.7rem">Signed in as <strong>${pf.account.user}</strong> — tenant <code>${pf.account.tenantId}</code></div>`;
+  }
+  if (pf.account) {
     if (!$("attribUpn").value) $("attribUpn").value = pf.account.user;
     if (!$("sponsorUpn").value) $("sponsorUpn").value = pf.account.user;
   }
+  $("signins").innerHTML = pf.signins.map(x =>
+    `<div class="tool"><span>${x.label}</span><span class="${x.done ? "ok" : "no"}">${x.done ? "signed in" : "needed"}</span></div>`).join("");
   $("pf").innerHTML = banner + rows;
+  $("pwshBox").hidden = !needsPwsh;
   $("pfActions").hidden = false;
-  $("btnLogin").hidden = pf.missing.length > 0;
-  $("btnLogin").textContent = pf.signedIn ? "Sign in as someone else" : "Sign in to Azure";
-  $("loginBox").hidden = pf.missing.length > 0;
+  $("btnLogin").hidden = other.length > 0 || pf.signedIn;
+  $("btnLogin").textContent = pf.account ? "Continue sign-in" : "Sign in";
+  $("loginBox").hidden = other.length > 0 || pf.signedIn;
   const ready = pf.ready && pf.signedIn;
   $("btnGo").disabled = !ready;
   $("btnDry").disabled = !ready;
 }
+
+$("btnPwsh").onclick = async () => {
+  $("btnPwsh").disabled = true;
+  $("pwshStatus").textContent = "Downloading…";
+  const { id } = await (await fetch("/api/install-pwsh", { method: "POST" })).json();
+  await new Promise((resolve) => {
+    const t = setInterval(async () => {
+      const st = await (await fetch(`/api/task-status?id=${id}`)).json();
+      if (st.lines.length) $("pwshStatus").textContent = st.lines[st.lines.length - 1];
+      if (st.done) { clearInterval(t); resolve(); }
+    }, 1000);
+  });
+  $("btnPwsh").disabled = false;
+  await preflight();
+};
 
 async function tenantCheck() {
   $("tenantBox").hidden = false;
@@ -245,41 +297,46 @@ async function tenantCheck() {
 }
 
 $("btnRecheck").onclick = () => preflight().then(tenantCheck);
-$("btnLogin").onclick = async () => {
-  $("btnLogin").disabled = true;
-  $("codeBox").hidden = true;
-  $("status").textContent = "Opening Microsoft sign-in…";
-
+// Two device-code sign-ins, one after the other. The code is shown here in
+// large type and the Microsoft page opens in a new tab; the password is typed
+// there, never into this page.
+async function signIn(which) {
   const { id } = await (await fetch("/api/login", {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      tenant: $("tenantHint").value.trim(),
-      deviceCode: $("deviceCode").checked,
-    }),
+    body: JSON.stringify({ tenant: $("tenantHint").value.trim(), which: which.key }),
   })).json();
-
-  // Poll rather than block: the server stays responsive, and a device code can
-  // appear at any point during the attempt.
-  await new Promise((resolve) => {
+  let opened = false;
+  const result = await new Promise((resolve) => {
     const t = setInterval(async () => {
       const st = await (await fetch(`/api/login-status?id=${id}`)).json();
       if (st.deviceCode) {
         $("theCode").textContent = st.deviceCode;
+        $("codeLink").href = st.verificationUri || "https://login.microsoft.com/device";
+        $("codeHint").textContent = `${which.label}. ${which.consent || ""}`;
         $("codeBox").hidden = false;
         $("status").textContent = "Waiting for you to finish signing in…";
+        if (!opened) { opened = true; window.open($("codeLink").href, "_blank", "noopener"); }
       }
-      if (st.done) {
-        clearInterval(t);
-        $("status").textContent = st.code === 0 ? "" : "Sign-in didn't complete.";
-        resolve();
-      }
+      if (st.done) { clearInterval(t); resolve(st); }
     }, 1200);
   });
-
   $("codeBox").hidden = true;
+  return result;
+}
+
+$("btnLogin").onclick = async () => {
+  $("btnLogin").disabled = true;
+  $("status").textContent = "Starting sign-in…";
+  let failed = "";
+  for (const which of (pf?.signins ?? []).filter(x => !x.done)) {
+    const st = await signIn(which);
+    if (st.code !== 0) { failed = st.error || "Sign-in didn't complete."; break; }
+    await preflight();
+  }
+  $("status").textContent = failed;
   $("btnLogin").disabled = false;
   await preflight();
-  if (pf && pf.signedIn) tenantCheck();
+  if (pf && pf.account) tenantCheck();
 };
 
 $("scopeChoice").onchange = (e) => {
@@ -294,6 +351,8 @@ $("showAdv").onchange = (e) => { $("advFields").hidden = !e.target.checked; };
 
 // --- learn what we can from the agent's own folder ---
 let detected = null;
+let defaults = { home: "", sep: "/" };
+fetch("/api/defaults").then(r => r.json()).then(d => { defaults = d; }).catch(() => {});
 async function detect() {
   const dir = $("agentDir").value.trim().replace(/^['"]|['"]$/g, "").replace(/\\ /g, " ");
   $("agentDir").value = dir;
@@ -313,6 +372,11 @@ async function detect() {
     $("agentName").value = detected.name.replace(/[-_]/g, " ").replace(/\b\w/g, c => c.toUpperCase());
   }
 }
+$("agentKind").onchange = (e) => {
+  const proxy = e.target.value === "proxy";
+  $("ownFields").hidden = proxy; $("proxyFields").hidden = !proxy;
+  $("agentUrl").placeholder = proxy ? "https://agent-proxy.example.com — the proxy's public address" : "https://your-agent.example.com";
+};
 $("agentDir").onchange = detect;
 $("agentDir").onblur = detect;
 $("agentName").oninput = (e) => { e.target.dataset.touched = "1"; };
@@ -321,6 +385,9 @@ function answers() {
   const scope = $("scopeChoice").value, mode = $("modeChoice").value;
   const name = $("agentName").value.trim() || "My Agent";
   const me = pf?.account?.user || "";
+  const proxy = $("agentKind").value === "proxy";
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "agent";
+  const proxyEnv = ($("proxyDir").value.trim() || `${defaults.home}${defaults.sep}.agent365${defaults.sep}proxy-${slug}`) + defaults.sep + ".env";
   // Everything a customer shouldn't have to know is derived, and only
   // overridden if they opened Advanced and typed something.
   const or = (id, fallback) => ($(id).value.trim() || fallback);
@@ -328,8 +395,11 @@ function answers() {
     appRegName: or("appRegName", `${name} Purview Connector`),
     purviewAppName: or("purviewAppName", name),
     attribUpn: or("attribUpn", me),
-    envPath: or("envPath", detected?.envPath || ""),
-    lang: or("lang", detected?.language || "typescript"),
+    envPath: or("envPath", proxy ? proxyEnv : (detected?.envPath || "")),
+    lang: proxy ? "proxy" : or("lang", detected?.language || "typescript"),
+    upstreamUrl: $("upstreamUrl").value.trim().replace(/\/+$/, ""),
+    upstreamDialect: $("upstreamDialect").value,
+    proxyPort: "8787",
     scopeChoice: scope === "me" ? "2" : scope,
     pilotGroup: $("pilotGroup").value,
     pilotUsers: scope === "me" ? me : $("pilotUsers").value,
@@ -348,6 +418,8 @@ function answers() {
     sponsorUpn: or("sponsorUpn", me),
     existingBlueprintId: $("existingBlueprintId").value,
     messagingEndpoint: or("messagingEndpoint", $("agentUrl").value.trim().replace(/\/+$/, "") + "/api/messages"),
+    agentDescription: or("agentDescription", `${name} — governed by Microsoft Agent 365`),
+    wantTeams: $("wantAgent365").checked && $("wantTeams").checked,
     revokeAfter: $("revokeAfter").checked,
     reuseExistingApp: true, replaceInstance: false,
     proceed: true,
@@ -356,6 +428,8 @@ function answers() {
 
 // [pattern, what to do about it] — matched against the wizard's fatal line.
 const HINTS = [
+  [/AppCatalog|appCatalogs/i, 'Publishing to the Teams app catalog needs the first sign-in to have been consented for AppCatalog.ReadWrite.All. Sign in again and tick “Consent on behalf of your organization”.'],
+  [/dev\.teams\.microsoft\.com|Developer Portal/i, 'The Teams Developer Portal sign-in is missing or expired. Click Re-check, then Sign in.'],
   [/Group .* not found/i, 'That group doesn\u2019t exist in this tenant. Choose <strong>Just me</strong>, or create the group in Entra first.'],
   [/not found in this tenant/i, 'Check the spelling, or pick <strong>Just me</strong> for a first run.'],
   [/Compliance Administrator/i, 'Your account needs Global Administrator, or Privileged Role Administrator, to grant this.'],
@@ -370,6 +444,9 @@ function validate(a) {
   if (!$("agentDir").value.trim()) return "Point me at your agent's folder first.";
   if (!a.envPath) return "Couldn't work out where to write the settings file — set it under Advanced.";
   if (!$("agentName").value.trim()) return "Give the agent a name.";
+  if ($("agentKind").value === "proxy") {
+    if (!/^https?:\/\//i.test(a.upstreamUrl)) return "Enter the vendor agent\u2019s API address (http:// or https://).";
+  } else if (!a.envPath) return "Point me at the agent\u2019s folder.";
   if ($("scopeChoice").value === "1" && !a.pilotGroup) return "Name the group, or choose \u201cJust me\u201d.";
   if ($("scopeChoice").value === "2" && !a.pilotUsers) return "List at least one person.";
   if (a.wantAgent365 && !/^https:\/\//i.test(a.agentUrl)) return "The agent's web address must start with https://";
@@ -443,7 +520,7 @@ $("btnDry").onclick = () => run(true);
 $("btnGo").onclick = () => run(false);
 
 
-preflight().then(() => { if (pf && pf.signedIn) tenantCheck(); });
+preflight().then(() => { if (pf && pf.account) tenantCheck(); });
 </script>
 </body>
 </html>

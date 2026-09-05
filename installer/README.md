@@ -1,57 +1,50 @@
-# Setup without a terminal
+# Agent 365 Setup — what's in this folder
 
-The customer double-clicks one file. It finds Node, starts a loopback-only
-server, and opens their browser to a form-based wizard.
+Double-click the launcher for your platform. It starts a small local page in
+your browser and walks you through the setup. Nothing to install first,
+nothing to type in a terminal.
 
 | Platform | Double-click |
 |---|---|
-| macOS | `installer/macos/Agent 365 Setup.app` |
-| Windows | `installer/windows/Agent 365 Setup.vbs` |
+| macOS | `Agent 365 Setup.app` |
+| Windows | `Agent 365 Setup.vbs` |
 
-Keep the launcher inside the kit folder — it locates the wizard relative to
-itself and says so plainly if it can't.
+Keep the launcher next to the `kit` folder — it finds the setup files relative
+to itself.
 
-## What it does
+## What happens when you run it
 
-1. **Checks prerequisites** — Node 18+, Azure CLI, PowerShell 7, and OpenSSL on
-   macOS/Linux (Windows uses `New-SelfSignedCertificate` instead). Anything
-   missing is listed with a download link rather than a stack trace.
-2. **Signs in** — a button runs `az login`. No terminal: the customer can name a
-   tenant (leave blank for their default), and if the machine can't open a
-   sign-in window — remote desktop, a server console — they tick a box and the
-   page shows the device code in large type. Sign-in is streamed, not awaited,
-   so the page stays responsive throughout.
-3. **Collects the same decisions the CLI asks for**, with the safe option
-   preselected and the risky ones behind visible warnings. "Just me" and
-   "specific people" become a Microsoft 365 pilot group the wizard creates —
-   Purview can only bind a policy to a tenant or a mail-enabled group.
-4. **Rehearse** runs a full dry run and changes nothing. **Provision** asks for
-   confirmation naming the tenant, mode and scope before it does anything.
-5. **Streams the live log** into the page, so there's nothing to go and read
-   afterwards.
+1. **Checks the machine.** Node.js runs the page; PowerShell 7 creates the
+   Purview policies. If either is missing, the launcher or the page offers to
+   download an official copy into your user folder (`~/.agent365`). Nothing
+   system-wide is changed and no admin password is asked for.
+2. **Signs you in, twice, as a Global Administrator.** Both are short device-code
+   sign-ins: the page shows a code, opens Microsoft's sign-in page, and you type
+   the code there. Your password never touches this tool.
+   - Microsoft 365 — appears in your sign-in log as *Microsoft Graph Command
+     Line Tools*. Tick **Consent on behalf of your organization** the first
+     time; it is a one-time consent for the permissions the setup needs.
+   - Teams Developer Portal — appears as *Teams Toolkit*. This is what registers
+     the agent's messaging endpoint so Teams can reach it.
+3. **Checks the tenant** — licences, Exchange Online, the Purview and Agent 365
+   permissions, your roles — before anything is created.
+4. **Asks a few plain questions.** Which agent (a folder on this machine, or a
+   third-party agent's API to front with the governance proxy), its name and
+   public address, who the policy applies to, and how strictly. The safe
+   answers are preselected.
+5. **Rehearse** runs the whole thing without changing anything. **Provision**
+   asks for confirmation naming the tenant, mode and scope, then does it all and
+   streams the log into the page.
 
-## Why there's no second implementation
-
-The browser wizard doesn't reimplement provisioning. It writes the operator's
-answers to a temporary JSON file and runs the CLI wizard with `--answers`, then
-streams its output back. One code path, one set of tests, no drift.
-
-That flag is useful on its own:
-
-```bash
-node wizard/agent365-govern.mjs --answers answers.json --dry-run
-```
-
-Repeat runs become reproducible instead of depending on prompt order — handy for
-rehearsing against a test agent before a customer visit.
+When it finishes, a message from your agent is waiting in your Teams.
 
 ## Security notes
 
-- The server binds **127.0.0.1 only**. It can provision a tenant; it must not be
-  reachable from the network.
-- The answers file is written `0600` into a temp directory and deleted when the
-  run finishes.
+- The local page binds **127.0.0.1 only**. It can provision a tenant; it must
+  not be reachable from the network, and it isn't.
+- Sign-in tokens and your answers live in a temp folder with `0600`
+  permissions and are removed when the setup closes.
 - No credential is ever rendered into the page. Secrets go straight into the
-  `.env` the wizard writes.
-- The macOS bundle is unsigned. Gatekeeper will ask on first launch —
-  right-click → Open, or sign it with your own Developer ID before distributing.
+  agent's `.env`.
+- The macOS bundle is unsigned. Gatekeeper asks on first launch — right-click →
+  Open, or sign it with your own Developer ID before distributing.

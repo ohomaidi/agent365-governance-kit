@@ -10,8 +10,12 @@ this puts the guard in the network path instead:
 caller → [ proxy: evaluate(prompt) → upstream agent → evaluate(reply) ] → caller
 ```
 
-Register **the proxy's URL** as the `agentInstance.url` in Agent 365 and the
-registry's own record points at a governed endpoint.
+Register **the proxy's URL** as the agent's endpoint in Agent 365 and the
+registry's own record points at a governed endpoint. The kit's installer does
+that for you when you choose *third-party agent*; it writes this proxy's `.env`.
+
+It also carries the half of Agent 365 a vendor agent cannot give you: a
+**Teams bridge** on `/api/messages` (below).
 
 ## Run it
 
@@ -31,7 +35,40 @@ wizard configures it exactly as it would configure an agent you wrote.
 --response-paths <a,b>  Custom dot-paths to the reply text.
 --streaming <mode>      buffer (default, governed) | passthrough (NOT governed)
 --max-body <bytes>      Request body cap (default 5 MiB).
+--teams <on|off>        Teams bridge (default: on when the installer wrote agent_id
+                        and connections__service_connection__* to .env).
+--upstream-path <p>     Path the bridge posts a turn to (default per dialect).
+--upstream-model <m>    Model name to send with the openai dialect.
 ```
+
+`GOVERNANCE_UPSTREAM`, `GOVERNANCE_DIALECT`, `GOVERNANCE_PROXY_PORT` and
+`GOVERNANCE_UPSTREAM_MODEL` are the environment equivalents.
+
+## Teams bridge
+
+Teams speaks Bot Framework activities to a messaging endpoint that must
+authenticate as the agent's blueprint identity. A vendor API has no such
+endpoint, so the proxy provides it:
+
+```
+Teams → /api/messages → verify JWT (Microsoft 365 Agents SDK)
+                      → Purview uploadText   → refuse in chat if blocked
+                      → vendor API, in its dialect (one turn = one call)
+                      → Purview downloadText → refuse in chat if blocked
+                      → reply as the agent; record the turn for the Agent 365 Activity tab
+```
+
+- Identity, endpoint and observability values come from the `.env` the
+  installer writes (`agent_id`, `connections__service_connection__*`,
+  `agent365Observability__*`). With no `agent_id` it runs in the SDK's
+  anonymous mode — right for the Agents Playground and the test-suite, wrong
+  for real Teams.
+- The turn is sent upstream as: `a2a` → `message/send` JSON-RPC; `openai` →
+  `POST /v1/chat/completions`; `generic` → `POST / {message, conversationId}`.
+  Override the path with `--upstream-path`.
+- A vendor error is reported in the chat, never swallowed.
+- Each turn is attributed to the person who typed it (`from.aadObjectId`) and
+  correlated by the Teams conversation id.
 
 ## Wire formats
 
@@ -68,8 +105,11 @@ healthy. It also reports how much it has blocked.
   the response **ungoverned**; it warns loudly at startup.
 - **Non-JSON bodies are forwarded ungoverned**, with a warning — the proxy
   cannot find text it cannot parse.
-- **It is not an authentication boundary.** Put it behind your existing
-  authn/authz; it forwards credentials to the upstream unchanged.
+- **It is not an authentication boundary** for API traffic. Put it behind your
+  existing authn/authz; it forwards credentials to the upstream unchanged. The
+  Teams bridge *does* verify the Bot Framework JWT on `/api/messages`.
+- **The bridge is one turn = one upstream call.** Conversation memory is the
+  vendor's job (the conversation id is passed along); the proxy keeps none.
 
 ## Attribution
 

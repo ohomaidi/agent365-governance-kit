@@ -6,7 +6,8 @@
  * passes every tooling check and then fails ten minutes in, at
  * Connect-IPPSSession, in front of the customer.
  *
- * This asks the tenant directly. `az` is injected so it's testable offline.
+ * This asks the tenant directly, through the signed-in admin's delegated
+ * Graph client. `graph` is injected so it's testable offline.
  */
 
 /** Well-known app ids we look for to infer that a service exists in the tenant. */
@@ -39,26 +40,23 @@ const warn = (name, detail, fix) => ({ name, status: "warn", detail, fix });
 const bad = (name, detail, fix) => ({ name, status: "fail", detail, fix });
 
 /**
- * @param {(args: string[]) => any} azJson  Runs `az ...` and parses JSON; throws on failure.
+ * @param {(method:string, path:string, body?:any) => Promise<any>} graph  Delegated Graph client; throws on non-2xx.
+ * @param {{id?:string, upn?:string, tenantId?:string}|null} account         Who is signed in (from the token cache).
  * @returns {Promise<{checks: object[], summary: {ok:number,warn:number,fail:number}, canProvisionPurview:boolean, canRegisterAgent365:boolean}>}
  */
-export async function probeTenant(azJson) {
+export async function probeTenant(graph, account) {
   const checks = [];
-  let account = null;
 
   // --- who and where ---
-  try {
-    account = azJson(["account", "show", "-o", "json"]);
-    checks.push(ok("Signed in", `${account.user?.name} — tenant ${account.tenantId}`));
-  } catch {
-    checks.push(bad("Signed in", "not signed in", "Run: az login"));
-    return finish(checks, account);
+  if (!account?.tenantId) {
+    checks.push(bad("Signed in", "not signed in", "Use the installer's Sign in button."));
+    return finish(checks, null);
   }
+  checks.push(ok("Signed in", `${account.upn} — tenant ${account.tenantId}`));
 
   // --- organisation + the onmicrosoft domain Connect-IPPSSession needs ---
   try {
-    const org = azJson(["rest", "--method", "GET", "--url",
-      "https://graph.microsoft.com/v1.0/organization?$select=displayName,verifiedDomains", "-o", "json"]);
+    const org = await graph("GET", "/v1.0/organization?$select=displayName,verifiedDomains");
     const o = org?.value?.[0];
     const domains = (o?.verifiedDomains ?? []).map((d) => d.name);
     const onms = domains.find((d) => d.endsWith(".onmicrosoft.com"));
@@ -73,8 +71,7 @@ export async function probeTenant(azJson) {
   // --- licences: the single best predictor of "this will actually work" ---
   let skus = [];
   try {
-    const r = azJson(["rest", "--method", "GET", "--url",
-      "https://graph.microsoft.com/v1.0/subscribedSkus", "-o", "json"]);
+    const r = await graph("GET", "/v1.0/subscribedSkus");
     skus = (r?.value ?? []).map((s) => s.skuPartNumber);
     if (!skus.length) {
       checks.push(bad("Licences", "no subscribed SKUs in this tenant",
@@ -88,7 +85,8 @@ export async function probeTenant(azJson) {
 
   // --- Exchange Online must exist for the Security & Compliance endpoint ---
   try {
-    azJson(["ad", "sp", "show", "--id", EXCHANGE_ONLINE_APP, "--query", "id", "-o", "json"]);
+    const sp = await graph("GET", `/v1.0/servicePrincipals?$filter=appId eq '${EXCHANGE_ONLINE_APP}'&$select=id`);
+    if (!sp?.value?.length) throw new Error("absent");
     checks.push(ok("Exchange Online", "service principal present"));
   } catch {
     checks.push(bad("Exchange Online", "service principal not found",
@@ -97,15 +95,15 @@ export async function probeTenant(azJson) {
 
   // --- Which Graph app roles this tenant actually offers ---
   //
-  // NOTE: we deliberately do NOT probe /beta/agentRegistry directly. `az rest`
-  // uses the Azure CLI first-party app, whose token carries no agent scopes at
-  // all, so that call returns 404/403 in every tenant — including ones where
-  // the feature is fully available. The presence of the app roles is the honest
-  // signal, and it's also what the connector app will be granted.
+  // NOTE: we deliberately do NOT probe the agent registry directly: the admin's
+  // delegated token carries no agent scopes, so that call returns 404/403 in
+  // every tenant — including ones where the feature is fully available. The
+  // presence of the app roles is the honest signal, and it's also what the
+  // connector app will be granted.
   let graphRoles = [];
   try {
-    const graph = azJson(["ad", "sp", "show", "--id", GRAPH_APP, "-o", "json"]);
-    graphRoles = (graph?.appRoles ?? []).filter((r) => r.isEnabled !== false).map((r) => r.value);
+    const gsp = (await graph("GET", `/v1.0/servicePrincipals?$filter=appId eq '${GRAPH_APP}'&$select=appRoles`))?.value?.[0];
+    graphRoles = (gsp?.appRoles ?? []).filter((r) => r.isEnabled !== false).map((r) => r.value);
   } catch (e) {
     checks.push(warn("Microsoft Graph", "could not inspect app roles", String(e.message).slice(0, 160)));
   }
@@ -133,9 +131,7 @@ export async function probeTenant(azJson) {
 
   // --- roles actually held ---
   try {
-    const me = azJson(["ad", "signed-in-user", "show", "--query", "id", "-o", "json"]);
-    const memberOf = azJson(["rest", "--method", "GET", "--url",
-      `https://graph.microsoft.com/v1.0/users/${me}/memberOf?$select=displayName`, "-o", "json"]);
+    const memberOf = await graph("GET", `/v1.0/users/${account.id || "me"}/memberOf?$select=displayName`);
     const held = (memberOf?.value ?? []).map((g) => g.displayName).filter(Boolean);
     const isGA = held.includes("Global Administrator");
     const relevant = Object.keys(ROLES).filter((r) => held.includes(r));
@@ -165,7 +161,7 @@ function finish(checks, account) {
   };
   const failed = (name) => checks.some((c) => c.name === name && c.status === "fail");
   return {
-    account: account ? { user: account.user?.name, tenantId: account.tenantId } : null,
+    account: account ? { user: account.upn, tenantId: account.tenantId } : null,
     checks, summary,
     // Purview needs Exchange Online + the Graph roles; Agent 365 needs the registry.
     canProvisionPurview: !failed("Exchange Online") && !failed("Purview Graph API") && !failed("Licences"),

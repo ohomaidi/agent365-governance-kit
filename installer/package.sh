@@ -13,7 +13,8 @@ stage() {                    # $1 = staging dir
   mkdir -p "$1/kit/installer" "$1/kit/wizard/lib"
   cp "$ROOT/installer/server.mjs" "$ROOT/installer/ui.html"        "$1/kit/installer/"
   cp "$ROOT/wizard/agent365-govern.mjs"                            "$1/kit/wizard/"
-  cp "$ROOT/wizard/lib/agent365.mjs" "$ROOT/wizard/lib/capabilities.mjs" "$1/kit/wizard/lib/"
+  cp "$ROOT/wizard/lib/agent365.mjs" "$ROOT/wizard/lib/capabilities.mjs" \
+     "$ROOT/wizard/lib/auth.mjs" "$ROOT/wizard/lib/teams.mjs"              "$1/kit/wizard/lib/"
   cp "$ROOT/installer/README.md"                                   "$1/README.txt"
 }
 

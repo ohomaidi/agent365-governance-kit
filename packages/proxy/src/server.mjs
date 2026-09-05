@@ -66,6 +66,7 @@ const readBody = (req, limit) =>
  * @param {string} [opts.streaming]     "buffer" (default) | "passthrough"
  * @param {number} [opts.maxBodyBytes]  Default 5 MiB.
  * @param {string} [opts.userHeader]    Header carrying the end-user's Entra object id.
+ * @param {Function} [opts.teams]       Express handler from createTeamsBridge(); mounted at /api/messages.
  */
 export function createGovernanceProxy(opts) {
   const {
@@ -75,6 +76,7 @@ export function createGovernanceProxy(opts) {
     streaming = "buffer",
     maxBodyBytes = 5 * 1024 * 1024,
     userHeader = "x-agent-user-id",
+    teams = null,
     log = console,
   } = opts;
 
@@ -107,8 +109,16 @@ export function createGovernanceProxy(opts) {
         missing: guard.missing ?? [],
         governing: guard.state === "ready",
         streaming,
+        teams: Boolean(teams),
         stats,
       });
+    }
+
+    // Teams talks Bot Framework to /api/messages; that path is the bridge's,
+    // not a passthrough to the vendor.
+    if (teams && (req.url === "/api/messages" || req.url?.startsWith("/api/messages?"))) {
+      stats.teamsTurns = (stats.teamsTurns ?? 0) + 1;
+      return teams(req, res);
     }
 
     stats.requests++;

@@ -15,6 +15,8 @@
  * teaching the proxy core about a new payload shape.
  */
 
+import crypto from "node:crypto";
+
 /** Walk a dot-path with [*] wildcards, collecting every string it reaches. */
 export function collect(obj, path) {
   const parts = path.split(".");
@@ -64,6 +66,16 @@ export const dialects = {
         error: { code: -32001, message: reason, data: { blockedBy: "microsoft-purview" } },
       },
     }),
+    /** A user turn as a message/send call — what the Teams bridge sends upstream. */
+    compose: (text, { conversationId } = {}) => ({
+      path: "/",
+      body: {
+        jsonrpc: "2.0", id: crypto.randomUUID(), method: "message/send",
+        params: { message: { role: "user", kind: "message", messageId: crypto.randomUUID(),
+          ...(conversationId ? { contextId: conversationId } : {}), parts: [{ kind: "text", text }] } },
+      },
+    }),
+    replyText: (b) => A2A_RESPONSE_PATHS.flatMap((p) => collect(b, p)).filter(Boolean).join("\n"),
   },
 
   /** OpenAI-compatible chat completions — very common for vendor agents. */
@@ -84,6 +96,16 @@ export const dialects = {
       status: 403,
       json: { error: { message: reason, type: "policy_violation", code: "content_blocked_by_purview" } },
     }),
+    compose: (text, { conversationId, model } = {}) => ({
+      path: "/v1/chat/completions",
+      body: { ...(model ? { model } : {}), messages: [{ role: "user", content: text }], ...(conversationId ? { user: conversationId } : {}) },
+    }),
+    replyText: (b) => {
+      const c = b?.choices?.[0]?.message?.content;
+      if (typeof c === "string") return c;
+      if (Array.isArray(c)) return c.map((x) => x?.text ?? "").filter(Boolean).join("\n");
+      return typeof b?.output_text === "string" ? b.output_text : "";
+    },
   },
 
   /** Anything else: point it at the right fields with dot-paths. */
@@ -95,6 +117,11 @@ export const dialects = {
     extractResponse(b) { return this.responsePaths.flatMap((p) => collect(b, p)); },
     correlationId: (b) => b?.conversationId ?? b?.conversation_id ?? b?.sessionId ?? undefined,
     refusal: (reason) => ({ status: 403, json: { error: reason, blocked: true } }),
+    compose: (text, { conversationId } = {}) => ({
+      path: "/",
+      body: { message: text, ...(conversationId ? { conversationId } : {}) },
+    }),
+    replyText(b) { return this.responsePaths.flatMap((p) => collect(b, p)).find(Boolean) ?? ""; },
   },
 };
 

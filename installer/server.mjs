@@ -9,12 +9,15 @@
  */
 import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync, mkdtempSync, rmSync, existsSync, readdirSync, statSync } from "node:fs";
-import { tmpdir, homedir } from "node:os";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, existsSync, readdirSync, statSync, mkdirSync, createWriteStream, chmodSync } from "node:fs";
+import { tmpdir, homedir, arch } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import { pipeline } from "node:stream/promises";
+import { Readable } from "node:stream";
 import { probeTenant } from "../wizard/lib/capabilities.mjs";
+import { TokenCache, startDeviceCode, pollDeviceCode, makeDelegatedGraph, CLIENTS, GRAPH_SCOPE_STRING, DEVPORTAL_SCOPE } from "../wizard/lib/auth.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..");
@@ -24,6 +27,20 @@ const IS_WINDOWS = process.platform === "win32";
 const work = mkdtempSync(join(tmpdir(), "a365-installer-"));
 const runs = new Map(); // id -> { child, buffer, done, code }
 
+// One sign-in for the whole session. Tokens live in a 0600 file inside the
+// work dir (removed on exit); A365_TOKEN_CACHE lets a re-run reuse a sign-in.
+const TOKEN_CACHE = process.env.A365_TOKEN_CACHE || join(work, "tokens.json");
+const cache = new TokenCache(TOKEN_CACHE);
+
+/** The two sign-ins the run needs, and why. */
+const SIGNINS = [
+  { key: "graph", clientId: CLIENTS.graphCli, scope: GRAPH_SCOPE_STRING,
+    label: "Microsoft 365 (Entra, Purview, Teams app catalog)", consent: "Tick \u201cConsent on behalf of your organization\u201d." },
+  { key: "devportal", clientId: CLIENTS.teamsToolkit, scope: DEVPORTAL_SCOPE,
+    label: "Teams Developer Portal (registers the agent\u2019s messaging endpoint)", consent: "" },
+];
+const signinState = () => SIGNINS.map((s) => ({ key: s.key, label: s.label, consent: s.consent, done: cache.signedIn(s.clientId) }));
+
 function which(cmd) {
   try {
     execFileSync(IS_WINDOWS ? "where" : "which", [cmd], { stdio: "ignore" });
@@ -31,28 +48,65 @@ function which(cmd) {
   } catch { return false; }
 }
 
+/* ---- PowerShell 7: found on PATH, or downloaded to the user's profile ---- */
+const PWSH_VERSION = "7.4.6";
+const PWSH_HOME = join(homedir(), ".agent365", `pwsh-${PWSH_VERSION}`);
+const PWSH_BIN = join(PWSH_HOME, IS_WINDOWS ? "pwsh.exe" : "pwsh");
+function pwshPath() {
+  if (process.env.A365_PWSH && existsSync(process.env.A365_PWSH)) return process.env.A365_PWSH;
+  if (which("pwsh")) return "pwsh";
+  if (existsSync(PWSH_BIN)) return PWSH_BIN;
+  return "";
+}
+function pwshAsset() {
+  const a = arch() === "arm64" ? "arm64" : "x64";
+  if (IS_WINDOWS) return { file: `PowerShell-${PWSH_VERSION}-win-${a}.zip`, kind: "zip" };
+  if (process.platform === "darwin") return { file: `powershell-${PWSH_VERSION}-osx-${a}.tar.gz`, kind: "tgz" };
+  return { file: `powershell-${PWSH_VERSION}-linux-${a}.tar.gz`, kind: "tgz" };
+}
+/** Download the official portable build into ~/.agent365 (no admin rights needed). */
+async function installPwsh(log) {
+  const { file, kind } = pwshAsset();
+  const url = `https://github.com/PowerShell/PowerShell/releases/download/v${PWSH_VERSION}/${file}`;
+  mkdirSync(PWSH_HOME, { recursive: true });
+  const archive = join(PWSH_HOME, file);
+  log(`Downloading PowerShell ${PWSH_VERSION} from github.com/PowerShell/PowerShell…`);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`);
+  await pipeline(Readable.fromWeb(res.body), createWriteStream(archive));
+  log("Extracting…");
+  if (kind === "tgz") {
+    execFileSync("tar", ["-xzf", archive, "-C", PWSH_HOME], { stdio: "ignore" });
+    chmodSync(PWSH_BIN, 0o755);
+  } else {
+    // Windows PowerShell 5.1 is always present and can unzip.
+    execFileSync("powershell.exe", ["-NoProfile", "-Command",
+      `Expand-Archive -LiteralPath '${archive}' -DestinationPath '${PWSH_HOME}' -Force`], { stdio: "ignore" });
+  }
+  rmSync(archive, { force: true });
+  execFileSync(PWSH_BIN, ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"], { stdio: "ignore" });
+  log(`PowerShell ${PWSH_VERSION} ready at ${PWSH_BIN}`);
+  return PWSH_BIN;
+}
+
 /** What's installed, and who (if anyone) is signed in. */
 function preflight() {
+  const pwsh = pwshPath();
   const tools = {
     node: process.version,
-    az: which("az"),
-    pwsh: which("pwsh"),
+    pwsh: pwsh ? (pwsh === "pwsh" ? true : pwsh) : false,
     openssl: IS_WINDOWS ? "n/a" : which("openssl"),
   };
-  let account = null;
-  if (tools.az) {
-    try {
-      account = JSON.parse(execFileSync("az", ["account", "show", "-o", "json"], { encoding: "utf8" }));
-    } catch { account = null; }
-  }
   const missing = [];
-  if (!tools.az) missing.push({ name: "Azure CLI", url: "https://learn.microsoft.com/cli/azure/install-azure-cli" });
-  if (!tools.pwsh) missing.push({ name: "PowerShell 7", url: "https://learn.microsoft.com/powershell/scripting/install/installing-powershell" });
+  if (!pwsh) missing.push({ name: "PowerShell 7", url: "https://learn.microsoft.com/powershell/scripting/install/installing-powershell", auto: true });
   if (!IS_WINDOWS && !tools.openssl) missing.push({ name: "OpenSSL", url: "https://www.openssl.org/source/" });
+  const account = cache.account(CLIENTS.graphCli);
+  const signins = signinState();
   return {
     tools, missing, platform: process.platform,
-    signedIn: Boolean(account),
-    account: account ? { user: account.user?.name, tenantId: account.tenantId, name: account.name } : null,
+    signins,
+    signedIn: signins.every((s) => s.done),
+    account: account ? { user: account.upn, tenantId: account.tenantId, name: account.name } : null,
     ready: missing.length === 0,
   };
 }
@@ -115,73 +169,55 @@ const server = createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/api/preflight") return json(res, 200, preflight());
 
   // Tooling readiness says nothing about whether the TENANT can do this.
-  if (req.method === "GET" && url.pathname === "/api/tenants") {
-    // Which directories can this account actually reach?
-    try {
-      const out = execFileSync("az", ["account", "list", "--all", "-o", "json"],
-        { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-      const seen = new Map();
-      for (const a of JSON.parse(out || "[]")) {
-        if (!seen.has(a.tenantId)) seen.set(a.tenantId, { tenantId: a.tenantId, name: a.name, isDefault: a.isDefault });
-      }
-      return json(res, 200, { tenants: [...seen.values()] });
-    } catch { return json(res, 200, { tenants: [] }); }
-  }
-
   if (req.method === "GET" && url.pathname === "/api/tenant") {
-    const azJson = (args) => {
-      const out = execFileSync("az", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-      return out ? JSON.parse(out) : null;
-    };
-    try { return json(res, 200, await probeTenant(azJson)); }
+    try { return json(res, 200, await probeTenant(makeDelegatedGraph(cache), cache.account(CLIENTS.graphCli))); }
     catch (e) { return json(res, 500, { error: String(e.message) }); }
   }
 
+  // Download a portable PowerShell 7 into the user's profile. Streamed so the
+  // page can show progress; nothing system-wide is touched.
+  if (req.method === "POST" && url.pathname === "/api/install-pwsh") {
+    const id = randomUUID();
+    const run = { buffer: [], done: false, code: null };
+    runs.set(id, run);
+    installPwsh((m) => run.buffer.push(m))
+      .then(() => { run.done = true; run.code = 0; })
+      .catch((e) => { run.buffer.push(`\u2717 ${e.message}`); run.done = true; run.code = 1; });
+    return json(res, 200, { id });
+  }
+
   if (req.method === "POST" && url.pathname === "/api/login") {
-    // Sign-in is streamed, not awaited. execFileSync here would block the whole
-    // single-threaded server, freezing the page for the duration of the login,
-    // and swallowing the device code when az can't open a browser (RDP, a
-    // server console, a locked-down desktop) — leaving the customer staring at
-    // nothing forever.
+    // Device-code sign-in, in-process: no Azure CLI, and the password is typed
+    // into Microsoft's page, never into ours. The page shows the code in large
+    // type and polls for completion; the server never blocks.
     let raw = "";
     req.on("data", (c) => (raw += c));
     await new Promise((r) => req.on("end", r));
     let opts = {};
     try { opts = JSON.parse(raw || "{}"); } catch { /* defaults are fine */ }
-
-    const args = ["login"];
-    if (opts.tenant) args.push("--tenant", String(opts.tenant));
-    if (opts.deviceCode) args.push("--use-device-code");
-    args.push("--only-show-errors");
+    const which = SIGNINS.find((x) => x.key === (opts.which || "graph")) ?? SIGNINS[0];
+    // The second sign-in must land in the same tenant as the first.
+    const tenant = (which.key !== "graph" && cache.account(CLIENTS.graphCli)?.tenantId) || String(opts.tenant || "").trim() || "organizations";
 
     const id = randomUUID();
-    const child = spawn("az", args, { stdio: ["ignore", "pipe", "pipe"] });
-    const run = { child, buffer: [], done: false, code: null, deviceCode: null };
+    const run = { done: false, code: null, deviceCode: null, verificationUri: "", error: "", which: which.key };
     runs.set(id, run);
-
-    const push = (chunk) => {
-      const text = String(chunk);
-      for (const line of text.split(/\r?\n/)) if (line.trim()) run.buffer.push(line);
-      // Surface the device code so the page can show it in large type.
-      const m = text.match(/code\s+([A-Z0-9]{6,})\s+to authenticate/i);
-      if (m) run.deviceCode = m[1];
-    };
-    child.stdout.on("data", push);
-    child.stderr.on("data", push);
-    child.on("close", (code) => { run.done = true; run.code = code; });
-
-    // Don't let a cancelled sign-in hang around forever.
-    setTimeout(() => { if (!run.done) { try { child.kill(); } catch {} } }, 10 * 60 * 1000);
-
-    return json(res, 200, { id });
+    (async () => {
+      const dc = await startDeviceCode({ tenant, clientId: which.clientId, scope: which.scope });
+      run.deviceCode = dc.userCode; run.verificationUri = dc.verificationUri;
+      const tok = await pollDeviceCode({ tenant, clientId: which.clientId, deviceCode: dc.deviceCode, interval: dc.interval, expiresIn: dc.expiresIn });
+      cache.addSignIn(which.clientId, tok, which.scope);
+    })().then(() => { run.done = true; run.code = 0; })
+      .catch((e) => { run.error = String(e.message || e); run.done = true; run.code = 1; });
+    return json(res, 200, { id, which: which.key });
   }
 
   if (req.method === "GET" && url.pathname === "/api/login-status") {
     const run = runs.get(url.searchParams.get("id"));
     if (!run) return json(res, 404, { error: "unknown login" });
     return json(res, 200, {
-      done: run.done, code: run.code, deviceCode: run.deviceCode,
-      lines: run.buffer.slice(-6),
+      done: run.done, code: run.code, deviceCode: run.deviceCode, verificationUri: run.verificationUri,
+      error: run.error, which: run.which, signins: signinState(), lines: run.buffer ? run.buffer.slice(-6) : [],
     });
   }
 
@@ -198,9 +234,10 @@ const server = createServer(async (req, res) => {
 
     const args = [WIZARD, "--answers", answersPath];
     if (payload.dryRun) args.push("--dry-run");
+    const pwsh = pwshPath();
     const child = spawn(process.execPath, args, {
       cwd: ROOT,
-      env: { ...process.env, FORCE_COLOR: "0" },
+      env: { ...process.env, FORCE_COLOR: "0", A365_TOKEN_CACHE: TOKEN_CACHE, ...(pwsh && pwsh !== "pwsh" ? { A365_PWSH: pwsh } : {}) },
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -241,6 +278,12 @@ const server = createServer(async (req, res) => {
     }, 150);
     req.on("close", () => clearInterval(tick));
     return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/task-status") {
+    const run = runs.get(url.searchParams.get("id"));
+    if (!run) return json(res, 404, { error: "unknown task" });
+    return json(res, 200, { done: run.done, code: run.code, lines: run.buffer.slice(-8) });
   }
 
   if (req.method === "GET" && url.pathname === "/api/detect") {

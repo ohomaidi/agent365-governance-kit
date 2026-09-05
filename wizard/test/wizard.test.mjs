@@ -218,28 +218,27 @@ describe("closing output", () => {
 describe("pilot group scope", () => {
   const stub = (existing) => {
     const calls = [];
-    const azJson = (args) => {
-      const key = args.join(" "); calls.push(key);
-      if (key.includes("groups?$filter=mailNickname")) return existing ? { id: "g-1", mail: "pilot@contoso.com", displayName: "P" } : null;
-      if (key.includes("/members?")) return ["u-1"];
-      if (key.includes("--method POST") && key.includes("/groups ")) return { id: "g-new", mail: "new@contoso.com", displayName: "P" };
+    const graph = async (method, path, body) => {
+      const key = `${method} ${path} ${body ? JSON.stringify(body) : ""}`; calls.push(key);
+      if (path.includes("groups?$filter=mailNickname")) return { value: existing ? [{ id: "g-1", mail: "pilot@contoso.com", displayName: "P" }] : [] };
+      if (path.includes("/members?")) return { value: [{ id: "u-1" }] };
+      if (method === "POST" && path === "/v1.0/groups") return { id: "g-new", mail: "new@contoso.com", displayName: "P" };
       return null;
     };
-    const az = (args) => { calls.push(args.join(" ")); return ""; };
-    return { calls, deps: { azJson, az } };
+    return { calls, deps: graph };
   };
 
-  test("creates a Microsoft 365 (mail-enabled) group when none exists", () => {
+  test("creates a Microsoft 365 (mail-enabled) group when none exists", async () => {
     const { calls, deps } = stub(false);
-    const g = ensurePilotGroup({ displayName: "P", mailNickname: "p", ownerId: "o", memberIds: ["u-1"] }, deps);
+    const g = await ensurePilotGroup({ displayName: "P", mailNickname: "p", ownerId: "o", memberIds: ["u-1"] }, deps);
     assert.equal(g.created, true); assert.equal(g.mail, "new@contoso.com");
-    const post = calls.find((c) => c.includes("--method POST") && c.includes("/groups "));
+    const post = calls.find((c) => c.startsWith("POST /v1.0/groups "));
     assert.match(post, /"groupTypes":\["Unified"\]/); assert.match(post, /"mailEnabled":true/);
   });
 
-  test("reuses an existing group and adds only the missing members", () => {
+  test("reuses an existing group and adds only the missing members", async () => {
     const { calls, deps } = stub(true);
-    const g = ensurePilotGroup({ displayName: "P", mailNickname: "p", ownerId: "o", memberIds: ["u-1", "u-2"] }, deps);
+    const g = await ensurePilotGroup({ displayName: "P", mailNickname: "p", ownerId: "o", memberIds: ["u-1", "u-2"] }, deps);
     assert.equal(g.created, false);
     const adds = calls.filter((c) => c.includes("/members/$ref"));
     assert.equal(adds.length, 1, "u-1 is already a member; only u-2 is added");
@@ -279,29 +278,29 @@ describe("DSPM collection policy is per-tenant", () => {
 describe("blueprint admin consent", () => {
   const stub = (grantExists, scope = "") => {
     const calls = [];
-    const azJson = (a) => { const k = a.join(" "); calls.push(k);
-      if (k.includes("sp show")) return "rsp-1";
-      if (k.includes("oauth2PermissionGrants?$filter")) return grantExists ? { id: "g-1", scope } : null;
+    const graph = async (method, path, body) => {
+      const k = `${method} ${path} ${body ? JSON.stringify(body) : ""}`; calls.push(k);
+      if (path.includes("servicePrincipals?$filter=appId")) return { value: [{ id: "rsp-1" }] };
+      if (path.includes("oauth2PermissionGrants?$filter")) return { value: grantExists ? [{ id: "g-1", scope }] : [] };
       return null; };
-    const az = (a) => { calls.push(a.join(" ")); return ""; };
-    return { calls, deps: { azJson, az } };
+    return { calls, deps: graph };
   };
-  test("grants tenant-wide delegated consent for each resource when none exists", () => {
+  test("grants tenant-wide delegated consent for each resource when none exists", async () => {
     const { calls, deps } = stub(false);
-    const out = grantBlueprintConsent({ blueprintPrincipalId: "bp-sp" }, deps);
-    const posts = calls.filter((c) => c.includes("--method POST") && c.includes("oauth2PermissionGrants"));
+    const out = await grantBlueprintConsent({ blueprintPrincipalId: "bp-sp" }, deps);
+    const posts = calls.filter((c) => c.startsWith("POST /v1.0/oauth2PermissionGrants"));
     assert.equal(posts.length, 3);
     assert.ok(posts.every((c) => c.includes('"consentType":"AllPrincipals"') && c.includes('"clientId":"bp-sp"')));
     assert.ok(posts.some((c) => c.includes("Agent365.Observability.OtelWrite")));
     assert.equal(out.filter((l) => l.startsWith("consent granted")).length, 3);
   });
-  test("merges scopes into an existing grant instead of duplicating it", () => {
+  test("merges scopes into an existing grant instead of duplicating it", async () => {
     const { calls, deps } = stub(true, "SomeOther.Scope");
-    grantBlueprintConsent({ blueprintPrincipalId: "bp-sp" }, deps);
-    const patches = calls.filter((c) => c.includes("--method PATCH"));
+    await grantBlueprintConsent({ blueprintPrincipalId: "bp-sp" }, deps);
+    const patches = calls.filter((c) => c.startsWith("PATCH "));
     assert.equal(patches.length, 3);
     assert.ok(patches[0].includes("SomeOther.Scope"), "existing scope preserved");
-    assert.equal(calls.some((c) => c.includes("--method POST") && c.includes("oauth2PermissionGrants")), false);
+    assert.equal(calls.some((c) => c.startsWith("POST /v1.0/oauth2PermissionGrants")), false);
   });
 });
 
