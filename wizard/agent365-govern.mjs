@@ -152,12 +152,20 @@ function makeGraphClient({ tenantId, clientId, clientSecret }) {
   let token = "", expires = 0;
   async function getToken() {
     if (token && Date.now() < expires - 60_000) return token;
-    const res = await fetchRetry(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
-      method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret,
-        scope: "https://graph.microsoft.com/.default", grant_type: "client_credentials" }),
-    });
-    const j = await res.json();
+    // A secret minted seconds ago is accepted by one Entra token replica and
+    // refused by another (AADSTS7000215, seen live). Retry that one for a while.
+    let j = {};
+    for (let attempt = 0; attempt < 12; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, 15_000));
+      const res = await fetchRetry(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
+        method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret,
+          scope: "https://graph.microsoft.com/.default", grant_type: "client_credentials" }),
+      });
+      j = await res.json();
+      if (j.access_token) break;
+      if (!/AADSTS7000215|AADSTS700016|invalid_client/i.test(String(j.error_description || j.error))) break;
+    }
     if (!j.access_token) throw new Error(`token: ${j.error_description || JSON.stringify(j)}`);
     token = j.access_token; expires = Date.now() + (j.expires_in ?? 3600) * 1000;
     return token;
@@ -209,7 +217,9 @@ export async function waitForConnectorRoles({ tenantId, clientId, clientSecret, 
       missing = required.filter((r) => !roles.includes(r));
       if (!missing.length) return { ok: true, attempts: attempt, waitedMs: Date.now() - started };
     }
-    log(`connector token does not carry ${missing.length} role(s) yet (${missing.slice(0, 3).join(", ")}${missing.length > 3 ? ", …" : ""}) — waiting 20s (attempt ${attempt})`);
+    log(j.access_token
+      ? `connector token does not carry ${missing.length} role(s) yet (${missing.slice(0, 3).join(", ")}${missing.length > 3 ? ", …" : ""}) — waiting 20s (attempt ${attempt})`
+      : `connector credential not accepted yet (${String(j.error_description || j.error || "no token").slice(0, 60)}) — waiting 20s (attempt ${attempt})`);
     await new Promise((r) => setTimeout(r, 20_000));
   }
   return { ok: false, attempts: attempt, waitedMs: Date.now() - started, missing };
@@ -1567,11 +1577,16 @@ async function validate({ tenantId, appId, clientSecret, userId, purviewAppName 
     p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${what} timed out after ${ms}ms`)), ms)),
   ]);
 
-  const tokRes = await withTimeout(fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
-    method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ client_id: appId, client_secret: clientSecret, scope: "https://graph.microsoft.com/.default", grant_type: "client_credentials" }),
-  }), 20000, "token");
-  const tokJson = await tokRes.json();
+  let tokJson = {};
+  for (let attempt = 0; attempt < 12; attempt++) {
+    if (attempt) await new Promise((r) => setTimeout(r, 15_000));
+    const tokRes = await withTimeout(fetchRetry(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
+      method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ client_id: appId, client_secret: clientSecret, scope: "https://graph.microsoft.com/.default", grant_type: "client_credentials" }),
+    }), 20000, "token");
+    tokJson = await tokRes.json();
+    if (tokJson.access_token || !/AADSTS7000215|invalid_client/i.test(String(tokJson.error_description || tokJson.error))) break;
+  }
   if (!tokJson.access_token) throw new Error(`token: ${tokJson.error_description || JSON.stringify(tokJson)}`);
   steps.push("token acquired");
 
