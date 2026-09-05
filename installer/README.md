@@ -22,7 +22,9 @@ itself and says so plainly if it can't.
    page shows the device code in large type. Sign-in is streamed, not awaited,
    so the page stays responsive throughout.
 3. **Collects the same decisions the CLI asks for**, with the safe option
-   preselected and the risky ones behind visible warnings.
+   preselected and the risky ones behind visible warnings. "Just me" and
+   "specific people" become a Microsoft 365 pilot group the wizard creates —
+   Purview can only bind a policy to a tenant or a mail-enabled group.
 4. **Rehearse** runs a full dry run and changes nothing. **Provision** asks for
    confirmation naming the tenant, mode and scope before it does anything.
 5. **Streams the live log** into the page, so there's nothing to go and read

@@ -66,7 +66,7 @@ production agent. Its defaults are chosen so that a mistake fails safe:
 | Unreachable Purview | **blocks** (`PURVIEW_FAIL_CLOSED=false` to opt out) | An outage must not become an ungoverned window. |
 | Incomplete config | **blocks**, logs which vars are missing | "Misconfigured" is a failure, not "off". |
 | New DLP policy mode | **TestWithNotifications** | Audits and alerts; blocks nothing until you review results. |
-| New DLP policy scope | **a pilot group you name** | Tenant-wide needs two explicit confirmations. |
+| New DLP policy scope | **a pilot group** (created for you when you name people) | Purview binds only to a tenant or a mail-enabled group; tenant-wide needs two explicit confirmations. |
 | DSPM content ingestion | **off** | Storing prompt/response text is a privacy decision, not a default. |
 | Provisioning privileges | **revoked after use** | The connector keeps only the two Graph roles it needs at runtime. |
 
@@ -133,6 +133,9 @@ node wizard/agent365-govern.mjs      # or: npm run init
 The wizard signs you in (`az login` as Global Admin), asks for your variables, your
 agent's language, **who the policy applies to**, and **whether it enforces**, then:
 
+0. when you scope to specific people, creates (or reuses) a **Microsoft 365 pilot group**
+   holding them — Purview's Applications-workload DLP binds to a tenant or a mail-enabled
+   group only; there is no per-user binding,
 1. creates a dedicated app registration + secret + certificate,
 2. grants `Content.Process.All`, `ProtectionScopes.Compute.All`, `Exchange.ManageAsApp` —
    plus `AgentInstance.ReadWrite.All` and the blueprint roles when you ask for
@@ -140,8 +143,9 @@ agent's language, **who the policy applies to**, and **whether it enforces**, th
 3. assigns the **Compliance Administrator** role (provisioning only — see step 8),
 4. creates a DLP policy + rules (Credit Card and/or your custom keywords) and, if you
    ask for it, a DSPM collection policy,
-5. **registers the agent in Agent 365** — creates the identity blueprint, mints its
-   credential, POSTs the agent instance with its A2A card, and reads it back to verify,
+5. **registers the agent in Agent 365** — identity blueprint → credential → blueprint
+   principal → agent identity → `POST /beta/copilot/agentRegistrations` with the agent
+   card, then reads it back to verify. Re-running finds and reuses each of these,
 6. writes all `PURVIEW_*`, `agent365Observability__*` and `AGENT365_INSTANCE_ID` values
    into your app's `.env` — **replacing** any previous block it wrote, after a `.bak`,
 7. validates end to end: **token → `protectionScopes/compute` → `processContent`**,
@@ -253,10 +257,10 @@ npm run test:all       # TypeScript + wizard + Python + .NET
 | TypeScript | 20 | defaults, misconfiguration, verdicts, retries, timeouts, caching, payload, redaction |
 | Python | 19 | same behaviours, mirrored |
 | .NET | 18 | same behaviours, mirrored |
-| Wizard | 51 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 payloads and call ordering |
+| Wizard | 49 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 payloads and call ordering |
 | Proxy | 20 | enforcement, protocol-shaped refusals, attribution, health |
 
-**128 tests total.**
+**126 tests total.** Registration and policy creation are also verified live against a licensed tenant.
 
 CI runs all of them on every push ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
@@ -270,7 +274,8 @@ CI runs all of them on every push ([`.github/workflows/ci.yml`](.github/workflow
 - **Per-user scoping:** the managed-app plane doesn't accept user/group scoping via PowerShell for *all* policy types; the wizard sets it in the policy `Locations`, and you can refine it in the Purview portal.
 - **Billing:** Purview API calls for custom apps are metered (pay-as-you-go on the Azure subscription).
 - **PowerShell:** the wizard pins ExchangeOnlineManagement `3.5.1` (newer 3.10.x throws on PowerShell 7.6).
-- **Registration uses `/beta` Graph endpoints**, which Microsoft labels subject to change. It runs app-only under the connector app — the Azure CLI's own token carries no agent scopes, so `az rest` cannot make these calls.
+- **Registration uses the Agent Registration API** (`/beta/copilot/agentRegistrations`), which Microsoft labels subject to change; the identity steps are on `v1.0`. It runs app-only under the connector app — the Azure CLI's own token carries no agent scopes, so `az rest` cannot make these calls. The older `/beta/agentRegistry/*` surface retired on 15 June 2026.
+- **Scope is a tenant or a mail-enabled group.** Purview cannot bind an Applications-workload DLP policy to individual users, so "just me" / "specific people" become a Microsoft 365 pilot group the wizard creates and maintains.
 - **The proxy only governs traffic that traverses it.** A vendor SaaS agent users hit directly in a browser bypasses it; use endpoint DLP or Agent 365's block control there.
 - **Certificate:** used only for policy provisioning. The runtime authenticates with the client secret; remove the cert afterwards if you won't re-run the wizard.
 - **Not published to npm/PyPI/NuGet.** Install from this repo (see each package README); `npx agent365-govern` will not resolve.

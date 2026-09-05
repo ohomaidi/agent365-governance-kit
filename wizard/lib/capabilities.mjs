@@ -18,9 +18,10 @@ export const PURVIEW_ROLES = ["Content.Process.All", "ProtectionScopes.Compute.A
 
 /** Graph application permissions Agent 365 registration needs. */
 export const AGENT365_ROLES = [
-  "AgentInstance.ReadWrite.All",
   "AgentIdentityBlueprint.Create",
-  "AgentIdentityBlueprint.ReadWrite.All",
+  "AgentIdentityBlueprintPrincipal.Create",
+  "AgentIdentity.Create.All",
+  "AgentRegistration.ReadWrite.All",
 ];
 
 /** Roles the wizard's stages actually need. */
@@ -123,8 +124,7 @@ export async function probeTenant(azJson) {
     checks.push(a365Missing.length
       ? bad("Agent 365 registration", `missing app role(s): ${a365Missing.join(", ")}`,
             "Registration will be skipped. Purview is unaffected.")
-      : warn("Agent 365 registration", "permissions present; endpoint checked during provisioning",
-             "The Entra agent registry retired 15 June 2026. If it no longer answers, register in the M365 admin center."));
+      : ok("Agent 365 registration", "blueprint, identity and registration permissions available"));
     checks.push(graphRoles.includes("CopilotPackages.ReadWrite.All")
       ? ok("Agent 365 inventory", "CopilotPackages.ReadWrite.All available")
       : warn("Agent 365 inventory", "CopilotPackages.ReadWrite.All not offered",

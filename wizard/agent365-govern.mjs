@@ -29,7 +29,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { registerAgent, listAgentInstances, GRAPH_BETA } from "./lib/agent365.mjs";
+import { registerAgent, slugify } from "./lib/agent365.mjs";
 import { probeTenant } from "./lib/capabilities.mjs";
 
 // --- Microsoft constants (stable GUIDs) ---
@@ -47,8 +47,12 @@ const ROLE_AGENT_BLUEPRINT_RW = "7fddd33b-d884-4ec0-8696-72cff90ff825";     // A
 const ROLE_AGENT_BLUEPRINT_CREATE = "ea4b2453-ad2d-4d94-9155-10d5d9493ce9"; // AgentIdentityBlueprint.Create
 const ROLE_AGENT_BLUEPRINT_CREDS = "0510736e-bdfb-4b37-9a1f-89b4a074763a";  // AgentIdentityBlueprint.AddRemoveCreds.All
 const ROLE_AGENT_CARD_RW = "228b1a03-f7ca-4348-b50d-e8a547ab61af";          // AgentCardManifest.ReadWrite.All
-// The Agent 365 inventory API that REPLACED the retired Entra agent registry.
-const ROLE_COPILOT_PACKAGES_RW = "ed31732f-9495-47ed-ba3b-4ed0948c1c64";    // CopilotPackages.ReadWrite.All
+const ROLE_AGENT_BLUEPRINT_AUTH = "19202363-278e-49c2-bf00-391e2ba00881";   // AgentIdentityBlueprint.UpdateAuthProperties.All
+const ROLE_AGENT_PRINCIPAL_CREATE = "8959696d-d07e-4916-9b1e-3ba9ce459161"; // AgentIdentityBlueprintPrincipal.Create
+const ROLE_AGENT_IDENTITY_CREATE = "ad25cc1d-84d8-47df-a08e-b34c2e800819";  // AgentIdentity.Create.All
+const ROLE_AGENT_IDENTITY_READ = "b2b8f011-2898-4234-9092-5059f6c1ebfa";    // AgentIdentity.Read.All
+const ROLE_AGENT_REGISTRATION_RW = "39fb8c64-7bd3-4107-8515-14d6e55ddda4";  // AgentRegistration.ReadWrite.All (POST /copilot/agentRegistrations)
+const ROLE_COPILOT_PACKAGES_RW = "ed31732f-9495-47ed-ba3b-4ed0948c1c64";    // CopilotPackages.ReadWrite.All (Agent 365 inventory)
 const EXO_MODULE_VERSION = "3.5.1"; // 3.10.x throws NullRef on PowerShell 7.6
 
 const IS_WINDOWS = process.platform === "win32";
@@ -88,64 +92,54 @@ function az(args) { return sh("az", args); }
 function azJson(args) { const out = az(args).trim(); return out ? JSON.parse(out) : null; }
 
 /**
- * Graph caller for the Agent 365 registry, authenticated as the CONNECTOR APP.
+ * Graph caller for Agent 365 registration, authenticated as the CONNECTOR APP.
  *
- * This deliberately does not use `az rest`. The Azure CLI is a first-party app
- * whose delegated token carries no agent-related scopes — AgentInstance.*,
- * AgentIdentityBlueprint.* and friends are simply absent from it — so registry
- * calls made through it return 404/403 in every tenant, including ones where
- * the feature is fully licensed. The app registration this wizard creates holds
- * the app roles, so it mints its own token instead.
+ * Not `az rest`: the Azure CLI is a first-party app whose token carries no
+ * agent scopes at all, so every agent endpoint 403s/404s through it. The app
+ * registration this wizard creates holds the app roles and mints its own token.
  *
- * Injected into registerAgent, so the flow stays unit-testable without a tenant.
+ * Contract (shared with wizard/lib/agent365.mjs): graph(method, path, body?,
+ * headers?) resolves to the parsed body on 2xx; otherwise throws an Error with
+ * `.status` and `.body`. Paths are full ("/v1.0/…" or "/beta/…").
  */
-/** Thrown when registration is impossible rather than merely failing. */
-class SkipRegistration extends Error {}
-
 function makeGraphClient({ tenantId, clientId, clientSecret }) {
   let token = "", expires = 0;
-
   async function getToken() {
     if (token && Date.now() < expires - 60_000) return token;
     const res = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: clientId, client_secret: clientSecret,
-        scope: "https://graph.microsoft.com/.default", grant_type: "client_credentials",
-      }),
+      method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret,
+        scope: "https://graph.microsoft.com/.default", grant_type: "client_credentials" }),
     });
     const j = await res.json();
     if (!j.access_token) throw new Error(`token: ${j.error_description || JSON.stringify(j)}`);
-    token = j.access_token;
-    expires = Date.now() + (j.expires_in ?? 3600) * 1000;
+    token = j.access_token; expires = Date.now() + (j.expires_in ?? 3600) * 1000;
     return token;
   }
-
-  const call = async (base, method, path, body) => {
-    // Freshly granted app roles take a little while to reach a minted token.
+  return async function graph(method, path, body, headers = {}) {
+    // Freshly granted app roles take a little while to reach a minted token:
+    // 401/403 are retried with a re-minted token. Object replication (404 /
+    // 400 "does not exist") is the library's job.
     const delays = [0, 5000, 10000, 20000, 30000];
     let last;
     for (const d of delays) {
       if (d) await new Promise((r) => setTimeout(r, d));
       const t = await getToken();
-      const res = await fetch(`${base}${path}`, {
+      const res = await fetch(`https://graph.microsoft.com${path}`, {
         method,
-        headers: { authorization: `Bearer ${t}`, ...(body ? { "content-type": "application/json" } : {}) },
+        headers: { authorization: `Bearer ${t}`, ...(body ? { "content-type": "application/json" } : {}), ...headers },
         body: body ? JSON.stringify(body) : undefined,
       });
       const text = await res.text();
-      if (res.ok) return text ? JSON.parse(text) : null;
-      last = `${method} ${path} -> HTTP ${res.status}: ${text.slice(0, 300)}`;
-      if (![401, 403].includes(res.status)) break;  // only wait out propagation
-      token = "";                                    // re-mint; roles may have landed
+      let parsed = null; try { parsed = text ? JSON.parse(text) : null; } catch { parsed = { raw: text }; }
+      if (res.ok) return parsed;
+      last = Object.assign(new Error(`${method} ${path} -> HTTP ${res.status}: ${(parsed?.error?.message ?? text).slice(0, 300)}`),
+        { status: res.status, body: parsed });
+      if (![401, 403].includes(res.status)) break;
+      token = "";
     }
-    throw new Error(last);
+    throw last;
   };
-
-  const graph = (method, path, body) => call(GRAPH_BETA, method, path, body);
-  graph.v1 = (method, path, body) => call("https://graph.microsoft.com/v1.0", method, path, body);
-  return graph;
 }
 
 /** Quote a value for safe embedding in a PowerShell single-quoted literal. */
@@ -156,6 +150,46 @@ export const odata = (v) => String(v ?? "").replace(/'/g, "''");
 function assertEnvSafe(name, v) {
   if (/[\r\n]/.test(String(v))) die(`${name} must not contain newlines.`);
   return v;
+}
+
+/**
+ * Purview's Applications-workload DLP binds a policy to exactly two things:
+ * the whole tenant, or a mail-enabled group. There is no per-user binding
+ * (probed live: "User", "Individual", "Recipient" are all rejected). So
+ * "just me" / "specific people" becomes: create (or reuse) a Microsoft 365
+ * group holding those people, and bind to its mail address.
+ *
+ * Idempotent on mailNickname; adds any missing members on re-run.
+ * `deps` is injectable for tests.
+ */
+export function ensurePilotGroup({ displayName, mailNickname, ownerId, memberIds }, deps = { azJson, az }) {
+  const G = "https://graph.microsoft.com/v1.0";
+  let g = deps.azJson(["rest", "--method", "GET",
+    "--url", `${G}/groups?$filter=mailNickname eq '${odata(mailNickname)}'&$select=id,mail,displayName`,
+    "--query", "value[0]", "-o", "json"]);
+  let created = false;
+  if (!g) {
+    g = deps.azJson(["rest", "--method", "POST", "--url", `${G}/groups`,
+      "--headers", "Content-Type=application/json",
+      "--body", JSON.stringify({
+        displayName, mailNickname, description: "Pilot scope for an Agent 365 Governance Kit DLP policy.",
+        groupTypes: ["Unified"], mailEnabled: true, securityEnabled: false,
+        "owners@odata.bind": [`${G}/users/${ownerId}`],
+        "members@odata.bind": [...new Set(memberIds)].map((id) => `${G}/users/${id}`),
+      }), "--query", "{id:id,mail:mail,displayName:displayName}", "-o", "json"]);
+    created = true;
+  } else {
+    const have = (deps.azJson(["rest", "--method", "GET", "--url", `${G}/groups/${g.id}/members?$select=id`,
+      "--query", "value[].id", "-o", "json"]) ?? []);
+    for (const id of memberIds) {
+      if (have.includes(id)) continue;
+      deps.az(["rest", "--method", "POST", "--url", `${G}/groups/${g.id}/members/$ref`,
+        "--headers", "Content-Type=application/json",
+        "--body", JSON.stringify({ "@odata.id": `${G}/directoryObjects/${id}` }), "-o", "none"]);
+    }
+  }
+  if (!g?.mail) throw new Error(`pilot group "${displayName}" has no mail address; Purview cannot bind to it`);
+  return { id: g.id, mail: g.mail, displayName: g.displayName, created };
 }
 
 /** Best-effort shred: overwrite file bytes before unlinking. */
@@ -312,7 +346,7 @@ async function main(work) {
   console.log(`  3) Everyone in the tenant  (production-wide)${C.reset}`);
   const scopeChoice = await ask("Choose 1/2/3:", "1", "scopeChoice");
 
-  let scopeInclusions, scopeLabel;
+  let scopeInclusions, scopeLabel, pilotPlan = null;
   if (scopeChoice === "3") {
     warn("Tenant-wide means EVERY user in this tenant is subject to the policy.");
     if (!(await yes("Are you sure you want tenant-wide scope?", false, "confirmTenantWide"))) { closeInput(); die("Aborted — re-run and pick a pilot group."); }
@@ -322,24 +356,33 @@ async function main(work) {
   } else if (scopeChoice === "2") {
     const upns = (await ask("Pilot user UPNs (comma-separated):", attribUpn, "pilotUsers")).split(",").map((s) => s.trim()).filter(Boolean);
     if (!upns.length) { closeInput(); die("No users given."); }
+    const ids = [];
     for (const u of upns) {
-      try { azJson(["ad", "user", "show", "--id", u, "--query", "id", "-o", "json"]); }
+      try { ids.push(azJson(["ad", "user", "show", "--id", u, "--query", "id", "-o", "json"])); }
       catch { closeInput(); die(`User "${u}" not found in this tenant.`); }
     }
-    scopeInclusions = upns.map((u) => ({ Type: "User", Identity: u }));
-    scopeLabel = `${upns.length} user(s): ${upns.join(", ")}`;
+    // Purview can't bind to users, so these people go into a pilot group
+    // that is created after "Proceed" (never during a rehearsal).
+    pilotPlan = {
+      displayName: `${purviewAppName} Pilot`,
+      mailNickname: slugify(`${purviewAppName}-pilot`),
+      memberIds: ids, upns,
+    };
+    scopeLabel = `pilot group "${pilotPlan.displayName}" (${upns.length}: ${upns.join(", ")})`;
   } else {
     const grp = await ask("Pilot group email / object id:", "", "pilotGroup");
     if (!grp) { closeInput(); die("A pilot group is required for scope 1. Create one in Entra, or pick option 2 or 3."); }
     // Checked even in a dry run: it's a read-only lookup, and a rehearsal that
     // can't catch what provisioning would fail on is worthless.
-    try { azJson(["ad", "group", "show", "--group", grp, "--query", "id", "-o", "json"]); }
-    catch {
+    let g;
+    try { g = azJson(["ad", "group", "show", "--group", grp, "--query", "{id:id,mail:mail,displayName:displayName}", "-o", "json"]); }
+    catch { closeInput(); die(`Group "${grp}" not found in this tenant. Pick "Just me", or create the group in Entra first.`); }
+    if (!g?.mail) {
       closeInput();
-      die(`Group "${grp}" not found in this tenant. Pick "Just me", or create the group in Entra first.`);
+      die(`Group "${g?.displayName ?? grp}" has no mail address. Purview DLP can only bind to a Microsoft 365 group or a mail-enabled group — pick one of those, or choose "Just me".`);
     }
-    scopeInclusions = [{ Type: "Group", Identity: grp }];
-    scopeLabel = `group ${grp}`;
+    scopeInclusions = [{ Type: "Group", Identity: g.mail }];
+    scopeLabel = `group ${g.displayName} <${g.mail}>`;
   }
 
   // --- enforcement mode: test by default ---
@@ -417,6 +460,7 @@ async function main(work) {
   console.log("");
 
   if (DRY_RUN) {
+    if (pilotPlan) plan(`create pilot group "${pilotPlan.displayName}" with ${pilotPlan.memberIds.length} member(s) and scope the DLP policy to it`);
     plan("create the app registration, secret, certificate and role assignments");
     plan(`create DLP policy in ${dlpMode} mode scoped to ${scopeLabel}`);
     plan(`write ${envPath}`);
@@ -434,6 +478,16 @@ async function main(work) {
     return;
   }
   if (!(await yes("Proceed?", true, "proceed"))) { closeInput(); die("Aborted."); }
+
+  // ---- 0. pilot group (scope = specific people) ----
+  if (pilotPlan) {
+    info(`Creating pilot group "${pilotPlan.displayName}"…`);
+    const ownerId = azJson(["ad", "signed-in-user", "show", "--query", "id", "-o", "json"]);
+    const g = ensurePilotGroup({ ...pilotPlan, ownerId });
+    scopeInclusions = [{ Type: "Group", Identity: g.mail }];
+    if (g.created) record(`pilot group "${g.displayName}" (${g.id}) — delete with: az ad group delete --group ${g.id}`);
+    ok(`Pilot group ${g.mail} ${g.created ? "created" : "reused"} — ${pilotPlan.memberIds.length} member(s)`);
+  }
 
   // ---- 1. app registration + SP + secret ----
   info("Creating app registration…");
@@ -477,6 +531,11 @@ async function main(work) {
     assignRole(graphSp, ROLE_AGENT_BLUEPRINT_CREATE, "AgentIdentityBlueprint.Create");
     assignRole(graphSp, ROLE_AGENT_BLUEPRINT_CREDS, "AgentIdentityBlueprint.AddRemoveCreds.All");
     assignRole(graphSp, ROLE_AGENT_CARD_RW, "AgentCardManifest.ReadWrite.All");
+    assignRole(graphSp, ROLE_AGENT_BLUEPRINT_AUTH, "AgentIdentityBlueprint.UpdateAuthProperties.All");
+    assignRole(graphSp, ROLE_AGENT_PRINCIPAL_CREATE, "AgentIdentityBlueprintPrincipal.Create");
+    assignRole(graphSp, ROLE_AGENT_IDENTITY_CREATE, "AgentIdentity.Create.All");
+    assignRole(graphSp, ROLE_AGENT_IDENTITY_READ, "AgentIdentity.Read.All");
+    assignRole(graphSp, ROLE_AGENT_REGISTRATION_RW, "AgentRegistration.ReadWrite.All");
     assignRole(graphSp, ROLE_COPILOT_PACKAGES_RW, "CopilotPackages.ReadWrite.All");
   }
   ok("App-role assignments granted");
@@ -543,84 +602,35 @@ async function main(work) {
     warn("The connector + permissions are still set. Re-run the wizard to retry policy creation.");
   }
 
-  // ---- 4b. Agent 365: blueprint + registry instance ----
-  // This used to be a printed checklist. Microsoft now exposes registration
-  // through Graph, so the wizard does it and verifies the result.
+  // ---- 4b. Agent 365: blueprint → secret → principal → identity → registration ----
+  // Every call here has been run live against a licensed tenant. Failures are
+  // reported, not fatal: Purview provisioning above already succeeded.
   let a365 = null;
   if (wantAgent365) {
-    info("Registering in Agent 365 (identity blueprint + agent registry)…");
+    info("Registering in Agent 365 (identity blueprint + agent identity + registry)…");
     try {
       const sponsorId = azJson(["ad", "user", "show", "--id", sponsorUpn, "--query", "id", "-o", "json"]);
       if (!sponsorId) throw new Error(`sponsor "${sponsorUpn}" not found in this tenant`);
       const graph = makeGraphClient({ tenantId, clientId: appId, clientSecret });
-      const graphV1 = graph.v1;
-
-      // A stale instance from the retired (pre-June-2026) registry will collide.
-      try {
-        const existing = await listAgentInstances(graph);
-        const clash = existing.find((i) => i.displayName === agentName);
-        if (clash) {
-          warn(`  An agent instance named "${agentName}" already exists (${clash.id}).`);
-          if (await yes("  Replace it?", false, "replaceInstance")) {
-            await graph("DELETE", `/agentRegistry/agentInstances/${clash.id}`);
-            ok("  removed the previous registration");
-          } else {
-            throw new Error("registration skipped — an instance with that name already exists");
-          }
-        }
-      } catch (e) {
-        if (/already exists/.test(String(e.message))) throw e;
-        info(`  (could not list existing instances: ${String(e.message).slice(0, 120)})`);
-      }
-
-      // The Entra agent registry (/beta/agentRegistry/*) was RETIRED on
-      // 2026-06-15 and now returns 404 for everyone. Check before attempting a
-      // registration that cannot succeed, and fall back to reporting the
-      // tenant's live Agent 365 inventory instead of failing the whole run.
-      let registryLive = true;
-      try {
-        await graph("GET", "/agentRegistry/agentInstances");
-      } catch (e) {
-        if (/HTTP (404|400)/.test(String(e.message))) registryLive = false;
-      }
-      if (!registryLive) {
-        warn("  The Entra agent registry API retired on 15 June 2026 and no longer accepts registrations.");
-        warn("  Purview governance is fully configured; Agent 365 registration must be done in the");
-        warn("  Microsoft 365 admin center → Agents, until Microsoft documents the replacement write API.");
-        try {
-          const cat = await graphV1("GET", "/copilot/admin/catalog/packages?$top=1");
-          const n = cat?.["@odata.count"];
-          if (n !== undefined) ok(`  Agent 365 inventory reachable — ${n} agents/apps currently registered in this tenant.`);
-        } catch { /* inventory is a nicety, not a requirement */ }
-        a365 = null;
-        throw new SkipRegistration();
-      }
-
       a365 = await registerAgent(graph, {
         agentName,
         agentDescription: `${agentName} — governed by the Agent 365 Governance Kit`,
         agentUrl,
         sponsorIds: [sponsorId],
         ownerIds: [sponsorId],
-        existingBlueprintId,
-        transport,
+        managedByAppId: appId,
         organization: purviewAppName,
+        existingBlueprintId,
       }, (m) => info(`  ${m}`));
-
       for (const st of a365.steps) ok(`  ${st}`);
-      record(`Agent 365 blueprint ${a365.blueprintId}`);
-      record(`Agent 365 instance ${a365.instanceId} — delete with: az rest --method DELETE --url ${GRAPH_BETA}/agentRegistry/agentInstances/${a365.instanceId}`);
-      if (!a365.verified) warn("  Registration could not be read back — check the Agent 365 registry manually.");
+      record(`Agent 365 blueprint ${a365.blueprintId} — delete with: az ad app delete --id ${a365.blueprintAppId}`);
+      record(`Agent 365 registration ${a365.registrationId} — delete with: DELETE https://graph.microsoft.com/beta/copilot/agentRegistrations/${a365.registrationId}`);
+      if (!a365.verified) warn("  Registration could not be read back — check M365 admin center → Agents.");
     } catch (e) {
       a365 = null;
-      if (e instanceof SkipRegistration) {
-        // Already explained above; not a failure of this run.
-      } else {
       warn(`Agent 365 registration failed: ${String(e.message).slice(0, 400)}`);
-      warn("  These are /beta endpoints. The connector app was granted");
-      warn("  AgentInstance.ReadWrite.All and the blueprint roles; a new assignment can");
-      warn("  take a few minutes to reach a token. Purview provisioning is unaffected.");
-      }
+      warn("  The connector was granted the agent app roles; a fresh grant can take a few");
+      warn("  minutes to reach a token. Re-run the wizard to retry. Purview is unaffected.");
     }
   }
 
@@ -645,17 +655,18 @@ async function main(work) {
       "ENABLE_A365_OBSERVABILITY_EXPORTER=true",
       "A365_OBSERVABILITY_LOG_LEVEL=info|warn|error",
       `agent365Observability__tenantId=${tenantId}`,
-      `agent365Observability__clientId=${a365.blueprintAppId || a365.blueprintId}`,
+      `agent365Observability__clientId=${a365.blueprintAppId}`,
       `agent365Observability__clientSecret=${a365.blueprintSecret}`,
-      `agent365Observability__agentBlueprintId=${a365.blueprintId}`,
+      `agent365Observability__agentBlueprintId=${a365.blueprintAppId}`,
+      `agent365Observability__agentId=${a365.agentIdentityId}`,
       `agent365Observability__agentName=${agentName}`,
       `agent365Observability__agentDescription=${agentName}`,
       "",
-      "# Agent 365 registry (written by the wizard; the live instance id is what",
-      "# the observability endpoint authorises against).",
-      `AGENT365_INSTANCE_ID=${a365.instanceId}`,
+      "# Agent 365 registry (written by the wizard)",
+      `AGENT365_REGISTRATION_ID=${a365.registrationId}`,
+      `AGENT365_AGENT_IDENTITY_ID=${a365.agentIdentityId}`,
+      `AGENT365_BLUEPRINT_PRINCIPAL_ID=${a365.blueprintPrincipalId}`,
       `AGENT365_AGENT_URL=${agentUrl}`);
-    if (a365.agentUserId) block.push(`AGENT365_AGENT_USER_ID=${a365.agentUserId}`);
   }
   const how = writeEnvBlock(envPath, block);
   record(`.env block ${how} at ${envPath}`);
@@ -725,12 +736,13 @@ async function main(work) {
     catch { /* non-fatal */ }
     if (a365) {
       console.log(`\n${C.g}${C.b}Agent 365 registration complete.${C.reset}`);
-      console.log(`  blueprint : ${a365.blueprintId}`);
-      console.log(`  instance  : ${a365.instanceId}`);
-      console.log(`  endpoint  : ${agentUrl}`);
+      console.log(`  blueprint    : ${a365.blueprintAppId}`);
+      console.log(`  identity     : ${a365.agentIdentityId}`);
+      console.log(`  registration : ${a365.registrationId}${a365.verified ? "  (verified)" : ""}`);
+      console.log(`  endpoint     : ${agentUrl}`);
       console.log(`\n${C.b}${C.y}Two things the wizard still can't do:${C.reset}`);
-      console.log(`  1. Grant admin consent for the blueprint's Graph permissions (Entra -> the blueprint -> API permissions)`);
-      console.log(`  2. Assign the Agent 365 licence to the agent user, if your tenant requires one`);
+      console.log(`  1. Grant admin consent for the blueprint's Graph permissions (Entra -> Agents -> Agent blueprints)`);
+      console.log(`  2. Assign the Agent 365 licence to the agent identity, if your tenant requires one`);
       console.log(`\n  Then verify: M365 admin center -> Agents -> All agents -> "${agentName}"\n`);
     } else {
       console.log(`\n${C.b}${C.y}Agent 365 was NOT registered.${C.reset} To do it by hand, see AGENT365_SETUP.md\n`);
@@ -817,16 +829,17 @@ export function agent365Checklist({ agentName, lang, blueprintId }) {
     : "Wire observability with initObservability() + refreshTurnObservability() + withAgentScope() (see the package README).";
   return `# Completing Agent 365 setup for "${agentName}"
 
-The wizard now automates most of this through Microsoft Graph:
+The wizard automates registration through Microsoft Graph, as the connector app:
 
-  POST /beta/agentIdentityBlueprints                 create the identity blueprint
-  POST /beta/agentIdentityBlueprints/{id}/addPassword mint its credential
-  POST /beta/agentRegistry/agentInstances            register the agent + its card
-  GET  /beta/agentRegistry/agentInstances/{id}       verify the registration
+  POST /v1.0/applications/microsoft.graph.agentIdentityBlueprint         identity blueprint
+  POST /v1.0/applications/{id}/microsoft.graph.agentIdentityBlueprint/addPassword
+  POST /v1.0/serviceprincipals/microsoft.graph.agentIdentityBlueprintPrincipal
+  POST /beta/servicePrincipals/microsoft.graph.agentIdentity              agent identity
+  POST /beta/copilot/agentRegistrations                                   Agent 365 registry
+  GET  /beta/copilot/agentRegistrations/{id}                              verify
 
-Those endpoints need the *Agent Registry Administrator* and *Agent ID
-Administrator* roles, and the AgentInstance.ReadWrite.All permission. They are
-/beta endpoints, which Microsoft labels subject to change.
+The registration endpoint is /beta, which Microsoft labels subject to change.
+(The older /beta/agentRegistry/* surface retired on 15 June 2026.)
 
 ## What still needs a human
 
@@ -927,10 +940,14 @@ $connected=$false
 # Back off gently at first — permissions usually land in well under a minute.
 $delays = @(5,10,15,30,30,60,60,60,60,60,60,60)
 for ($i=0; $i -lt $delays.Count; $i++) {
-  try { Connect-IPPSSession -AppId ${psLit(appId)} -Certificate $cert -Organization ${psLit(org)} -ShowBanner:$false; $connected=$true; break }
+  # *>$null: on failure the module dumps the raw HTTP response (headers, CSP,
+  # cookies) to the host before throwing. The exception still reaches catch.
+  try { Connect-IPPSSession -AppId ${psLit(appId)} -Certificate $cert -Organization ${psLit(org)} -ShowBanner:$false -ErrorAction Stop *>$null; $connected=$true; break }
   catch {
-    if ($i -eq 0) { Write-Host ("  first attempt failed: " + $_.Exception.Message) }
-    Write-Host ("  waiting for permission propagation (attempt " + ($i+1) + " of " + $delays.Count + ")…")
+    $m = ($_.Exception.Message -split "\`n")[0]
+    if ($m -match "AADSTS700027") { $m = "certificate not yet visible to Entra (propagation)" }
+    elseif ($m.Length -gt 160) { $m = $m.Substring(0,160) + "…" }
+    Write-Host ("  attempt " + ($i+1) + " of " + $delays.Count + ": " + $m + " — retrying in " + $delays[$i] + "s")
     Start-Sleep -Seconds $delays[$i]
   }
 }

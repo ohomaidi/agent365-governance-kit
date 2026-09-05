@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { psLit, odata, writeEnvBlock, buildProvisionScript, makeCertificate,
-         agent365Checklist, integrationSnippet, BEGIN, END } from "../agent365-govern.mjs";
+         agent365Checklist, integrationSnippet, ensurePilotGroup, BEGIN, END } from "../agent365-govern.mjs";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "a365-wiztest-"));
 
@@ -210,5 +210,47 @@ describe("closing output", () => {
     for (const lang of ["typescript", "python", "dotnet", "csharp", "unknown"]) {
       assert.ok(integrationSnippet(lang).includes("guard"), `no snippet for ${lang}`);
     }
+  });
+});
+
+describe("pilot group scope", () => {
+  const stub = (existing) => {
+    const calls = [];
+    const azJson = (args) => {
+      const key = args.join(" "); calls.push(key);
+      if (key.includes("groups?$filter=mailNickname")) return existing ? { id: "g-1", mail: "pilot@contoso.com", displayName: "P" } : null;
+      if (key.includes("/members?")) return ["u-1"];
+      if (key.includes("--method POST") && key.includes("/groups ")) return { id: "g-new", mail: "new@contoso.com", displayName: "P" };
+      return null;
+    };
+    const az = (args) => { calls.push(args.join(" ")); return ""; };
+    return { calls, deps: { azJson, az } };
+  };
+
+  test("creates a Microsoft 365 (mail-enabled) group when none exists", () => {
+    const { calls, deps } = stub(false);
+    const g = ensurePilotGroup({ displayName: "P", mailNickname: "p", ownerId: "o", memberIds: ["u-1"] }, deps);
+    assert.equal(g.created, true); assert.equal(g.mail, "new@contoso.com");
+    const post = calls.find((c) => c.includes("--method POST") && c.includes("/groups "));
+    assert.match(post, /"groupTypes":\["Unified"\]/); assert.match(post, /"mailEnabled":true/);
+  });
+
+  test("reuses an existing group and adds only the missing members", () => {
+    const { calls, deps } = stub(true);
+    const g = ensurePilotGroup({ displayName: "P", mailNickname: "p", ownerId: "o", memberIds: ["u-1", "u-2"] }, deps);
+    assert.equal(g.created, false);
+    const adds = calls.filter((c) => c.includes("/members/$ref"));
+    assert.equal(adds.length, 1, "u-1 is already a member; only u-2 is added");
+    assert.match(adds[0], /directoryObjects\/u-2/);
+  });
+
+  test("Purview binds to Tenant or Group only — a per-user binding is never emitted", () => {
+    const ps = buildProvisionScript({
+      appId: "app", org: "o.onmicrosoft.com", pfx: "/x.pfx", purviewAppName: "A", wantCreditCard: true,
+      customSitTerms: [], work: "/tmp", dlpMode: "TestWithNotifications",
+      scopeInclusions: [{ Type: "Group", Identity: "a-pilot@o.onmicrosoft.com" }], wantDspm: false, dspmIngest: false,
+    });
+    assert.match(ps, /"Type":"Group","Identity":"a-pilot@o\.onmicrosoft\.com"/);
+    assert.equal(ps.includes('"Type":"User"'), false);
   });
 });

@@ -28,7 +28,9 @@ const HEALTHY = {
   [`sp show --id ${GRAPH_APP}`]: { appRoles: [
     { value: "Content.Process.All" }, { value: "ProtectionScopes.Compute.All" },
     { value: "AgentInstance.ReadWrite.All" }, { value: "AgentIdentityBlueprint.Create" },
-    { value: "AgentIdentityBlueprint.ReadWrite.All" },
+    { value: "AgentIdentityBlueprint.ReadWrite.All" }, { value: "AgentIdentityBlueprintPrincipal.Create" },
+    { value: "AgentIdentity.Create.All" }, { value: "AgentRegistration.ReadWrite.All" },
+    { value: "CopilotPackages.ReadWrite.All" },
   ] },
   "signed-in-user show": "me-1",
   "memberOf": { value: [{ displayName: "Global Administrator" }] },

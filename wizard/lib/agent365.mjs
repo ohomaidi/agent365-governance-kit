@@ -1,239 +1,243 @@
 /**
  * Agent 365 registration — the part that used to be a manual checklist.
  *
- * Microsoft now exposes agent registration through Graph, so the wizard can
- * create the identity blueprint, mint its credential and register the agent
- * instance (with its A2A agent card) instead of printing instructions.
+ * This is the flow Microsoft documents today, and every step below has been
+ * run live against a licensed tenant and returned 2xx:
  *
- *   POST  /beta/agentIdentityBlueprints            create the blueprint
- *   POST  /beta/agentIdentityBlueprints/{id}/addPassword
- *   POST  /beta/agentRegistry/agentInstances       register instance + manifest
- *   GET   /beta/agentRegistry/agentInstances       verify
+ *   1. POST /v1.0/applications/microsoft.graph.agentIdentityBlueprint      blueprint
+ *   2. POST /v1.0/applications/{id}/microsoft.graph.agentIdentityBlueprint/addPassword
+ *   3. POST /v1.0/serviceprincipals/microsoft.graph.agentIdentityBlueprintPrincipal
+ *   4. POST /beta/servicePrincipals/microsoft.graph.agentIdentity           agent identity
+ *   5. POST /beta/copilot/agentRegistrations                                Agent 365 registry
+ *   6. GET  /beta/copilot/agentRegistrations/{id}                           verify
  *
- * Permissions: AgentInstance.ReadWrite.All, plus the *Agent Registry
- * Administrator* and *Agent ID Administrator* roles. Blueprint creation
- * REQUIRES at least one sponsor.
+ * The old /beta/agentRegistry/* surface retired on 2026-06-15 and returns 404
+ * for everyone; step 5 is its replacement (the "Agent Registration API").
  *
- * These are /beta endpoints — Microsoft labels them "subject to change" and
- * unsupported in production. Every call here is therefore best-effort and
- * reports precisely what failed rather than aborting the Purview work that
- * already succeeded.
+ * Two things make this robust in practice:
+ *   - Entra replication. A seconds-old object can 404 on one replica, or come
+ *     back as 400 "does not exist" from a dependent endpoint. Every step retries
+ *     those signatures with backoff instead of failing.
+ *   - Idempotency. Re-running finds the existing blueprint, principal and
+ *     registration (registrations are keyed by sourceAgentId) so a customer can
+ *     rehearse and re-run without stacking duplicates.
  *
- * NOTE: the legacy Entra agentRegistry API retired 2026-06-15. Agents
- * registered before then must be re-registered through these endpoints.
+ * Permissions (application, on the connector app):
+ *   AgentIdentityBlueprint.Create, AgentIdentityBlueprint.AddRemoveCreds.All,
+ *   AgentIdentityBlueprintPrincipal.Create, AgentIdentity.Create.All,
+ *   AgentIdentity.Read.All, AgentRegistration.ReadWrite.All
+ *
+ * `graph` is injected: graph(method, path, body?, headers?) resolves to the
+ * parsed body on 2xx and throws an Error carrying `.status` and `.body`
+ * otherwise. Paths are full ("/v1.0/…" or "/beta/…").
  */
 
-export const GRAPH_BETA = "https://graph.microsoft.com/beta";
+export const GRAPH = "https://graph.microsoft.com";
+export const GRAPH_BETA = `${GRAPH}/beta`;
 
-/** Transports the registry understands, in the order we prefer them. */
-export const TRANSPORTS = ["JSONRPC", "HTTP+JSON", "GRPC"];
+const ODATA4 = { "OData-Version": "4.0" };
 
-/**
- * Build an A2A agent card manifest.
- *
- * This is the document Agent 365 stores to describe what the agent is and can
- * do. It's embedded in the agentInstance POST — there is no standalone create
- * for a manifest.
- */
-export function buildAgentCard({
-  displayName,
-  description,
-  version = "1.0.0",
-  protocolVersion = "1.0",
-  organization,
-  organizationUrl,
-  iconUrl,
-  documentationUrl,
-  skills = [],
-  ownerIds = [],
-  originatingStore = "Agent 365 Governance Kit",
-  inputModes = ["text/plain"],
-  outputModes = ["text/plain"],
-}) {
+/** Turn a display name into a stable registry key: "Abbas Test 1" → "abbas-test-1". */
+export function slugify(name) {
+  return String(name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "agent";
+}
+
+/** Entra replication signatures worth waiting out. */
+function isReplicationLag(err) {
+  const msg = String(err?.body?.error?.message ?? err?.message ?? "").toLowerCase();
+  return err?.status === 404 || (err?.status === 400 && msg.includes("does not exist"));
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Call with backoff on replication lag only; other errors surface immediately. */
+async function withReplication(fn, log, label) {
+  const waits = [0, 10_000, 20_000, 30_000, 45_000, 60_000];
+  let last;
+  for (const w of waits) {
+    if (w) { log(`${label}: waiting ${w / 1000}s for replication`); await sleep(w); }
+    try { return await fn(); } catch (e) {
+      last = e;
+      if (!isReplicationLag(e)) throw e;
+    }
+  }
+  throw last;
+}
+
+/** A2A-style agent card for the registration. */
+export function buildAgentCard({ displayName, description, url, organization, version = "1.0.0", skills = [] }) {
   if (!displayName) throw new Error("agent card requires a displayName");
   const card = {
-    displayName,
-    description: description || displayName,
-    protocolVersion,
+    name: displayName,
     version,
-    originatingStore,
-    defaultInputModes: inputModes,
-    defaultOutputModes: outputModes,
-    supportsAuthenticatedExtendedCard: false,
-    skills: skills.map((s, i) => ({
-      id: s.id || `skill-${i + 1}`,
-      name: s.name || s.id || `Skill ${i + 1}`,
-      description: s.description || "",
-      tags: s.tags || [],
-    })),
+    description: description || displayName,
+    capabilities: { streaming: false, pushNotifications: false },
+    defaultInputModes: ["text"],
+    defaultOutputModes: ["text"],
+    skills: (skills.length ? skills : [{ id: "chat", name: "Chat", description: "Conversational assistant" }])
+      .map((s, i) => ({ id: s.id || `skill-${i + 1}`, name: s.name || s.id || `Skill ${i + 1}`, description: s.description || "" })),
   };
-  if (ownerIds.length) card.ownerIds = ownerIds;
-  if (iconUrl) card.iconUrl = iconUrl;
-  if (documentationUrl) card.documentationUrl = documentationUrl;
-  if (organization) card.provider = { organization, url: organizationUrl || "" };
+  if (url) card.url = url;
+  if (organization) card.provider = { organization };
   return card;
 }
 
-/**
- * Build the agentInstance POST body.
- *
- * `url` is the agent's own endpoint and may be ANY reachable address — which is
- * what makes it possible to register a third-party agent you cannot modify.
- * Point it at a governance proxy instead and every registered call is inspected.
- */
-export function buildInstancePayload({
-  displayName,
-  url,
-  blueprintId,
-  identityId,
-  managedBy,
-  ownerIds = [],
-  sourceAgentId,
-  originatingStore = "Agent 365 Governance Kit",
-  preferredTransport = "JSONRPC",
-  additionalInterfaces = [],
-  card,
+/** Body for POST /beta/copilot/agentRegistrations. */
+export function buildRegistrationPayload({
+  displayName, description, sourceAgentId, ownerIds = [], createdBy, managedByAppId,
+  agentIdentityId, agentIdentityBlueprintId, card, originatingStore = "Agent 365 Governance Kit",
 }) {
-  if (!displayName) throw new Error("agent instance requires a displayName");
-  if (!url) throw new Error("agent instance requires a url");
-  if (!/^https:\/\//i.test(url)) {
-    throw new Error(`agent instance url must be https (got "${url}")`);
-  }
-  if (!TRANSPORTS.includes(preferredTransport)) {
-    throw new Error(`preferredTransport must be one of ${TRANSPORTS.join(", ")}`);
-  }
+  if (!displayName) throw new Error("registration requires a displayName");
+  if (!ownerIds.length && !managedByAppId) throw new Error("registration requires ownerIds or managedByAppId");
+  if (!createdBy) throw new Error("registration requires createdBy");
+  const now = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
   const body = {
     displayName,
-    url,
-    preferredTransport,
+    description: description || displayName,
+    sourceAgentId: sourceAgentId || slugify(displayName),
     originatingStore,
-    agentCardManifest: card,
+    createdBy,
+    sourceCreatedDateTime: now,
+    sourceLastModifiedDateTime: now,
+    agentCard: card,
   };
-  if (blueprintId) body.agentIdentityBlueprintId = blueprintId;
-  if (identityId) body.agentIdentityId = identityId;
-  if (managedBy) body.managedBy = managedBy;
   if (ownerIds.length) body.ownerIds = ownerIds;
-  if (sourceAgentId) body.sourceAgentId = sourceAgentId;
-  if (additionalInterfaces.length) {
-    body.additionalInterfaces = additionalInterfaces.map((i) => ({
-      url: i.url,
-      transport: i.transport,
-    }));
-  }
+  if (managedByAppId) body.managedByAppId = managedByAppId;
+  if (agentIdentityId) body.agentIdentityId = agentIdentityId;
+  if (agentIdentityBlueprintId) body.agentIdentityBlueprintId = agentIdentityBlueprintId;
   return body;
 }
 
-/**
- * Build the agentIdentityBlueprint create body.
- * Sponsors are required by the API; we surface that as a clear error rather
- * than letting Graph return an opaque 400.
- */
-export function buildBlueprintPayload({
-  displayName,
-  description,
-  sponsorIds = [],
-  signInAudience = "AzureADMyOrg",
-  tags = [],
-}) {
+/** Body for creating the blueprint. Sponsors are required by the API. */
+export function buildBlueprintPayload({ displayName, sponsorIds = [], ownerIds = [] }) {
   if (!displayName) throw new Error("blueprint requires a displayName");
-  if (!sponsorIds.length) {
-    throw new Error("blueprint requires at least one sponsor (a user or group object id)");
-  }
+  if (!sponsorIds.length) throw new Error("blueprint requires at least one sponsor (a user object id)");
+  const bind = (ids) => ids.map((id) => `${GRAPH}/v1.0/users/${id}`);
   const body = {
+    "@odata.type": "Microsoft.Graph.AgentIdentityBlueprint",
     displayName,
-    signInAudience,
-    "sponsors@odata.bind": sponsorIds.map(
-      (id) => `https://graph.microsoft.com/beta/directoryObjects/${id}`,
-    ),
+    "sponsors@odata.bind": bind(sponsorIds),
   };
-  if (description) body.description = description.slice(0, 1024);
-  if (tags.length) body.tags = tags;
+  if (ownerIds.length) body["owners@odata.bind"] = bind(ownerIds);
   return body;
 }
 
 /**
- * Registration driver. `graph` is an injected caller:
- *   graph(method, path, body?) -> parsed JSON | null
- * so this whole flow is unit-testable without a tenant.
+ * Register an agent in Agent 365. Returns ids, the blueprint secret (only ever
+ * returned once by Graph), and a step log.
  */
 export async function registerAgent(graph, opts, log = () => {}) {
   const {
     agentName, agentDescription, agentUrl, sponsorIds = [], ownerIds = [],
-    managedBy, existingBlueprintId, transport = "JSONRPC",
-    organization, skills = [],
+    managedByAppId, organization, skills = [],
+    sourceAgentId = slugify(agentName),
+    existingBlueprintId = "",
   } = opts;
+  if (!agentName) throw new Error("agentName is required");
+  if (!sponsorIds.length) throw new Error("a sponsor (user object id) is required");
 
-  const result = { blueprintId: "", blueprintAppId: "", blueprintSecret: "", instanceId: "", steps: [] };
+  const r = { steps: [], blueprintId: "", blueprintAppId: "", blueprintSecret: "",
+              blueprintPrincipalId: "", agentIdentityId: "", registrationId: "", verified: false };
+  const owners = ownerIds.length ? ownerIds : sponsorIds;
+  const createdBy = owners[0];
 
-  // 1. Blueprint — reuse if the caller already has one.
-  let blueprintId = existingBlueprintId || "";
-  if (blueprintId) {
-    const bp = await graph("GET", `/agentIdentityBlueprints/${blueprintId}`);
-    result.blueprintAppId = bp?.appId ?? "";
-    result.steps.push(`reused existing blueprint ${blueprintId}`);
-    log(`reused blueprint ${blueprintId}`);
+  // ---- 1. blueprint: reuse by id, then by name, else create ----
+  const bpName = `${agentName} Blueprint`;
+  let bp = null;
+  if (existingBlueprintId) {
+    bp = await graph("GET", `/v1.0/applications/microsoft.graph.agentIdentityBlueprint/${existingBlueprintId}`);
+    r.steps.push(`reused blueprint ${bp.id}`);
   } else {
-    const bp = await graph("POST", "/agentIdentityBlueprints", buildBlueprintPayload({
-      displayName: `${agentName} Blueprint`,
-      description: agentDescription,
-      sponsorIds,
-      tags: ["agent365-governance-kit"],
-    }));
-    blueprintId = bp?.id ?? "";
-    result.blueprintAppId = bp?.appId ?? "";
-    if (!blueprintId) throw new Error("blueprint creation returned no id");
-    result.steps.push(`created blueprint ${blueprintId} (appId ${result.blueprintAppId})`);
-    log(`created blueprint ${blueprintId}`);
-
-    // 2. Credential for the blueprint (used by the observability exporter).
-    const pw = await graph("POST", `/agentIdentityBlueprints/${blueprintId}/addPassword`, {
-      passwordCredential: { displayName: "agent365-governance-kit" },
-    });
-    result.blueprintSecret = pw?.secretText ?? "";
-    result.steps.push(result.blueprintSecret ? "minted blueprint secret" : "blueprint secret NOT returned");
-    log("minted blueprint secret");
+    const found = await graph("GET",
+      `/v1.0/applications/microsoft.graph.agentIdentityBlueprint?$filter=displayName eq '${bpName.replace(/'/g, "''")}'&$select=id,appId,displayName`);
+    bp = found?.value?.[0] ?? null;
+    if (bp) {
+      r.steps.push(`found existing blueprint ${bp.id}`);
+    } else {
+      bp = await graph("POST", "/v1.0/applications/microsoft.graph.agentIdentityBlueprint",
+        buildBlueprintPayload({ displayName: bpName, sponsorIds, ownerIds: owners }), ODATA4);
+      r.steps.push(`created blueprint ${bp.id}`);
+    }
   }
-  result.blueprintId = blueprintId;
+  r.blueprintId = bp.id; r.blueprintAppId = bp.appId;
+  log(`blueprint ${bp.id}`);
 
-  // 3. Register the instance together with its agent card.
-  const card = buildAgentCard({
-    displayName: agentName,
-    description: agentDescription,
-    organization,
-    skills,
-    ownerIds,
-  });
-  const payload = buildInstancePayload({
-    displayName: agentName,
-    url: agentUrl,
-    blueprintId,
-    managedBy,
-    ownerIds,
-    preferredTransport: transport,
-    card,
-  });
-  const inst = await graph("POST", "/agentRegistry/agentInstances", payload);
-  result.instanceId = inst?.id ?? "";
-  if (!result.instanceId) throw new Error("agent instance creation returned no id");
-  result.agentUserId = inst?.agentUserId ?? "";
-  result.steps.push(`registered agent instance ${result.instanceId}`);
-  log(`registered instance ${result.instanceId}`);
+  // ---- 2. credential (secretText is only returned at creation) ----
+  const pw = await withReplication(
+    () => graph("POST", `/v1.0/applications/${bp.id}/microsoft.graph.agentIdentityBlueprint/addPassword`,
+      { passwordCredential: { displayName: "agent365-governance-kit" } }),
+    log, "addPassword");
+  r.blueprintSecret = pw?.secretText ?? "";
+  r.steps.push(r.blueprintSecret ? "minted blueprint secret" : "WARNING: blueprint secret not returned");
 
-  // 4. Read it back — registration that isn't verified isn't registration.
-  const check = await graph("GET", `/agentRegistry/agentInstances/${result.instanceId}`);
-  result.verified = Boolean(check?.id);
-  result.steps.push(result.verified ? "verified via GET" : "WARNING: read-back failed");
+  // ---- 3. blueprint principal: reuse or create ----
+  const sp = await withReplication(
+    () => graph("GET", `/v1.0/servicePrincipals?$filter=appId eq '${bp.appId}'&$select=id`), log, "principal lookup");
+  let prin = sp?.value?.[0] ?? null;
+  if (prin) {
+    r.steps.push(`found existing blueprint principal ${prin.id}`);
+  } else {
+    prin = await withReplication(
+      () => graph("POST", "/v1.0/serviceprincipals/microsoft.graph.agentIdentityBlueprintPrincipal",
+        { appId: bp.appId }, ODATA4),
+      log, "principal");
+    r.steps.push(`created blueprint principal ${prin.id}`);
+  }
+  r.blueprintPrincipalId = prin.id;
 
-  return result;
+  // ---- 4. agent identity: reuse by name under this blueprint, else create ----
+  let ident = null;
+  try {
+    const list = await graph("GET",
+      `/beta/servicePrincipals/microsoft.graph.agentIdentity?$filter=agentIdentityBlueprintId eq '${bp.appId}'&$select=id,displayName`);
+    ident = (list?.value ?? []).find((i) => i.displayName === agentName) ?? null;
+  } catch { /* filter may be unsupported; fall through to create */ }
+  if (ident) {
+    r.steps.push(`found existing agent identity ${ident.id}`);
+  } else {
+    ident = await withReplication(
+      () => graph("POST", "/beta/servicePrincipals/microsoft.graph.agentIdentity", {
+        displayName: agentName,
+        agentIdentityBlueprintId: bp.appId,
+        "sponsors@odata.bind": sponsorIds.map((id) => `${GRAPH}/v1.0/users/${id}`),
+      }),
+      log, "agent identity");
+    r.steps.push(`created agent identity ${ident.id}`);
+  }
+  r.agentIdentityId = ident.id;
+  log(`agent identity ${ident.id}`);
+
+  // ---- 5. Agent 365 registration: keyed by sourceAgentId, so reuse if present ----
+  let reg = null;
+  try {
+    reg = await graph("GET", `/beta/copilot/agentRegistrations/${encodeURIComponent(sourceAgentId)}`);
+  } catch (e) { if (e?.status !== 404) throw e; }
+  if (reg?.id) {
+    r.steps.push(`found existing registration ${reg.id}`);
+  } else {
+    const card = buildAgentCard({ displayName: agentName, description: agentDescription, url: agentUrl, organization, skills });
+    reg = await withReplication(
+      () => graph("POST", "/beta/copilot/agentRegistrations", buildRegistrationPayload({
+        displayName: agentName, description: agentDescription, sourceAgentId,
+        ownerIds: owners, createdBy, managedByAppId,
+        agentIdentityId: ident.id, agentIdentityBlueprintId: bp.appId, card,
+      })),
+      log, "registration");
+    r.steps.push(`registered in Agent 365 as ${reg.id}`);
+  }
+  r.registrationId = reg.id;
+
+  // ---- 6. read it back: registration that isn't verified isn't registration ----
+  try {
+    const check = await withReplication(
+      () => graph("GET", `/beta/copilot/agentRegistrations/${encodeURIComponent(r.registrationId)}`), log, "verify");
+    r.verified = Boolean(check?.id);
+  } catch { r.verified = false; }
+  r.steps.push(r.verified ? "verified via GET" : "WARNING: read-back failed");
+  return r;
 }
 
-/** List what's already registered, so the wizard can offer to reuse or replace. */
-export async function listAgentInstances(graph) {
-  const res = await graph("GET", "/agentRegistry/agentInstances");
-  return res?.value ?? [];
-}
-
-/** Remove a stale registration (e.g. one stranded by the June 2026 retirement). */
-export async function deleteAgentInstance(graph, id) {
-  await graph("DELETE", `/agentRegistry/agentInstances/${id}`);
+/** Remove a registration (e.g. to rehearse from clean). */
+export async function deleteRegistration(graph, id) {
+  await graph("DELETE", `/beta/copilot/agentRegistrations/${encodeURIComponent(id)}`);
 }
