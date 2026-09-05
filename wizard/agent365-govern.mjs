@@ -217,12 +217,12 @@ export async function waitForConnectorRoles({ tenantId, clientId, clientSecret, 
 
 /** Retry a call that references an Entra object created seconds ago (404 / "does not exist"). */
 async function withReplicationLocal(fn) {
-  const delays = [0, 3000, 6000, 10000, 15000, 20000];
+  const delays = [0, 3000, 6000, 10000, 15000, 20000, 30000, 30000];
   let last;
   for (const d of delays) {
     if (d) await new Promise((r) => setTimeout(r, d));
     try { return await fn(); }
-    catch (e) { last = e; if (!(e?.status === 404 || (e?.status === 400 && /does not exist|not found/i.test(String(e.message))))) throw e; }
+    catch (e) { last = e; if (!(e?.status === 404 || (e?.status === 400 && /does not exist|not found|does not reference a valid|not present|could not be found/i.test(String(e.message))))) throw e; }
   }
   throw last;
 }
@@ -880,7 +880,8 @@ async function main(work) {
       // Admin consent — the step that makes the Activity tab and Teams delivery possible.
       if (wantConsent) {
         try {
-          for (const line of await grantBlueprintConsent({ blueprintPrincipalId: a365.agentIdentityId })) {
+          // The identity was created seconds ago: retry while the directory catches up.
+          for (const line of await withReplicationLocal(() => grantBlueprintConsent({ blueprintPrincipalId: a365.agentIdentityId }))) {
             (line.startsWith("WARNING") ? warn : ok)(`  ${line.replace(/^consent/, "identity consent")}`);
           }
         } catch (e) { warn(`  consent grants (identity) failed: ${String(e.message || e).slice(0, 200)}`); }
@@ -918,11 +919,11 @@ async function main(work) {
       } catch (e) { teams.errors.push(`endpoint: ${String(e.message || e).slice(0, 300)}`); warn(`  Agent 365 endpoint registration failed: ${String(e.message || e).slice(0, 300)}`); }
       try {
         const me = await dg("GET", "/v1.0/me?$select=usageLocation");
-        teams.agentUser = await ensureAgentUser(dg, { displayName: agentName, mailNickname: slugify(agentName), domain: org, agentIdentityId: a365.agentIdentityId, usageLocation: me?.usageLocation || "US" });
+        teams.agentUser = await withReplicationLocal(() => ensureAgentUser(dg, { displayName: agentName, mailNickname: slugify(agentName), domain: org, agentIdentityId: a365.agentIdentityId, usageLocation: me?.usageLocation || "US" }));
         ok(`  agent user ${teams.agentUser.created ? "created" : "reused"}: ${teams.agentUser.userPrincipalName}`);
         record(`agent user ${teams.agentUser.userPrincipalName} (${teams.agentUser.id}) — delete in Entra → Users`);
         if (wantLicence) {
-          teams.licence = await assignAgentLicence(dg, teams.agentUser.id);
+          teams.licence = await withReplicationLocal(() => assignAgentLicence(dg, teams.agentUser.id));
           if (teams.licence.status === "none") warn("  no Agent 365 / Frontier licence with free seats in this tenant — assign one to the agent user by hand");
           else ok(`  licence ${teams.licence.status}: ${teams.licence.sku}`);
         }
