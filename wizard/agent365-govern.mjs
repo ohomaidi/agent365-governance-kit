@@ -919,9 +919,25 @@ if (-not (Get-DlpComplianceRule -Identity ${psLit(purviewAppName + " Block Terms
     });
     dspmBlock = `
 try {
-  if (-not (Get-FeatureConfiguration -FeatureScenario KnowYourData -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "DSPM for AI - Collection policy for enterprise AI apps" })) {
+  $fc = Get-FeatureConfiguration -FeatureScenario KnowYourData -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "DSPM for AI - Collection policy for enterprise AI apps" }
+  if (-not $fc) {
     New-FeatureConfiguration -FeatureScenario KnowYourData -Name "DSPM for AI - Collection policy for enterprise AI apps" -Mode Enable -ScenarioConfig ${psLit(scenarioConfig)} -Locations ${psLit(collLoc)} | Out-Null
     Write-Host "  created DSPM collection policy (ingestion ${dspmIngest ? "ON" : "OFF"})"
+  } else {
+    # The collection policy is one per tenant. A second agent must be APPENDED to
+    # its locations, not skipped — otherwise it never shows up in DSPM for AI.
+    $existing = @($fc.Locations | ConvertFrom-Json)
+    if ($existing | Where-Object { $_.Location -eq ${psLit(appId)} }) {
+      Write-Host "  DSPM collection policy already covers this app"
+    } else {
+      $add = @(${psLit(collLoc)} | ConvertFrom-Json)
+      $merged = ConvertTo-Json -InputObject @(@($existing) + @($add)) -Depth 8 -Compress
+      Set-FeatureConfiguration -Identity $fc.Identity -Locations $merged -ErrorAction Stop | Out-Null
+      Start-Sleep -Seconds 15
+      $n = @((Get-FeatureConfiguration -FeatureScenario KnowYourData | Where-Object { $_.Name -eq $fc.Name }).Locations | ConvertFrom-Json).Count
+      if ($n -gt $existing.Count) { Write-Host ("  added this app to the existing DSPM collection policy (" + $n + " location(s))") }
+      else { Write-Host "  WARNING: DSPM collection policy exists but this app could not be appended - add it in Purview > DSPM for AI > collection policy > locations" }
+    }
   }
 } catch { Write-Host ("  collection policy: " + $_.Exception.Message) }`;
   }

@@ -257,10 +257,10 @@ npm run test:all       # TypeScript + wizard + Python + .NET
 | TypeScript | 20 | defaults, misconfiguration, verdicts, retries, timeouts, caching, payload, redaction |
 | Python | 19 | same behaviours, mirrored |
 | .NET | 18 | same behaviours, mirrored |
-| Wizard | 49 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 payloads and call ordering |
+| Wizard | 51 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 payloads and call ordering |
 | Proxy | 20 | enforcement, protocol-shaped refusals, attribution, health |
 
-**126 tests total.** Registration and policy creation are also verified live against a licensed tenant.
+**128 tests total.** Registration and policy creation are also verified live against a licensed tenant.
 
 CI runs all of them on every push ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 

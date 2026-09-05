@@ -254,3 +254,22 @@ describe("pilot group scope", () => {
     assert.equal(ps.includes('"Type":"User"'), false);
   });
 });
+
+
+describe("DSPM collection policy is per-tenant", () => {
+  const base = {
+    appId: "app-2", org: "o.onmicrosoft.com", pfx: "/x.pfx", purviewAppName: "Abbas Test 2", wantCreditCard: false,
+    customSitTerms: [], work: "/tmp", dlpMode: "TestWithNotifications",
+    scopeInclusions: [{ Type: "Group", Identity: "p@o.onmicrosoft.com" }],
+  };
+  test("a second agent is appended to the existing policy, not skipped", () => {
+    const ps = buildProvisionScript({ ...base, wantDspm: true, dspmIngest: false });
+    assert.match(ps, /New-FeatureConfiguration/, "creates it when absent");
+    assert.match(ps, /Set-FeatureConfiguration -Identity \$fc\.Identity -Locations \$merged/, "appends when present");
+    assert.match(ps, /could not be appended/, "says so honestly if the append does not take");
+  });
+  test("no DSPM means no DSPM cmdlets at all", () => {
+    const ps = buildProvisionScript({ ...base, wantDspm: false, dspmIngest: false });
+    assert.equal(/FeatureConfiguration/.test(ps), false);
+  });
+});
