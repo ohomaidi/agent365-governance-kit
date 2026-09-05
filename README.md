@@ -6,7 +6,7 @@ built *and* for vendor agents you cannot modify.
 
 Hand the customer **one file**. They double-click it, sign in as a Global
 Administrator, answer four questions, and their agent is registered, governed,
-published to Teams, and sends them a hello.
+and waiting for them in Teams.
 
 ## Download and run
 
@@ -82,10 +82,12 @@ to verify. Nothing on this list is a manual step.
     appId, `webApplicationInfo.resource = api://botid-<appId>`, generated icons)
     and **published to the organisation's app catalog** — a new version is
     added if the app already exists.
-15. **Installed** in the personal scope of the admin, the attributed user and
-    every member of the pilot group, so it is in their Teams app bar.
-16. **Messaging endpoint registered** in the Teams Developer Portal (bot id =
-    blueprint appId, endpoint `https://<agent>/api/messages`).
+15. **Messaging endpoint registered** in the Teams Developer Portal (bot id =
+    blueprint appId, endpoint `https://<agent>/api/messages`) — before the
+    install, because Teams opens the chat with the bot when it installs the app.
+16. **Installed** in the personal scope of the admin, the attributed user and
+    every member of the pilot group, so it is in their Teams app bar; retried
+    while the bot registration propagates.
 17. **Proof attempt**: the installer mints a token *as the agent identity* (the
     SDK's two-step agentic flow) and tries to send a hello into the admin's
     Teams. Teams' generic connector currently refuses proactive messages from
