@@ -1,7 +1,7 @@
 {
   "name": "@zaatarlabs/agent365-governance-proxy",
   "version": "0.2.0",
-  "description": "Reverse proxy that applies Microsoft Purview DLP to an AI agent you cannot modify — including third-party and vendor agents registered in Agent 365.",
+  "description": "Reverse proxy that applies Microsoft Purview DLP to an AI agent you cannot modify \u2014 including third-party and vendor agents registered in Agent 365.",
   "type": "module",
   "main": "src/server.mjs",
   "exports": {
@@ -12,19 +12,33 @@
   "bin": {
     "agent365-govern-proxy": "src/bin.mjs"
   },
-  "files": ["src", "README.md"],
+  "files": [
+    "src",
+    "README.md"
+  ],
   "scripts": {
     "start": "node src/bin.mjs",
     "test": "node --test test/*.test.mjs"
   },
-  "keywords": ["microsoft", "purview", "agent365", "dlp", "governance", "proxy", "a2a", "teams"],
+  "keywords": [
+    "microsoft",
+    "purview",
+    "agent365",
+    "dlp",
+    "governance",
+    "proxy",
+    "a2a",
+    "teams"
+  ],
   "license": "UNLICENSED",
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "@microsoft/agents-hosting": "^1.5.3",
     "@microsoft/opentelemetry": "^1.1.0",
     "@opentelemetry/resources": "^2.8.0",
-    "@zaatarlabs/agent365-governance-kit": "file:../typescript",
+    "@zaatarlabs/agent365-governance-kit": "^0.2.0",
     "dotenv": "^16.4.5",
     "express": "^5.1.0"
   }

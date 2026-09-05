@@ -40,6 +40,7 @@ import { buildTeamsPackage, publishToOrgCatalog, installForUsers, registerMessag
          registerAgent365Endpoint, ensureAgentUser, assignAgentLicence } from "./lib/teams.mjs";
 import { detectGuard, findKitTarball, wireNodeGuard } from "./lib/wire.mjs";
 import { detectRunner } from "./lib/restart.mjs";
+import { findProxyTarballs, scaffoldProxy, startProxy } from "./lib/proxy.mjs";
 
 // --- Microsoft constants (stable GUIDs) ---
 const GRAPH_APP = "00000003-0000-0000-c000-000000000000";
@@ -498,7 +499,7 @@ async function main(work) {
   // A third-party agent you cannot modify: the proxy IS the agent as far as
   // Purview, Agent 365 and Teams are concerned. Its .env gets the same block
   // plus where the vendor lives and how it speaks.
-  let upstreamUrl = "", upstreamDialect = "auto", proxyPort = "8787";
+  let upstreamUrl = "", upstreamDialect = "auto", proxyPort = "8787", upstreamPath = "", wantProxyStart = false;
   if (lang === "proxy") {
     upstreamUrl = await ask("  Vendor agent's API base URL (what the proxy forwards to):", "", "upstreamUrl");
     while (!/^https?:\/\//i.test(upstreamUrl)) {
@@ -507,7 +508,9 @@ async function main(work) {
       upstreamUrl = await ask("  Vendor agent's API base URL:", "", "upstreamUrl");
     }
     upstreamDialect = (await ask("  Its wire format (a2a / openai / generic / auto):", "auto", "upstreamDialect")).toLowerCase();
+    upstreamPath = await ask("  Path of its chat endpoint (what a Teams turn is posted to):", upstreamDialect === "openai" ? "/v1/chat/completions" : "/", "upstreamPath");
     proxyPort = await ask("  Port the proxy listens on:", "8787", "proxyPort");
+    wantProxyStart = await yes("  Install and start the proxy on this machine when done?", true, "wantProxyStart");
   }
 
   // --- guard wiring: never hand the customer code to paste ---
@@ -1072,6 +1075,7 @@ async function main(work) {
     block.push("", "# --- governance proxy (fronts a third-party agent) ---",
       `GOVERNANCE_UPSTREAM=${upstreamUrl}`,
       `GOVERNANCE_DIALECT=${upstreamDialect}`,
+      `GOVERNANCE_UPSTREAM_PATH=${upstreamPath || "/"}`,
       `GOVERNANCE_PROXY_PORT=${proxyPort}`);
   }
   try { const dir = envPath.replace(/[^/\\]*$/, ""); if (dir && !existsSync(dir)) mkdirSync(dir, { recursive: true }); } catch { /* writeEnvBlock reports */ }
@@ -1147,8 +1151,28 @@ async function main(work) {
       ? `\n${C.d}Purview not touched this run; the previous run's settings are kept.${C.reset}`
       : `\n${C.y}Purview was not provisioned (your choice).${C.reset} The guard is written disabled; re-run with Purview on to enable it.`);
   } else if (lang === "proxy") {
-    console.log(`\n${C.g}${C.b}Purview governance is set up.${C.reset} Nothing to change in the vendor's agent — run the proxy next to this .env:\n`);
-    console.log(C.d + integrationSnippet(lang, { envPath, upstreamUrl, proxyPort, agentUrl }) + C.reset);
+    console.log(`\n${C.g}${C.b}Purview governance is set up.${C.reset} Nothing changes in the vendor's agent; the proxy is the governed endpoint.`);
+    if (wantProxyStart) {
+      try {
+        const kitRoot = fileURLToPath(new URL("..", import.meta.url));
+        const already = existsSync(join(agentDir, "node_modules", "@zaatarlabs", "agent365-governance-proxy"));
+        if (!already) { for (const st of scaffoldProxy({ dir: agentDir, tarballs: findProxyTarballs(kitRoot) }).steps) ok(`  ${st}`); }
+        else ok("  proxy already installed in this folder");
+        if (runner.kind && runner.restart) { ok(`  restarted the proxy: ${await runner.restart()}`); }
+        else {
+          const h = await startProxy({ dir: agentDir, port: Number(proxyPort) || 8787 });
+          if (h.status) ok(`  proxy started (pid ${h.pid}) — guard ${h.guard}, Teams bridge ${h.teams ? "on" : "off"}, governing: ${h.governing}`);
+          else warn(`  proxy started (pid ${h.pid}) but its health endpoint did not answer within 20s — see ${join(agentDir, "logs", "proxy.log")}`);
+        }
+        record(`governance proxy installed and running from ${agentDir} (stop it and delete the folder to undo)`);
+        console.log(`  ${C.d}Expose http://localhost:${proxyPort} as ${agentUrl} — that address is what Agent 365 and Teams call.${C.reset}`);
+      } catch (e) {
+        warn(`Could not install or start the proxy: ${String(e.message || e).slice(0, 300)}`);
+        console.log(C.d + integrationSnippet(lang, { envPath, upstreamUrl, proxyPort, agentUrl }) + C.reset);
+      }
+    } else {
+      console.log(C.d + integrationSnippet(lang, { envPath, upstreamUrl, proxyPort, agentUrl }) + C.reset);
+    }
   } else if (guardState.wired) {
     console.log(`\n${C.g}${C.b}Purview governance is set up.${C.reset} The agent already calls the guard (${guardState.how}); nothing to add.`);
   } else if (wantAutoWire) {
@@ -1209,7 +1233,9 @@ async function main(work) {
         console.log(`\n  ${C.y}Not published to Teams.${C.reset} Re-run and answer yes to "Publish to Teams" when you want it there.`);
       }
       console.log(`\n  ${C.d}Licences apply to the agent USER (AI teammate). A bot-only blueprint carries none.${C.reset}`);
-      if (wantRestart && runner.kind && runner.restart) {
+      if (lang === "proxy") {
+        /* handled in the proxy section above */
+      } else if (wantRestart && runner.kind && runner.restart) {
         try { ok(`Restarted the agent: ${await runner.restart()}`); }
         catch (e) { warn(`Could not restart the agent (${String(e.message || e).slice(0, 160)}) — restart it yourself so it loads ${envPath}.`); }
       } else if (wantRestart) {

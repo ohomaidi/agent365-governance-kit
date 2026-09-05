@@ -61,7 +61,7 @@ if (teamsWanted) {
   const bridge = await createTeamsBridge({
     upstream, guard, port,
     dialect: arg("dialect", process.env.GOVERNANCE_DIALECT || "auto"),
-    upstreamPath: arg("upstream-path"), upstreamModel: arg("upstream-model", process.env.GOVERNANCE_UPSTREAM_MODEL),
+    upstreamPath: arg("upstream-path", process.env.GOVERNANCE_UPSTREAM_PATH), upstreamModel: arg("upstream-model", process.env.GOVERNANCE_UPSTREAM_MODEL),
   });
   teams = bridge.handler;
   console.log(`[proxy] Teams bridge on /api/messages (${bridge.anonymous ? "ANONYMOUS — no agent_id configured; fine for the Playground, not for Teams" : `app ${bridge.appId}`}; observability ${bridge.observability ? "on" : "off"})`);

@@ -417,3 +417,24 @@ describe("agent restart detection", () => {
     assert.equal(none.kind, ""); assert.match(none.detail, /no pm2/);
   });
 });
+
+describe("third-party proxy is installed, not described", () => {
+  test("scaffoldProxy pins both shipped tarballs, installs, and writes start scripts", async () => {
+    const { scaffoldProxy } = await import("../lib/proxy.mjs");
+    const d = mkdtempSync(join(tmpdir(), "proxy-")); const t = mkdtempSync(join(tmpdir(), "tgz-"));
+    const kit = join(t, "zaatarlabs-agent365-governance-kit-0.2.0.tgz"), proxy = join(t, "zaatarlabs-agent365-governance-proxy-0.2.0.tgz");
+    writeFileSync(kit, "k"); writeFileSync(proxy, "p");
+    const calls = [];
+    const r = scaffoldProxy({ dir: d, tarballs: { kit, proxy }, run: (cmd, args) => { calls.push([cmd, ...args]); return ""; } });
+    const pkg = JSON.parse(readFileSync(join(d, "package.json"), "utf8"));
+    assert.equal(pkg.dependencies["@zaatarlabs/agent365-governance-proxy"], "file:./zaatarlabs-agent365-governance-proxy-0.2.0.tgz");
+    assert.equal(pkg.dependencies["@zaatarlabs/agent365-governance-kit"], "file:./zaatarlabs-agent365-governance-kit-0.2.0.tgz");
+    assert.deepEqual(calls[0].slice(0, 2), ["npm", "install"]);
+    assert.ok(existsSync(join(d, "start.sh")) && existsSync(join(d, "start.cmd")) && existsSync(join(d, "logs")));
+    assert.match(r.startCommand, /bin\.mjs$/);
+  });
+  test("refuses to pretend when the tarballs are missing", async () => {
+    const { scaffoldProxy } = await import("../lib/proxy.mjs");
+    assert.throws(() => scaffoldProxy({ dir: mkdtempSync(join(tmpdir(), "proxy-")), tarballs: { kit: "", proxy: "" }, run: () => "" }), /tarballs were not found/);
+  });
+});

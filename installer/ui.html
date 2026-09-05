@@ -114,6 +114,8 @@
         </div>
         <div class="row"><label for="upstreamDialect">How it speaks</label>
           <select id="upstreamDialect"><option value="auto">Detect from traffic</option><option value="openai">OpenAI-compatible (chat completions)</option><option value="a2a">Agent2Agent (JSON-RPC)</option><option value="generic">Simple JSON (message / reply)</option></select></div>
+        <div class="row"><label for="upstreamPath">Chat endpoint path</label><input type="text" id="upstreamPath" placeholder="/ (openai: /v1/chat/completions; e.g. /api/chat)"><span class="hint">Where a Teams message is posted on the vendor API.</span></div>
+        <div class="check"><input type="checkbox" id="wantProxyStart" checked><label for="wantProxyStart">Install and start the proxy on this machine when done (it must then be exposed at the web address below)</label></div>
         <div class="row">
           <label for="proxyDir">Where to keep the proxy&rsquo;s settings</label>
           <input type="text" id="proxyDir" placeholder="auto: ~/.agent365/proxy-&lt;name&gt;">
@@ -434,6 +436,8 @@ function answers() {
     lang: proxy ? "proxy" : or("lang", detected?.language || "typescript"),
     upstreamUrl: $("upstreamUrl").value.trim().replace(/\/+$/, ""),
     upstreamDialect: $("upstreamDialect").value,
+    upstreamPath: $("upstreamPath").value.trim() || ($("upstreamDialect").value === "openai" ? "/v1/chat/completions" : "/"),
+    wantProxyStart: $("wantProxyStart").checked,
     proxyPort: "8787",
     scopeChoice: scope === "me" ? "2" : scope,
     pilotGroup: $("pilotGroup").value,
