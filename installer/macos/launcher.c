@@ -17,7 +17,8 @@ int main(int argc, char **argv) {
   if (_NSGetExecutablePath(path, &size) != 0) { fprintf(stderr, "launcher: path too long\n"); return 1; }
   char real[4096]; if (!realpath(path, real)) { perror("launcher: realpath"); return 1; }
   char dir[4096]; strncpy(dir, dirname(real), sizeof(dir) - 1); dir[sizeof(dir) - 1] = 0;
-  char script[4200]; snprintf(script, sizeof(script), "%s/launch.sh", dir);
+  /* Contents/MacOS/launch -> Contents/Resources/launch.sh: resources are sealed by hash, never signed as code. */
+  char script[4300]; snprintf(script, sizeof(script), "%s/../Resources/launch.sh", dir);
   execl("/bin/bash", "bash", script, (char *)NULL);
   perror("launcher: exec"); return 1;
 }

@@ -30,7 +30,7 @@ APP="$MAC/Agent 365 Setup.app"
 # zip never ships a stale binary.
 clang -O2 -arch arm64 -arch x86_64 -mmacosx-version-min=11.0 \
   -o "$APP/Contents/MacOS/launch" "$ROOT/installer/macos/launcher.c"
-chmod +x "$APP/Contents/MacOS/launch" "$APP/Contents/MacOS/launch.sh"
+chmod +x "$APP/Contents/MacOS/launch" "$APP/Contents/Resources/launch.sh"
 
 # Sign + notarise when a Developer ID identity and a notarytool keychain
 # profile ("AC_PASSWORD") exist on this Mac; otherwise ship unsigned and say so.
