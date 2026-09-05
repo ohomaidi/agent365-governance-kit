@@ -85,6 +85,7 @@
     </div>
     <div id="pfActions" class="actions" style="margin-top:.8rem" hidden>
       <button id="btnLogin" class="ghost" type="button">Sign in</button>
+      <button id="btnLoginDev" class="ghost" type="button" hidden>Also sign in to the Teams Developer Portal (classic bot option only)</button>
       <button id="btnRecheck" class="ghost" type="button">Re-check</button>
     </div>
   </fieldset>
@@ -255,10 +256,7 @@ async function preflight() {
     banner = `<div class="bad" style="margin-bottom:.7rem">Install these first, then re-check:<br>` +
       other.map(m => `<a href="${m.url}" target="_blank" rel="noopener">${m.name}</a>`).join(" · ") + `</div>`;
   } else if (!pf.signedIn) {
-    const first = pf.signins.find(x => !x.done);
-    banner = pf.account
-      ? `<div class="warn" style="margin-bottom:.7rem">Signed in as <strong>${pf.account.user}</strong>. One more sign-in is needed: ${first.label}.</div>`
-      : `<div class="warn" style="margin-bottom:.7rem">Sign in as a <strong>Global Administrator</strong> of the tenant you want to configure. Two short sign-ins: one for Microsoft 365, one for the Teams Developer Portal.</div>`;
+    banner = `<div class="warn" style="margin-bottom:.7rem">Sign in as a <strong>Global Administrator</strong> of the tenant you want to configure. One short device-code sign-in.</div>`;
   } else {
     banner = `<div class="good" style="margin-bottom:.7rem">Signed in as <strong>${pf.account.user}</strong> — tenant <code>${pf.account.tenantId}</code></div>`;
   }
@@ -267,13 +265,15 @@ async function preflight() {
     if (!$("sponsorUpn").value) $("sponsorUpn").value = pf.account.user;
   }
   $("signins").innerHTML = pf.signins.map(x =>
-    `<div class="tool"><span>${x.label}</span><span class="${x.done ? "ok" : "no"}">${x.done ? "signed in" : "needed"}</span></div>`).join("");
+    `<div class="tool"><span>${x.label}</span><span class="${x.done ? "ok" : (x.optional ? "" : "no")}">${x.done ? "signed in" : (x.optional ? "optional" : "needed")}</span></div>`).join("");
+  const devportal = pf.signins.find(x => x.key === "devportal");
+  $("btnLoginDev").hidden = !pf.signedIn || !devportal || devportal.done;
   $("pf").innerHTML = banner + rows;
   $("pwshBox").hidden = !needsPwsh;
   $("pfActions").hidden = false;
   $("btnLogin").hidden = other.length > 0 || pf.signedIn;
-  $("btnLogin").textContent = pf.account ? "Continue sign-in" : "Sign in";
-  $("loginBox").hidden = other.length > 0 || pf.signedIn;
+  $("btnLogin").textContent = "Sign in";
+  $("loginBox").hidden = other.length > 0;
   const ready = pf.ready && pf.signedIn;
   $("btnGo").disabled = !ready;
   $("btnDry").disabled = !ready;
@@ -352,7 +352,7 @@ $("btnLogin").onclick = async () => {
   $("btnLogin").disabled = true;
   $("status").textContent = "Starting sign-in…";
   let failed = "";
-  for (const which of (pf?.signins ?? []).filter(x => !x.done)) {
+  for (const which of (pf?.signins ?? []).filter(x => !x.done && !x.optional)) {
     const st = await signIn(which);
     if (st.code !== 0) { failed = st.error || "Sign-in didn't complete."; break; }
     await preflight();
@@ -361,6 +361,13 @@ $("btnLogin").onclick = async () => {
   $("btnLogin").disabled = false;
   await preflight();
   if (pf && pf.account) tenantCheck();
+};
+$("btnLoginDev").onclick = async () => {
+  $("btnLoginDev").disabled = true;
+  const which = (pf?.signins ?? []).find(x => x.key === "devportal");
+  if (which) { const st = await signIn(which); $("status").textContent = st.code === 0 ? "" : (st.error || "Sign-in didn't complete."); }
+  $("btnLoginDev").disabled = false;
+  await preflight();
 };
 
 $("scopeChoice").onchange = (e) => {

@@ -36,10 +36,10 @@ const cache = new TokenCache(TOKEN_CACHE);
 const SIGNINS = [
   { key: "graph", clientId: CLIENTS.graphCli, scope: GRAPH_SCOPE_STRING,
     label: "Microsoft 365 (Entra, Purview, Teams app catalog)", consent: "Tick \u201cConsent on behalf of your organization\u201d." },
-  { key: "devportal", clientId: CLIENTS.teamsToolkit, scope: DEVPORTAL_SCOPE,
-    label: "Teams Developer Portal (registers the agent\u2019s messaging endpoint)", consent: "" },
+  { key: "devportal", clientId: CLIENTS.teamsToolkit, scope: DEVPORTAL_SCOPE, optional: true,
+    label: "Teams Developer Portal (only for the classic app/bot option)", consent: "" },
 ];
-const signinState = () => SIGNINS.map((s) => ({ key: s.key, label: s.label, consent: s.consent, done: cache.signedIn(s.clientId) }));
+const signinState = () => SIGNINS.map((s) => ({ key: s.key, label: s.label, consent: s.consent, optional: Boolean(s.optional), done: cache.signedIn(s.clientId) }));
 
 function which(cmd) {
   try {
@@ -105,7 +105,7 @@ function preflight() {
   return {
     tools, missing, platform: process.platform,
     signins,
-    signedIn: signins.every((s) => s.done),
+    signedIn: signins.filter((s) => !s.optional).every((s) => s.done),
     account: account ? { user: account.upn, tenantId: account.tenantId, name: account.name } : null,
     ready: missing.length === 0,
   };

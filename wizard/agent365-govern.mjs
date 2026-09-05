@@ -1122,7 +1122,8 @@ async function main(work) {
         console.log(`\n  ${C.y}Not published to Teams.${C.reset} Re-run and answer yes to "Publish to Teams" when you want it there.`);
       }
       console.log(`\n  ${C.d}Licences apply to the agent USER (AI teammate). A bot-only blueprint carries none.${C.reset}`);
-      console.log(`\n  Verify: M365 admin center -> Agents -> All agents -> "${agentName}"; Teams -> Apps -> Built for your org.\n`);
+      console.log(`\n  ${C.b}Restart the agent now${C.reset} so it loads the new settings in ${envPath}.`);
+      console.log(`  Verify: M365 admin center -> Agents -> All agents -> "${agentName}"${teams?.mode === "teammate" ? `; Teams -> New chat -> "${agentName}"` : "; Teams -> Apps -> Built for your org"}.\n`);
     } else {
       console.log(`\n${C.b}${C.y}Agent 365 was NOT registered.${C.reset} To do it by hand, see AGENT365_SETUP.md\n`);
     }
