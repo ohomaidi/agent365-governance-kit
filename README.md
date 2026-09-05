@@ -143,9 +143,12 @@ agent's language, **who the policy applies to**, and **whether it enforces**, th
 3. assigns the **Compliance Administrator** role (provisioning only — see step 8),
 4. creates a DLP policy + rules (Credit Card and/or your custom keywords) and, if you
    ask for it, a DSPM collection policy,
-5. **registers the agent in Agent 365** — identity blueprint → credential → blueprint
-   principal → agent identity → `POST /beta/copilot/agentRegistrations` with the agent
-   card, then reads it back to verify. Re-running finds and reuses each of these,
+5. **registers the agent in Agent 365** — identity blueprint → credential → identifier URI
+   (`api://botid-<appId>` + `access_as_user`) → blueprint principal → agent identity →
+   inheritable permissions → `POST /beta/copilot/agentRegistrations` with the agent card,
+   read back to verify — then **grants tenant-wide admin consent** from the blueprint to
+   the Messaging Bot API, Observability API and Agent 365 Tools (what
+   `a365 setup permissions bot` does). Re-running finds and reuses each of these,
 6. writes all `PURVIEW_*`, `agent365Observability__*` and `AGENT365_INSTANCE_ID` values
    into your app's `.env` — **replacing** any previous block it wrote, after a `.bak`,
 7. validates end to end: **token → `protectionScopes/compute` → `processContent`**,
@@ -216,10 +219,14 @@ limits in [`packages/proxy`](packages/proxy/README.md).
 
 ## 4. What the wizard can't do for you
 
-Agent registration itself is automated (blueprint, credential, instance and card,
-all through Graph, then read back to verify). Two things still need a person:
+Registration, identity, inheritable permissions and admin consent are all automated
+and read back to verify. Two things still need a person:
 
-- **Admin consent** for the blueprint's Graph permissions.
+- **The messaging endpoint.** Microsoft has not exposed the Teams endpoint-registration
+  API to every tenant — its own `a365` CLI falls back to the same manual step. The wizard
+  prints the exact values: Teams Developer Portal → Bot management → Bot ID =
+  `<blueprint appId>`, endpoint = `https://<agent>/api/messages`. Purview governance and
+  the Agent 365 registration do not depend on it.
 - **Licence assignment**, if your tenant requires one.
 
 Both are written to **[AGENT365_SETUP.md](AGENT365_SETUP.md)** next to your `.env`.
@@ -257,10 +264,10 @@ npm run test:all       # TypeScript + wizard + Python + .NET
 | TypeScript | 20 | defaults, misconfiguration, verdicts, retries, timeouts, caching, payload, redaction |
 | Python | 19 | same behaviours, mirrored |
 | .NET | 18 | same behaviours, mirrored |
-| Wizard | 51 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 payloads and call ordering |
+| Wizard | 62 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 payloads and call ordering |
 | Proxy | 20 | enforcement, protocol-shaped refusals, attribution, health |
 
-**128 tests total.** Registration and policy creation are also verified live against a licensed tenant.
+**139 tests total.** Registration and policy creation are also verified live against a licensed tenant.
 
 CI runs all of them on every push ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 

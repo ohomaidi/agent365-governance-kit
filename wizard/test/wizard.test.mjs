@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { psLit, odata, writeEnvBlock, buildProvisionScript, makeCertificate,
-         agent365Checklist, integrationSnippet, ensurePilotGroup, BEGIN, END } from "../agent365-govern.mjs";
+         agent365Checklist, integrationSnippet, ensurePilotGroup, grantBlueprintConsent, BEGIN, END } from "../agent365-govern.mjs";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "a365-wiztest-"));
 
@@ -199,10 +199,12 @@ describe("closing output", () => {
   // A ReferenceError here only surfaces at the very end of a real provision,
   // after the tenant has already been changed — so it gets its own coverage.
   test("the checklist renders with and without a blueprint id", () => {
-    for (const id of ["", undefined, "bp-123"]) {
-      const out = agent365Checklist({ agentName: "Abbas", lang: "typescript", blueprintId: id });
+    for (const id of ["", undefined, "bp-app-123"]) {
+      const out = agent365Checklist({ agentName: "Abbas", lang: "typescript", blueprintId: "", blueprintAppId: id,
+                                      messagingEndpoint: id ? "https://a.example.com/api/messages" : "" });
       assert.match(out, /Completing Agent 365 setup/);
-      assert.match(out, id ? /bp-123/ : /your blueprint/);
+      assert.match(out, /Teams Developer Portal/, "the one remaining manual step is named");
+      assert.match(out, id ? /Bot ID\s+bp-app-123/ : /<blueprint appId>/);
     }
   });
 
@@ -271,5 +273,56 @@ describe("DSPM collection policy is per-tenant", () => {
   test("no DSPM means no DSPM cmdlets at all", () => {
     const ps = buildProvisionScript({ ...base, wantDspm: false, dspmIngest: false });
     assert.equal(/FeatureConfiguration/.test(ps), false);
+  });
+});
+
+describe("blueprint admin consent", () => {
+  const stub = (grantExists, scope = "") => {
+    const calls = [];
+    const azJson = (a) => { const k = a.join(" "); calls.push(k);
+      if (k.includes("sp show")) return "rsp-1";
+      if (k.includes("oauth2PermissionGrants?$filter")) return grantExists ? { id: "g-1", scope } : null;
+      return null; };
+    const az = (a) => { calls.push(a.join(" ")); return ""; };
+    return { calls, deps: { azJson, az } };
+  };
+  test("grants tenant-wide delegated consent for each resource when none exists", () => {
+    const { calls, deps } = stub(false);
+    const out = grantBlueprintConsent({ blueprintPrincipalId: "bp-sp" }, deps);
+    const posts = calls.filter((c) => c.includes("--method POST") && c.includes("oauth2PermissionGrants"));
+    assert.equal(posts.length, 3);
+    assert.ok(posts.every((c) => c.includes('"consentType":"AllPrincipals"') && c.includes('"clientId":"bp-sp"')));
+    assert.ok(posts.some((c) => c.includes("Agent365.Observability.OtelWrite")));
+    assert.equal(out.filter((l) => l.startsWith("consent granted")).length, 3);
+  });
+  test("merges scopes into an existing grant instead of duplicating it", () => {
+    const { calls, deps } = stub(true, "SomeOther.Scope");
+    grantBlueprintConsent({ blueprintPrincipalId: "bp-sp" }, deps);
+    const patches = calls.filter((c) => c.includes("--method PATCH"));
+    assert.equal(patches.length, 3);
+    assert.ok(patches[0].includes("SomeOther.Scope"), "existing scope preserved");
+    assert.equal(calls.some((c) => c.includes("--method POST") && c.includes("oauth2PermissionGrants")), false);
+  });
+});
+
+
+describe("Security & Compliance connect is verified, not assumed", () => {
+  const ps = buildProvisionScript({
+    appId: "app", org: "o.onmicrosoft.com", pfx: "/x.pfx", purviewAppName: "A", wantCreditCard: true,
+    customSitTerms: [], work: "/tmp", dlpMode: "TestWithNotifications",
+    scopeInclusions: [{ Type: "Group", Identity: "p@o.onmicrosoft.com" }], wantDspm: false, dspmIngest: false,
+  });
+  test("checks the DLP cmdlets actually imported after connecting", () => {
+    assert.match(ps, /Get-Command Get-DlpCompliancePolicy/);
+  });
+  test("never swallows the connect's output stream (that is what lost the cmdlets on a retry)", () => {
+    const connects = ps.split("\n").filter((l) => l.includes("Connect-IPPSSession"));
+    assert.ok(connects.length >= 1);
+    for (const l of connects) assert.equal(l.includes("*>$null"), false, l);
+  });
+  test("resets the half-open session before retrying", () => {
+    const i = ps.indexOf("catch {"); const j = ps.indexOf("Start-Sleep -Seconds $delays[$i]");
+    assert.ok(i > -1 && j > i);
+    assert.match(ps.slice(i, j), /Disconnect-ExchangeOnline/);
   });
 });

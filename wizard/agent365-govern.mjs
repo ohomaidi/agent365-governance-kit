@@ -21,7 +21,7 @@
  * Requires: az (Azure CLI, logged in as Global Admin), pwsh 7, openssl.
  * Pure Node built-ins — no install needed to run the wizard.
  */
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout, argv, env as procEnv } from "node:process";
 import { writeFileSync, appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, copyFileSync, readdirSync, statSync } from "node:fs";
@@ -29,7 +29,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { registerAgent, slugify } from "./lib/agent365.mjs";
+import { registerAgent, slugify, A365_RESOURCES, MESSAGING_BOT_API_APP } from "./lib/agent365.mjs";
 import { probeTenant } from "./lib/capabilities.mjs";
 
 // --- Microsoft constants (stable GUIDs) ---
@@ -192,6 +192,48 @@ export function ensurePilotGroup({ displayName, mailNickname, ownerId, memberIds
   return { id: g.id, mail: g.mail, displayName: g.displayName, created };
 }
 
+/**
+ * Tenant-wide delegated consent from the blueprint principal to each Agent 365
+ * resource — what the Entra "Grant admin consent" button does, and what
+ * `a365 setup permissions bot` performs. Runs under the signed-in Global
+ * Administrator (the CLI token carries DelegatedPermissionGrant.ReadWrite.All).
+ * Idempotent: merges scopes into an existing grant.
+ */
+export function grantBlueprintConsent({ blueprintPrincipalId, resources = A365_RESOURCES }, deps = { azJson, az }) {
+  const G = "https://graph.microsoft.com/v1.0";
+  const out = [];
+  for (const res of resources) {
+    // The resource's service principal must exist in the tenant before it can be consented to.
+    let rsp = null;
+    try { rsp = deps.azJson(["ad", "sp", "show", "--id", res.appId, "--query", "id", "-o", "json"]); } catch { /* absent */ }
+    if (!rsp) {
+      try { rsp = deps.azJson(["ad", "sp", "create", "--id", res.appId, "--query", "id", "-o", "json"]); }
+      catch (e) { out.push(`WARNING: ${res.name} service principal could not be created: ${String(e.stderr || e).slice(0, 100)}`); continue; }
+    }
+    const existing = deps.azJson(["rest", "--method", "GET",
+      "--url", `${G}/oauth2PermissionGrants?$filter=clientId eq '${blueprintPrincipalId}' and resourceId eq '${rsp}' and consentType eq 'AllPrincipals'`,
+      "--query", "value[0]", "-o", "json"]);
+    if (existing) {
+      const have = new Set(String(existing.scope || "").split(" ").filter(Boolean));
+      const merged = [...new Set([...have, ...res.scopes])].join(" ");
+      if (merged !== String(existing.scope || "").trim()) {
+        deps.az(["rest", "--method", "PATCH", "--url", `${G}/oauth2PermissionGrants/${existing.id}`,
+          "--headers", "Content-Type=application/json", "--body", JSON.stringify({ scope: merged }), "-o", "none"]);
+        out.push(`consent updated: ${res.name} (${merged})`);
+      } else {
+        out.push(`consent already present: ${res.name}`);
+      }
+    } else {
+      deps.az(["rest", "--method", "POST", "--url", `${G}/oauth2PermissionGrants`,
+        "--headers", "Content-Type=application/json",
+        "--body", JSON.stringify({ clientId: blueprintPrincipalId, consentType: "AllPrincipals", resourceId: rsp, scope: res.scopes.join(" ") }),
+        "-o", "none"]);
+      out.push(`consent granted: ${res.name} (${res.scopes.join(", ")})`);
+    }
+  }
+  return out;
+}
+
 /** Best-effort shred: overwrite file bytes before unlinking. */
 function shred(dir) {
   if (!existsSync(dir)) return;
@@ -308,6 +350,14 @@ async function main(work) {
       stdout.write(promptText + v + "\n");
       return v.trim() || dflt || "";
     }
+    if (ANSWERS) {
+      // Non-interactive: a question the answers file doesn't cover takes its
+      // default; one with no default is a clear stop — never a crash on a
+      // readline that doesn't exist, and never a hang.
+      if (dflt) { stdout.write(promptText + dflt + "\n"); return dflt; }
+      closeInput();
+      die(`The answers file has no "${key ?? q}" and that question has no default.`);
+    }
     let a;
     if (scripted) {
       if (scriptIdx >= scripted.length) outOfInput();
@@ -419,7 +469,7 @@ async function main(work) {
   console.log(`  proxy in front of a third-party agent you cannot modify.${C.reset}`);
   const wantAgent365 = await yes("Register this agent in Agent 365?", true, "wantAgent365");
 
-  let agentName = "", agentUrl = "", sponsorUpn = "", existingBlueprintId = "", transport = "JSONRPC";
+  let agentName = "", agentUrl = "", sponsorUpn = "", existingBlueprintId = "", transport = "JSONRPC", messagingEndpoint = "";
   if (wantAgent365) {
     agentName = await ask("  Agent display name:", purviewAppName, "agentName");
     agentUrl = await ask("  Agent endpoint URL (https):", "", "agentUrl");
@@ -432,6 +482,7 @@ async function main(work) {
       .replace("HTTP+JSON", "HTTP+JSON");
     sponsorUpn = await ask("  Blueprint sponsor (UPN — required by the API):", acct.user.name, "sponsorUpn");
     existingBlueprintId = await ask("  Reuse an existing blueprint object id [blank = create new]:", "", "existingBlueprintId");
+    messagingEndpoint = await ask("  Messaging endpoint (where Teams delivers messages):", `${agentUrl.replace(/\/+$/, "")}/api/messages`, "messagingEndpoint");
   }
   const wantObservability = wantAgent365;
 
@@ -468,7 +519,7 @@ async function main(work) {
     // Render the closing output now (nothing is written) so a rehearsal
     // exercises the same reporting code a real run finishes with.
     void integrationSnippet(lang);
-    void agent365Checklist({ agentName: agentName || purviewAppName, lang, blueprintId: "" });
+    void agent365Checklist({ agentName: agentName || purviewAppName, lang, blueprintId: "", blueprintAppId: "", messagingEndpoint });
     if (wantAgent365) {
       plan(`create the agent identity blueprint and register "${agentName}" at ${agentUrl}`);
       plan("verify the registration by reading it back from the Agent 365 registry");
@@ -593,7 +644,10 @@ async function main(work) {
   let policiesOk = true;
   try {
     // Password crosses to pwsh via the environment, never via the script text.
-    execFileSync("pwsh", ["-NoProfile", "-File", psPath], { stdio: "inherit", env: { ...procEnv, A365_PFX_PW: pfxPw } });
+    // Output is forwarded line by line minus MSAL's raw token-error dump, which
+    // is written to the process console (not a PowerShell stream) on a failed
+    // connect attempt and would otherwise fill a customer's log with headers.
+    runFiltered("pwsh", ["-NoProfile", "-File", psPath], { ...procEnv, A365_PFX_PW: pfxPw });
     record(`DLP policy "${purviewAppName} DLP" (${dlpMode}, ${scopeLabel})`);
     if (wantDspm) record("DSPM for AI collection policy");
   } catch {
@@ -611,6 +665,17 @@ async function main(work) {
     try {
       const sponsorId = azJson(["ad", "user", "show", "--id", sponsorUpn, "--query", "id", "-o", "json"]);
       if (!sponsorId) throw new Error(`sponsor "${sponsorUpn}" not found in this tenant`);
+      // The resource service principals must exist BEFORE the blueprint makes
+      // their scopes inheritable: Graph accepts the POST for a missing SP and
+      // silently drops it (observed live: 3 reported, 1 read back).
+      for (const res of A365_RESOURCES) {
+        try { azJson(["ad", "sp", "show", "--id", res.appId, "--query", "id", "-o", "json"]); }
+        catch {
+          info(`  creating service principal for ${res.name}`);
+          try { azJson(["ad", "sp", "create", "--id", res.appId, "--query", "id", "-o", "json"]); }
+          catch (e) { warn(`  could not create ${res.name} service principal: ${String(e.stderr || e).slice(0, 100)}`); }
+        }
+      }
       const graph = makeGraphClient({ tenantId, clientId: appId, clientSecret });
       a365 = await registerAgent(graph, {
         agentName,
@@ -623,6 +688,12 @@ async function main(work) {
         existingBlueprintId,
       }, (m) => info(`  ${m}`));
       for (const st of a365.steps) ok(`  ${st}`);
+      // Admin consent — the step that makes the Activity tab and Teams delivery possible.
+      try {
+        for (const line of grantBlueprintConsent({ blueprintPrincipalId: a365.blueprintPrincipalId })) {
+          (line.startsWith("WARNING") ? warn : ok)(`  ${line}`);
+        }
+      } catch (e) { warn(`  consent grants failed: ${String(e.stderr || e.message || e).slice(0, 200)}`); }
       record(`Agent 365 blueprint ${a365.blueprintId} — delete with: az ad app delete --id ${a365.blueprintAppId}`);
       record(`Agent 365 registration ${a365.registrationId} — delete with: DELETE https://graph.microsoft.com/beta/copilot/agentRegistrations/${a365.registrationId}`);
       if (!a365.verified) warn("  Registration could not be read back — check M365 admin center → Agents.");
@@ -666,7 +737,21 @@ async function main(work) {
       `AGENT365_REGISTRATION_ID=${a365.registrationId}`,
       `AGENT365_AGENT_IDENTITY_ID=${a365.agentIdentityId}`,
       `AGENT365_BLUEPRINT_PRINCIPAL_ID=${a365.blueprintPrincipalId}`,
-      `AGENT365_AGENT_URL=${agentUrl}`);
+      `AGENT365_AGENT_URL=${agentUrl}`,
+      `AGENT365_MESSAGING_ENDPOINT=${messagingEndpoint}`,
+      `AGENT365_IDENTIFIER_URI=${a365.identifierUri ?? ""}`,
+      "",
+      "# --- Agents SDK runtime connection (Teams / Bot Framework path) ---",
+      `agent_id=${a365.blueprintAppId}`,
+      `connections__service_connection__settings__clientId=${a365.blueprintAppId}`,
+      `connections__service_connection__settings__clientSecret=${a365.blueprintSecret}`,
+      `connections__service_connection__settings__tenantId=${tenantId}`,
+      `connections__service_connection__settings__scopes=${MESSAGING_BOT_API_APP}/.default`,
+      "connectionsMap__0__serviceUrl=*",
+      "connectionsMap__0__connection=service_connection",
+      "agentic_altBlueprintConnectionName=service_connection",
+      "agentic_scopes=https://graph.microsoft.com/.default",
+      "agentic_connectionName=AgenticAuthConnection");
   }
   const how = writeEnvBlock(envPath, block);
   record(`.env block ${how} at ${envPath}`);
@@ -730,6 +815,7 @@ async function main(work) {
   if (wantObservability) {
     const checklist = agent365Checklist({
       agentName: agentName || purviewAppName, lang, blueprintId: a365?.blueprintId ?? "",
+      blueprintAppId: a365?.blueprintAppId ?? "", messagingEndpoint,
     });
     const setupPath = join(envPath.replace(/[^/\\]*$/, ""), "AGENT365_SETUP.md");
     try { writeFileSync(setupPath, checklist); ok(`Agent 365 completion steps written to ${setupPath}`); }
@@ -741,7 +827,10 @@ async function main(work) {
       console.log(`  registration : ${a365.registrationId}${a365.verified ? "  (verified)" : ""}`);
       console.log(`  endpoint     : ${agentUrl}`);
       console.log(`\n${C.b}${C.y}Two things the wizard still can't do:${C.reset}`);
-      console.log(`  1. Grant admin consent for the blueprint's Graph permissions (Entra -> Agents -> Agent blueprints)`);
+      console.log(`  1. Register the messaging endpoint. Microsoft has not exposed this API to every tenant yet —`);
+      console.log(`     its own CLI falls back to the same manual step. Teams Developer Portal -> Tools -> Bot management:`);
+      console.log(`       Bot ID           ${a365.blueprintAppId}`);
+      console.log(`       Endpoint address ${messagingEndpoint}`);
       console.log(`  2. Assign the Agent 365 licence to the agent identity, if your tenant requires one`);
       console.log(`\n  Then verify: M365 admin center -> Agents -> All agents -> "${agentName}"\n`);
     } else {
@@ -792,6 +881,26 @@ export function makeCertificate({ work, subjectName, pfxPw, run = sh }) {
   return { certPem, pfxPath: pfx };
 }
 
+/** Lines MSAL/EXO print to the console on a failed connect; nothing a customer can act on. */
+const PS_NOISE = [
+  /^Error Acquiring Token:/, /^System\.Exception: Case when Message contains/, /MsalServiceException/,
+  /^\s+at Microsoft\.Identity\.Client/, /^\s+ErrorCode: /, /^\s+ResponseBody: /, /^\s+--- End of inner exception/,
+  /^\s+at Microsoft\.Exchange\.Management/, /^(Pragma|Strict-Transport-Security|X-Content-Type-Options|x-ms-[a-z-]+|P3P|client-request-id|Content-Security-Policy[^:]*|X-XSS-Protection|Set-Cookie|Date|Cache-Control|Content-Type|Content-Length|Expires|Vary): /,
+];
+
+/** execFileSync with inherited stdio, minus known console noise. Throws on non-zero exit. */
+function runFiltered(cmd, args, env) {
+  const res = spawnSync(cmd, args, { encoding: "utf8", env, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 });
+  for (const chunk of [res.stdout, res.stderr]) {
+    for (const line of String(chunk ?? "").split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      if (PS_NOISE.some((re) => re.test(line))) continue;
+      console.log(line);
+    }
+  }
+  if (res.status !== 0) { const e = new Error(`${cmd} exited ${res.status}`); e.status = res.status; throw e; }
+}
+
 function printJournal() {
   if (!journal.length) return;
   console.error(`\n${C.y}${C.b}Created before stopping — undo these if you want a clean slate:${C.reset}`);
@@ -823,7 +932,7 @@ export function integrationSnippet(lang) {
   ].join("\n");
 }
 
-export function agent365Checklist({ agentName, lang, blueprintId }) {
+export function agent365Checklist({ agentName, lang, blueprintId, blueprintAppId = "", messagingEndpoint = "" }) {
   const obsNote = lang.startsWith("py")
     ? "Observability (Activity tab) for Python is preview — use the Node or .NET package for it, or skip."
     : "Wire observability with initObservability() + refreshTurnObservability() + withAgentScope() (see the package README).";
@@ -841,12 +950,21 @@ The wizard automates registration through Microsoft Graph, as the connector app:
 The registration endpoint is /beta, which Microsoft labels subject to change.
 (The older /beta/agentRegistry/* surface retired on 15 June 2026.)
 
+The wizard also grants tenant-wide admin consent from the blueprint to the
+Messaging Bot API, the Observability API and Agent 365 Tools, makes those
+permissions inheritable by agent identities, and sets the blueprint's identifier
+URI (api://botid-<appId>) with an access_as_user scope — the same configuration
+\`a365 setup permissions bot\` produces.
+
 ## What still needs a human
 
-1. **Admin consent** for the blueprint's Graph permissions:
-     Entra admin center -> Applications -> ${blueprintId || "your blueprint"} -> API permissions -> Grant admin consent.
-   Note that some high-risk Graph permissions are blocked for agent identities
-   and will be rejected with HTTP 400.
+1. **Messaging endpoint.** Microsoft has not exposed the endpoint-registration
+   API to every tenant; its own CLI falls back to this manual step too.
+     Teams Developer Portal -> Tools -> Bot management -> New bot
+       Bot ID           ${blueprintAppId || "<blueprint appId>"}
+       Endpoint address ${messagingEndpoint || "https://<your-agent>/api/messages"}
+   Until this is done, Teams cannot deliver messages to the agent. Purview
+   governance and the Agent 365 registration do not depend on it.
 
 2. **Licensing.** Viewing the agent inventory needs only the AI Reader role, but
    applying identity governance or Conditional Access to agents requires
@@ -953,17 +1071,31 @@ if (-not (Get-Module -ListAvailable ExchangeOnlineManagement | Where-Object { $_
 }
 Import-Module ExchangeOnlineManagement -RequiredVersion ${EXO_MODULE_VERSION}
 $connected=$false
+# The certificate was uploaded seconds ago; give Entra a moment so the first
+# attempt usually succeeds instead of failing loudly and retrying.
+Start-Sleep -Seconds 25
 # Back off gently at first — permissions usually land in well under a minute.
 $delays = @(5,10,15,30,30,60,60,60,60,60,60,60)
 for ($i=0; $i -lt $delays.Count; $i++) {
-  # *>$null: on failure the module dumps the raw HTTP response (headers, CSP,
-  # cookies) to the host before throwing. The exception still reaches catch.
-  try { Connect-IPPSSession -AppId ${psLit(appId)} -Certificate $cert -Organization ${psLit(org)} -ShowBanner:$false -ErrorAction Stop *>$null; $connected=$true; break }
+  # Keep the module's failure noise (raw HTTP headers) off the host, but do NOT
+  # redirect the output stream: with *>$null a RETRIED connect can report
+  # success without importing the DLP cmdlets. Verify they are present.
+  try {
+    Connect-IPPSSession -AppId ${psLit(appId)} -Certificate $cert -Organization ${psLit(org)} -ShowBanner:$false -WarningAction SilentlyContinue -ErrorAction Stop 2>$null 6>$null
+    if (-not (Get-Command Get-DlpCompliancePolicy -ErrorAction SilentlyContinue)) {
+      Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue *>$null
+      Connect-IPPSSession -AppId ${psLit(appId)} -Certificate $cert -Organization ${psLit(org)} -ShowBanner:$false -ErrorAction Stop
+      if (-not (Get-Command Get-DlpCompliancePolicy -ErrorAction SilentlyContinue)) { throw "connected, but the Security & Compliance cmdlets did not import" }
+    }
+    $connected=$true; break
+  }
   catch {
     $m = ($_.Exception.Message -split "\`n")[0]
     if ($m -match "AADSTS700027") { $m = "certificate not yet visible to Entra (propagation)" }
     elseif ($m.Length -gt 160) { $m = $m.Substring(0,160) + "…" }
     Write-Host ("  attempt " + ($i+1) + " of " + $delays.Count + ": " + $m + " — retrying in " + $delays[$i] + "s")
+    # A failed attempt can leave a half-open session that poisons the next one.
+    Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue *>$null
     Start-Sleep -Seconds $delays[$i]
   }
 }

@@ -35,6 +35,13 @@ const OK = {
   "POST /v1.0/serviceprincipals/microsoft.graph.agentIdentityBlueprintPrincipal": { id: "prin-1" },
   "GET /beta/servicePrincipals/microsoft.graph.agentIdentity?$filter": { value: [] },
   "POST /beta/servicePrincipals/microsoft.graph.agentIdentity": { id: "ident-1" },
+  "GET /v1.0/applications/bp-obj?$select=identifierUris,api": { identifierUris: [], api: { oauth2PermissionScopes: [] } },
+  "PATCH /v1.0/applications/bp-obj": null,
+  // stateful: reports whatever has been POSTed so far, like Graph does
+  "GET /beta/applications/bp-obj/microsoft.graph.agentIdentityBlueprint/inheritablePermissions": (b, calls) => ({
+    value: calls.filter((c) => c.method === "POST" && c.path.endsWith("/inheritablePermissions") && !c.body?.inheritableRoles?.reject)
+                .map((c) => ({ resourceAppId: c.body.resourceAppId })) }),
+  "POST /beta/applications/bp-obj/microsoft.graph.agentIdentityBlueprint/inheritablePermissions": { "@odata.type": "#microsoft.graph.inheritablePermission" },
   "POST /beta/copilot/agentRegistrations": { id: "abbas-test-1" },
   "GET /beta/copilot/agentRegistrations/abbas-test-1": (b, calls) =>
     calls.filter((c) => c.method === "POST" && c.path === "/beta/copilot/agentRegistrations").length ? { id: "abbas-test-1" } : err(404, "Not Found"),
@@ -82,6 +89,9 @@ describe("registration flow", () => {
       "/v1.0/applications/bp-obj/microsoft.graph.agentIdentityBlueprint/addPassword",
       "/v1.0/serviceprincipals/microsoft.graph.agentIdentityBlueprintPrincipal",
       "/beta/servicePrincipals/microsoft.graph.agentIdentity",
+      "/beta/applications/bp-obj/microsoft.graph.agentIdentityBlueprint/inheritablePermissions",
+      "/beta/applications/bp-obj/microsoft.graph.agentIdentityBlueprint/inheritablePermissions",
+      "/beta/applications/bp-obj/microsoft.graph.agentIdentityBlueprint/inheritablePermissions",
       "/beta/copilot/agentRegistrations",
     ]);
   });
@@ -112,6 +122,8 @@ describe("registration flow", () => {
       "GET /v1.0/applications/microsoft.graph.agentIdentityBlueprint?$filter": { value: [{ id: "bp-obj", appId: "bp-app" }] },
       "GET /v1.0/servicePrincipals?$filter=appId": { value: [{ id: "prin-1" }] },
       "GET /beta/servicePrincipals/microsoft.graph.agentIdentity?$filter": { value: [{ id: "ident-1", displayName: "Abbas Test 1" }] },
+      "GET /beta/applications/bp-obj/microsoft.graph.agentIdentityBlueprint/inheritablePermissions": { value: [
+        { resourceAppId: "5a807f24-c9de-44ee-a3a7-329e88a00ffc" }, { resourceAppId: "9b975845-388f-4429-889e-eab1ef63949c" }, { resourceAppId: "ea9ffc3e-8a23-4a7d-836d-234d7c7565c1" } ] },
       "GET /beta/copilot/agentRegistrations/abbas-test-1": { id: "abbas-test-1" },
     });
     const r = await registerAgent(g, BASE);
@@ -163,5 +175,68 @@ describe("registration flow", () => {
     const g = stubGraph({ "DELETE /beta/copilot/agentRegistrations/abbas-test-1": null });
     await deleteRegistration(g, "abbas-test-1");
     assert.equal(g.calls[0].path, "/beta/copilot/agentRegistrations/abbas-test-1");
+  });
+});
+
+describe("inheritable permissions", () => {
+  test("every Agent 365 resource is made inheritable — allAllowed on scopes and roles, like Microsoft's CLI", async () => {
+    const g = stubGraph(OK);
+    const r = await registerAgent(g, BASE);
+    const posts = g.calls.filter((c) => c.method === "POST" && c.path.endsWith("/inheritablePermissions"));
+    assert.equal(posts.length, 3);
+    for (const p of posts) {
+      assert.equal(p.body.inheritableScopes["@odata.type"], "microsoft.graph.allAllowedScopes");
+      assert.equal(p.body.inheritableRoles["@odata.type"], "microsoft.graph.allAllowedRoles");
+    }
+    assert.ok(posts.some((p) => p.body.resourceAppId === "9b975845-388f-4429-889e-eab1ef63949c"), "Observability API is inheritable");
+    assert.equal(r.steps.filter((s) => s.startsWith("inheritable permission:")).length, 3);
+  });
+  test("falls back to enumerated scopes when the tenant rejects inheritableRoles", async () => {
+    let n = 0;
+    const g = stubGraph({ ...OK, "POST /beta/applications/bp-obj/microsoft.graph.agentIdentityBlueprint/inheritablePermissions": (body) =>
+      body.inheritableRoles ? err(400, "Property 'inheritableRoles' does not exist") : { ok: true } });
+    const r = await registerAgent(g, BASE);
+    const posts = g.calls.filter((c) => c.method === "POST" && c.path.endsWith("/inheritablePermissions"));
+    assert.equal(posts.length, 6, "each resource: one rejected attempt, one fallback");
+    assert.equal(r.steps.filter((s) => s.startsWith("WARNING")).length, 0);
+  });
+  test("an already-present inheritable permission is not an error", async () => {
+    const all = { value: [{ resourceAppId: "5a807f24-c9de-44ee-a3a7-329e88a00ffc" }, { resourceAppId: "9b975845-388f-4429-889e-eab1ef63949c" }, { resourceAppId: "ea9ffc3e-8a23-4a7d-836d-234d7c7565c1" }] };
+    const g = stubGraph({ ...OK, "GET /beta/applications/bp-obj/microsoft.graph.agentIdentityBlueprint/inheritablePermissions": all });
+    const r = await registerAgent(g, BASE);
+    assert.equal(r.verified, true);
+    assert.equal(r.steps.some((s) => s.startsWith("WARNING")), false);
+    assert.equal(g.calls.some((c) => c.method === "POST" && c.path.endsWith("/inheritablePermissions")), false);
+  });
+  test("a permission not yet listed is reported after polling, not hidden behind the 201", async () => {
+    // POST succeeds for all three, but the read-back only ever shows one.
+    const g = stubGraph({ ...OK, "GET /beta/applications/bp-obj/microsoft.graph.agentIdentityBlueprint/inheritablePermissions": (b, calls) => ({
+      value: calls.some((c) => c.method === "POST" && c.path.endsWith("/inheritablePermissions")) ? [{ resourceAppId: "ea9ffc3e-8a23-4a7d-836d-234d7c7565c1" }] : [] }) });
+    const origSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = (fn) => origSetTimeout(fn, 0); // don't really wait
+    let r; try { r = await registerAgent(g, BASE); } finally { globalThis.setTimeout = origSetTimeout; }
+    const w = r.steps.find((s) => s.includes("not yet visible on read-back"));
+    assert.ok(w, "shortfall is reported"); assert.match(w, /Messaging Bot API/); assert.match(w, /Observability API/);
+    const reads = g.calls.filter((c) => c.method === "GET" && c.path.endsWith("/inheritablePermissions")).length;
+    assert.ok(reads >= 5, `polls before concluding (got ${reads} reads)`);
+  });
+});
+
+
+describe("identifier URI for Teams SSO", () => {
+  test("sets api://botid-<appId> and an access_as_user scope on a new blueprint", async () => {
+    const g = stubGraph(OK);
+    const r = await registerAgent(g, BASE);
+    const patch = g.calls.find((c) => c.method === "PATCH" && c.path === "/v1.0/applications/bp-obj");
+    assert.ok(patch, "blueprint is patched");
+    assert.deepEqual(patch.body.identifierUris, ["api://botid-bp-app"]);
+    assert.equal(patch.body.api.oauth2PermissionScopes[0].value, "access_as_user");
+    assert.equal(patch.headers?.["OData-Version"], "4.0");
+    assert.equal(r.identifierUri, "api://botid-bp-app");
+  });
+  test("is skipped when the identifier URI is already present", async () => {
+    const g = stubGraph({ ...OK, "GET /v1.0/applications/bp-obj?$select=identifierUris,api": { identifierUris: ["api://botid-bp-app"], api: { oauth2PermissionScopes: [] } } });
+    await registerAgent(g, BASE);
+    assert.equal(g.calls.some((c) => c.method === "PATCH"), false);
   });
 });

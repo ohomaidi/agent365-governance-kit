@@ -159,6 +159,7 @@
         <div class="row"><label for="purviewAppName">Name shown in Purview</label><input type="text" id="purviewAppName" placeholder="auto: same as the agent name"></div>
         <div class="row"><label for="appRegName">Connector app registration</label><input type="text" id="appRegName" placeholder="auto: &lt;agent name&gt; Purview Connector"></div>
         <div class="row"><label for="existingBlueprintId">Reuse blueprint id</label><input type="text" id="existingBlueprintId" placeholder="blank = create a new one"></div>
+        <div class="row"><label for="messagingEndpoint">Messaging endpoint</label><input type="text" id="messagingEndpoint" placeholder="auto: &lt;web address&gt;/api/messages"></div>
       </div>
     </fieldset>
 
@@ -346,6 +347,7 @@ function answers() {
     transport: or("transport", "JSONRPC"),
     sponsorUpn: or("sponsorUpn", me),
     existingBlueprintId: $("existingBlueprintId").value,
+    messagingEndpoint: or("messagingEndpoint", $("agentUrl").value.trim().replace(/\/+$/, "") + "/api/messages"),
     revokeAfter: $("revokeAfter").checked,
     reuseExistingApp: true, replaceInstance: false,
     proceed: true,

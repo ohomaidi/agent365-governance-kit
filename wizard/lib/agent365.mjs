@@ -32,10 +32,25 @@
  * otherwise. Paths are full ("/v1.0/…" or "/beta/…").
  */
 
+import { randomUUID } from "node:crypto";
+
 export const GRAPH = "https://graph.microsoft.com";
 export const GRAPH_BETA = `${GRAPH}/beta`;
 
 const ODATA4 = { "OData-Version": "4.0" };
+
+/**
+ * Resources an Agent 365 agent needs delegated access to, and the scopes.
+ * These are what `a365 setup permissions bot` configures: the Messaging Bot
+ * API (receive messages), the Observability API (export telemetry to the
+ * admin-centre Activity tab) and Agent 365 Tools metadata.
+ */
+export const A365_RESOURCES = [
+  { name: "Messaging Bot API", appId: "5a807f24-c9de-44ee-a3a7-329e88a00ffc", scopes: ["AgentData.ReadWrite"] },
+  { name: "Observability API", appId: "9b975845-388f-4429-889e-eab1ef63949c", scopes: ["Agent365.Observability.OtelWrite"] },
+  { name: "Agent 365 Tools",   appId: "ea9ffc3e-8a23-4a7d-836d-234d7c7565c1", scopes: ["McpServersMetadata.Read.All"] },
+];
+export const MESSAGING_BOT_API_APP = A365_RESOURCES[0].appId;
 
 /** Turn a display name into a stable registry key: "Abbas Test 1" → "abbas-test-1". */
 export function slugify(name) {
@@ -170,6 +185,35 @@ export async function registerAgent(graph, opts, log = () => {}) {
   r.blueprintSecret = pw?.secretText ?? "";
   r.steps.push(r.blueprintSecret ? "minted blueprint secret" : "WARNING: blueprint secret not returned");
 
+  // ---- 2b. identifier URI + access_as_user scope ----
+  // What Microsoft's CLI configures for Teams SSO / token exchange: the bot is
+  // identified as api://botid-<blueprint appId>. Documented in "Configure
+  // identifier URI and scope"; needs AgentIdentityBlueprint.UpdateAuthProperties.All.
+  const identifierUri = `api://botid-${bp.appId}`;
+  r.identifierUri = identifierUri;
+  try {
+    const cur = await withReplication(() => graph("GET", `/v1.0/applications/${bp.id}?$select=identifierUris,api`), log, "identifier uri");
+    if ((cur?.identifierUris ?? []).includes(identifierUri)) {
+      r.steps.push(`identifier URI already set (${identifierUri})`);
+    } else {
+      const scopes = [...(cur?.api?.oauth2PermissionScopes ?? [])];
+      if (!scopes.some((x) => x.value === "access_as_user")) {
+        scopes.push({
+          id: randomUUID(), isEnabled: true, type: "User", value: "access_as_user",
+          adminConsentDisplayName: "Access agent",
+          adminConsentDescription: "Allow the application to access the agent on behalf of the signed-in user.",
+        });
+      }
+      await withReplication(() => graph("PATCH", `/v1.0/applications/${bp.id}`, {
+        identifierUris: [...new Set([...(cur?.identifierUris ?? []), identifierUri])],
+        api: { oauth2PermissionScopes: scopes },
+      }, ODATA4), log, "identifier uri");
+      r.steps.push(`identifier URI ${identifierUri} + access_as_user scope`);
+    }
+  } catch (e) {
+    r.steps.push(`WARNING: identifier URI not set: ${String(e?.body?.error?.message ?? e?.message ?? "").slice(0, 120)}`);
+  }
+
   // ---- 3. blueprint principal: reuse or create ----
   const sp = await withReplication(
     () => graph("GET", `/v1.0/servicePrincipals?$filter=appId eq '${bp.appId}'&$select=id`), log, "principal lookup");
@@ -206,6 +250,61 @@ export async function registerAgent(graph, opts, log = () => {}) {
   }
   r.agentIdentityId = ident.id;
   log(`agent identity ${ident.id}`);
+
+  // ---- 4b. inheritable permissions: agent identities inherit these scopes from
+  //          the blueprint without a separate consent each ----
+  const inheritable = opts.inheritable ?? A365_RESOURCES;
+  // Idempotent: read what's already inheritable and post only what's missing.
+  let present = new Set();
+  try {
+    const cur = await graph("GET", `/beta/applications/${bp.id}/microsoft.graph.agentIdentityBlueprint/inheritablePermissions`);
+    present = new Set((cur?.value ?? []).map((x) => x.resourceAppId));
+  } catch { /* treat as none; a duplicate POST is handled below */ }
+  for (const res of inheritable) {
+    if (present.has(res.appId)) { r.steps.push(`inheritable permission already present: ${res.name}`); continue; }
+    const post = (body) => graph("POST", `/beta/applications/${bp.id}/microsoft.graph.agentIdentityBlueprint/inheritablePermissions`, body);
+    try {
+      // The shape Microsoft's own CLI sets and then verifies: allAllowed on
+      // scopes AND roles (the Observability API is used delegated and
+      // application). Older tenants may not know inheritableRoles yet.
+      try {
+        await post({ resourceAppId: res.appId,
+          inheritableScopes: { "@odata.type": "microsoft.graph.allAllowedScopes" },
+          inheritableRoles:  { "@odata.type": "microsoft.graph.allAllowedRoles" } });
+        r.steps.push(`inheritable permission: ${res.name} (all scopes and roles)`);
+      } catch (e) {
+        if (e?.status === 400 && /inheritableRoles/i.test(String(e?.body?.error?.message ?? e?.message ?? ""))) {
+          await post({ resourceAppId: res.appId,
+            inheritableScopes: { "@odata.type": "microsoft.graph.enumeratedScopes", scopes: res.scopes } });
+          r.steps.push(`inheritable permission: ${res.name} (${res.scopes.join(", ")})`);
+        } else throw e;
+      }
+    } catch (e) {
+      const msg = String(e?.body?.error?.message ?? e?.message ?? "").toLowerCase();
+      if (e?.status === 409 || msg.includes("already exist") || msg.includes("conflict")) {
+        r.steps.push(`inheritable permission already present: ${res.name}`);
+      } else {
+        r.steps.push(`WARNING: inheritable permission for ${res.name} failed: ${msg.slice(0, 120)}`);
+      }
+    }
+  }
+
+  // Read them back. The list endpoint is eventually consistent — observed live:
+  // 3 accepted, 1 listed immediately, 3 listed a couple of minutes later — so
+  // poll before concluding anything is missing.
+  try {
+    let missing = [];
+    for (const wait of [0, 15_000, 20_000, 25_000, 30_000]) {
+      if (wait) { log(`inheritable read-back: waiting ${wait / 1000}s for consistency`); await sleep(wait); }
+      const after = await graph("GET", `/beta/applications/${bp.id}/microsoft.graph.agentIdentityBlueprint/inheritablePermissions`);
+      const have = new Set((after?.value ?? []).map((x) => x.resourceAppId));
+      missing = inheritable.filter((x) => !have.has(x.appId)).map((x) => x.name);
+      if (!missing.length) break;
+    }
+    r.steps.push(missing.length
+      ? `WARNING: inheritable permissions not yet visible on read-back: ${missing.join(", ")} (eventual consistency — re-run later to confirm)`
+      : `inheritable permissions verified (${inheritable.length}/${inheritable.length})`);
+  } catch { r.steps.push("WARNING: could not read back inheritable permissions"); }
 
   // ---- 5. Agent 365 registration: keyed by sourceAgentId, so reuse if present ----
   let reg = null;
