@@ -62,6 +62,26 @@ export const A365_SERVICE_DELEGATED = ["AgentTools.AgentBluePrint.Create", "Agen
 
 const LOGIN = "https://login.microsoftonline.com";
 
+/**
+ * fetch with retries on NETWORK failures only (undici "fetch failed",
+ * ECONNRESET, socket hang up, DNS blips). Seen live: the first Graph call after
+ * a multi-minute PowerShell stage failed on a stale keep-alive socket and the
+ * whole Agent 365 stage was abandoned. HTTP responses are returned as-is.
+ */
+export async function fetchRetry(url, init, { tries = 4, baseMs = 1500 } = {}) {
+  let last;
+  for (let i = 0; i < tries; i++) {
+    if (i) await new Promise((r) => setTimeout(r, baseMs * 2 ** (i - 1)));
+    try { return await fetch(url, init); }
+    catch (e) {
+      last = e;
+      const msg = String(e?.cause?.code ?? e?.cause?.message ?? e?.message ?? e);
+      if (!/fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|EPIPE|UND_ERR/i.test(msg)) throw e;
+    }
+  }
+  throw Object.assign(new Error(`network: ${String(last?.cause?.code ?? last?.message ?? last)} after ${tries} attempts (${url.split("?")[0]})`), { cause: last, network: true });
+}
+
 function form(body) {
   return { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(body) };
 }
@@ -79,7 +99,7 @@ export function claims(jwt) {
  * @returns {Promise<{deviceCode:string,userCode:string,verificationUri:string,message:string,interval:number,expiresIn:number}>}
  */
 export async function startDeviceCode({ tenant = "organizations", clientId = CLIENTS.graphCli, scope = GRAPH_SCOPE_STRING }) {
-  const res = await fetch(`${LOGIN}/${tenant}/oauth2/v2.0/devicecode`, form({ client_id: clientId, scope: `${scope} openid profile offline_access` }));
+  const res = await fetchRetry(`${LOGIN}/${tenant}/oauth2/v2.0/devicecode`, form({ client_id: clientId, scope: `${scope} openid profile offline_access` }));
   const j = await res.json();
   if (!j.device_code) throw new Error(`device code request failed: ${j.error_description || JSON.stringify(j)}`);
   return { deviceCode: j.device_code, userCode: j.user_code, verificationUri: j.verification_uri, message: j.message, interval: j.interval ?? 5, expiresIn: j.expires_in ?? 900 };
@@ -95,7 +115,7 @@ export async function pollDeviceCode({ tenant = "organizations", clientId = CLIE
   while (Date.now() < deadline) {
     if (signal?.aborted) throw new Error("sign-in cancelled");
     await new Promise((r) => setTimeout(r, wait * 1000));
-    const res = await fetch(`${LOGIN}/${tenant}/oauth2/v2.0/token`,
+    const res = await fetchRetry(`${LOGIN}/${tenant}/oauth2/v2.0/token`,
       form({ grant_type: "urn:ietf:params:oauth:grant-type:device_code", client_id: clientId, device_code: deviceCode }));
     const j = await res.json();
     if (j.access_token) return j;
@@ -162,7 +182,7 @@ export class TokenCache {
       if (delay) await new Promise((r) => setTimeout(r, delay));
       const cl = this.data.clients[clientId];
       if (!cl?.refreshToken) throw new Error(`not signed in (${clientId})`);
-      const res = await fetch(`${LOGIN}/${cl.tenant}/oauth2/v2.0/token`,
+      const res = await fetchRetry(`${LOGIN}/${cl.tenant}/oauth2/v2.0/token`,
         form({ grant_type: "refresh_token", client_id: clientId, refresh_token: cl.refreshToken, scope: `${scope} openid profile offline_access` }));
       const j = await res.json();
       if (j.access_token) {
@@ -194,7 +214,7 @@ export function makeDelegatedGraph(cache, { clientId = CLIENTS.graphCli, scope =
       if (d) await new Promise((r) => setTimeout(r, d));
       const t = await cache.token(scope, clientId);
       const isRaw = Buffer.isBuffer(body);
-      const res = await fetch(`https://graph.microsoft.com${path}`, {
+      const res = await fetchRetry(`https://graph.microsoft.com${path}`, {
         method,
         headers: { authorization: `Bearer ${t}`, ...(body && !isRaw ? { "content-type": "application/json" } : {}), ...headers },
         body: body === undefined ? undefined : (isRaw ? body : JSON.stringify(body)),
@@ -216,7 +236,7 @@ export function makeDevPortal(cache, { clientId = CLIENTS.teamsToolkit } = {}) {
   return async function devPortal(method, path, body, headers = {}) {
     const t = await cache.token(DEVPORTAL_SCOPE, clientId);
     const isRaw = Buffer.isBuffer(body);
-    const res = await fetch(`${DEVPORTAL_BASE}${path}`, {
+    const res = await fetchRetry(`${DEVPORTAL_BASE}${path}`, {
       method,
       headers: { authorization: `Bearer ${t}`, ...(body && !isRaw ? { "content-type": "application/json" } : {}), ...headers },
       body: body === undefined ? undefined : (isRaw ? body : JSON.stringify(body)),
@@ -259,7 +279,7 @@ export function makeAgent365Service(cache, { clientId = CLIENTS.graphCli } = {})
       let t;
       try { t = await cache.token(A365_SERVICE_SCOPE, clientId); }
       catch (e) { last = e; if (!/65001|consent/i.test(e.message)) throw e; continue; }
-      const res = await fetch(`${A365_SERVICE_BASE}${path}`, {
+      const res = await fetchRetry(`${A365_SERVICE_BASE}${path}`, {
         method, headers: { authorization: `Bearer ${t}`, ...(body ? { "content-type": "application/json" } : {}), ...headers },
         body: body === undefined ? undefined : JSON.stringify(body),
       });

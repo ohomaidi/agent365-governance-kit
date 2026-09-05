@@ -35,7 +35,7 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { registerAgent, slugify, A365_RESOURCES, MESSAGING_BOT_API_APP } from "./lib/agent365.mjs";
 import { probeTenant } from "./lib/capabilities.mjs";
-import { TokenCache, startDeviceCode, pollDeviceCode, makeDelegatedGraph, makeDevPortal, makeAgent365Service, ensureAgent365ServiceConsent, CLIENTS, GRAPH_SCOPE_STRING } from "./lib/auth.mjs";
+import { TokenCache, startDeviceCode, pollDeviceCode, makeDelegatedGraph, makeDevPortal, makeAgent365Service, ensureAgent365ServiceConsent, fetchRetry, CLIENTS, GRAPH_SCOPE_STRING } from "./lib/auth.mjs";
 import { buildTeamsPackage, publishToOrgCatalog, installForUsers, registerMessagingEndpoint, proactiveHello,
          registerAgent365Endpoint, ensureAgentUser, assignAgentLicence } from "./lib/teams.mjs";
 import { detectGuard, findKitTarball, wireNodeGuard } from "./lib/wire.mjs";
@@ -152,7 +152,7 @@ function makeGraphClient({ tenantId, clientId, clientSecret }) {
   let token = "", expires = 0;
   async function getToken() {
     if (token && Date.now() < expires - 60_000) return token;
-    const res = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
+    const res = await fetchRetry(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
       method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret,
         scope: "https://graph.microsoft.com/.default", grant_type: "client_credentials" }),
@@ -171,7 +171,7 @@ function makeGraphClient({ tenantId, clientId, clientSecret }) {
     for (const d of delays) {
       if (d) await new Promise((r) => setTimeout(r, d));
       const t = await getToken();
-      const res = await fetch(`https://graph.microsoft.com${path}`, {
+      const res = await fetchRetry(`https://graph.microsoft.com${path}`, {
         method,
         headers: { authorization: `Bearer ${t}`, ...(body ? { "content-type": "application/json" } : {}), ...headers },
         body: body ? JSON.stringify(body) : undefined,

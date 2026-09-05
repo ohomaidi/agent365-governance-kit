@@ -248,3 +248,24 @@ describe("AI teammate path (the one Microsoft supports for agent identities)", (
     assert.equal(await ensureAgent365ServiceConsent(g2), "present");
   });
 });
+
+
+describe("network resilience", () => {
+  test("fetchRetry retries transient network failures and returns the first HTTP response", async () => {
+    const { fetchRetry } = await import("../lib/auth.mjs");
+    const orig = global.fetch; let n = 0;
+    global.fetch = async () => { if (++n < 3) throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNRESET" } }); return { ok: true, status: 200 }; };
+    try { const r = await fetchRetry("https://x/y", {}, { baseMs: 1 }); assert.equal(r.status, 200); assert.equal(n, 3); }
+    finally { global.fetch = orig; }
+  });
+  test("fetchRetry gives up with a network error after the attempts, and does not retry non-network throws", async () => {
+    const { fetchRetry } = await import("../lib/auth.mjs");
+    const orig = global.fetch;
+    global.fetch = async () => { throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNRESET" } }); };
+    try { await assert.rejects(fetchRetry("https://x/y", {}, { tries: 2, baseMs: 1 }), /network: ECONNRESET after 2 attempts/); }
+    finally { global.fetch = orig; }
+    let m = 0; global.fetch = async () => { m++; throw new Error("boom"); };
+    try { await assert.rejects(fetchRetry("https://x/y", {}, { baseMs: 1 }), /boom/); assert.equal(m, 1); }
+    finally { global.fetch = orig; }
+  });
+});
