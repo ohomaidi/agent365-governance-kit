@@ -165,7 +165,7 @@ function makeGraphClient({ tenantId, clientId, clientSecret }) {
     // Freshly granted app roles take a little while to reach a minted token:
     // 401/403 are retried with a re-minted token. Object replication (404 /
     // 400 "does not exist") is the library's job.
-    const delays = [0, 5000, 10000, 20000, 30000];
+    const delays = [0, 5000, 10000, 20000, 30000, 45000, 60000, 60000];
     let last;
     for (const d of delays) {
       if (d) await new Promise((r) => setTimeout(r, d));
@@ -185,6 +185,33 @@ function makeGraphClient({ tenantId, clientId, clientSecret }) {
     }
     throw last;
   };
+}
+
+/**
+ * Entra puts freshly granted app roles into a client-credentials token only
+ * after a propagation delay (observed live: >2 minutes). Poll the connector's
+ * own token until the roles it needs are actually in the `roles` claim, so the
+ * registration calls that follow cannot 403 on a stale token.
+ */
+export async function waitForConnectorRoles({ tenantId, clientId, clientSecret, required, log = () => {}, maxMs = 8 * 60_000, fetchImpl = fetch }) {
+  const started = Date.now();
+  let attempt = 0, missing = required;
+  while (Date.now() - started < maxMs) {
+    attempt++;
+    const j = await fetchImpl(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
+      method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret, grant_type: "client_credentials", scope: "https://graph.microsoft.com/.default" }),
+    }).then((r) => r.json()).catch(() => ({}));
+    if (j.access_token) {
+      let roles = [];
+      try { roles = JSON.parse(Buffer.from(j.access_token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")).roles ?? []; } catch { /* unreadable token */ }
+      missing = required.filter((r) => !roles.includes(r));
+      if (!missing.length) return { ok: true, attempts: attempt, waitedMs: Date.now() - started };
+    }
+    log(`connector token does not carry ${missing.length} role(s) yet (${missing.slice(0, 3).join(", ")}${missing.length > 3 ? ", …" : ""}) — waiting 20s (attempt ${attempt})`);
+    await new Promise((r) => setTimeout(r, 20_000));
+  }
+  return { ok: false, attempts: attempt, waitedMs: Date.now() - started, missing };
 }
 
 /** Retry a call that references an Entra object created seconds ago (404 / "does not exist"). */
@@ -811,6 +838,12 @@ async function main(work) {
         catch (e) { warn(`  could not create ${res.name} service principal: ${String(e.message || e).slice(0, 100)}`); }
       }
       const graph = makeGraphClient({ tenantId, clientId: appId, clientSecret });
+      // Never register on a token that does not yet carry the roles granted a
+      // few minutes ago; that is exactly how this stage failed once, live.
+      const rolesWanted = ["AgentIdentityBlueprint.Create", "AgentIdentityBlueprintPrincipal.Create", "AgentIdentity.Create.All", "AgentRegistration.ReadWrite.All"];
+      const ready = await waitForConnectorRoles({ tenantId, clientId: appId, clientSecret, required: rolesWanted, log: (m) => info(`  ${m}`) });
+      if (!ready.ok) throw new Error(`the connector's token still lacks ${ready.missing.join(", ")} after ${Math.round(ready.waitedMs / 60000)} minutes — Entra has not propagated the app roles; re-run in a few minutes`);
+      if (ready.attempts > 1) ok(`  connector permissions active after ${Math.round(ready.waitedMs / 1000)}s`);
       a365 = await registerAgent(graph, {
         agentName,
         agentDescription: agentDescription || `${agentName} — governed by the Agent 365 Governance Kit`,

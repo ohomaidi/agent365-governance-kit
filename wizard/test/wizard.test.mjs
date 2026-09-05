@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { psLit, odata, writeEnvBlock, buildProvisionScript, makeCertificate,
-         agent365Checklist, integrationSnippet, ensurePilotGroup, grantBlueprintConsent, BEGIN, END } from "../agent365-govern.mjs";
+         agent365Checklist, integrationSnippet, ensurePilotGroup, grantBlueprintConsent, waitForConnectorRoles, BEGIN, END } from "../agent365-govern.mjs";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "a365-wiztest-"));
 
@@ -336,5 +336,27 @@ describe("Security & Compliance connect is verified, not assumed", () => {
     const i = ps.indexOf("catch {"); const j = ps.indexOf("Start-Sleep -Seconds $delays[$i]");
     assert.ok(i > -1 && j > i);
     assert.match(ps.slice(i, j), /Disconnect-ExchangeOnline/);
+  });
+});
+
+
+describe("connector role propagation", () => {
+  const tokenWith = (roles) => "x." + Buffer.from(JSON.stringify({ roles })).toString("base64url") + ".y";
+  test("waits until the connector's own token carries every required role, then proceeds", async () => {
+    let calls = 0;
+    const fetchImpl = async () => ({ json: async () => ({ access_token: tokenWith(++calls < 3 ? ["AgentIdentity.Create.All"] : ["AgentIdentity.Create.All", "AgentRegistration.ReadWrite.All"]) }) });
+    const orig = global.setTimeout; global.setTimeout = (fn) => orig(fn, 0);
+    try {
+      const r = await waitForConnectorRoles({ tenantId: "t", clientId: "c", clientSecret: "s", required: ["AgentIdentity.Create.All", "AgentRegistration.ReadWrite.All"], fetchImpl });
+      assert.equal(r.ok, true); assert.equal(r.attempts, 3);
+    } finally { global.setTimeout = orig; }
+  });
+  test("gives up with the missing roles named, never silently", async () => {
+    const fetchImpl = async () => ({ json: async () => ({ access_token: tokenWith([]) }) });
+    const orig = global.setTimeout; global.setTimeout = (fn) => orig(fn, 0);
+    try {
+      const r = await waitForConnectorRoles({ tenantId: "t", clientId: "c", clientSecret: "s", required: ["AgentRegistration.ReadWrite.All"], fetchImpl, maxMs: 50 });
+      assert.equal(r.ok, false); assert.deepEqual(r.missing, ["AgentRegistration.ReadWrite.All"]);
+    } finally { global.setTimeout = orig; }
   });
 });
