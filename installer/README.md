@@ -46,5 +46,10 @@ When it finishes, a message from your agent is waiting in your Teams.
   permissions and are removed when the setup closes.
 - No credential is ever rendered into the page. Secrets go straight into the
   agent's `.env`.
-- The macOS bundle is unsigned. Gatekeeper asks on first launch — right-click →
-  Open, or sign it with your own Developer ID before distributing.
+- The macOS bundle is not notarised. On first launch macOS says
+  *"Agent 365 Setup" Not Opened*: click **Done**, open **System Settings →
+  Privacy & Security**, scroll to *"Agent 365 Setup" was blocked* → **Open
+  Anyway**, confirm, and double-click the app again. Once. (Sign and notarise
+  it with a Developer ID to remove this step for customers.)
+- Windows SmartScreen may show *Windows protected your PC* for the launcher:
+  **More info → Run anyway**.

@@ -29,7 +29,9 @@ Command Line Tools* and *Teams Toolkit*. The first asks for a one-time
 **Rehearse** runs the whole thing and changes nothing. **Provision** names the
 tenant, mode and scope, asks once, then does it all and streams the log.
 
-> Not notarised for macOS: the first launch may need right-click → Open.
+> **First launch on macOS** (the app is not yet notarised): macOS says *"Agent 365 Setup" Not Opened*.
+> Click **Done**, open **System Settings → Privacy & Security**, scroll to *"Agent 365 Setup" was blocked* → **Open Anyway**, confirm, then double-click the app again. Two clicks, once.
+> **Windows SmartScreen** may show *Windows protected your PC*: click **More info → Run anyway**.
 
 ---
 
