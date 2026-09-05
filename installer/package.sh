@@ -22,9 +22,13 @@ stage() {                    # $1 = staging dir
 MACTMP="$(mktemp -d)"
 MAC="$MACTMP/Agent365-Setup"        # named, so the zip doesn't carry a temp name
 mkdir -p "$MAC"
-stage "$MAC"
 cp -R "$ROOT/installer/macos/Agent 365 Setup.app" "$MAC/"
 APP="$MAC/Agent 365 Setup.app"
+# The kit goes INSIDE the bundle: macOS runs a downloaded app from a translocated
+# copy, so files beside the app are not visible to it. Self-contained is the only
+# layout that survives that. The README sits next to the app for humans.
+stage "$APP/Contents/Resources"
+mv "$APP/Contents/Resources/README.txt" "$MAC/README.txt"
 # The executable is a small universal binary (Apple notarises real code, not a
 # bare script bundle); it hands over to launch.sh. Rebuild it from source so the
 # zip never ships a stale binary.

@@ -17,15 +17,19 @@ notice() { osascript -e "display notification \"$1\" with title \"Agent 365 Setu
 # next to a "kit" folder.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER=""
+# Shipped form: the kit lives INSIDE the bundle (Contents/Resources/kit), so a
+# downloaded app still works when macOS runs it from a translocated copy.
+if [ -f "$HERE/kit/installer/server.mjs" ]; then SERVER="$HERE/kit/installer/server.mjs"; fi
 CANDIDATE="$HERE"
 for _ in 1 2 3 4 5 6; do
+  [ -n "$SERVER" ] && break
   CANDIDATE="$(cd "$CANDIDATE/.." 2>/dev/null && pwd)" || break
   if [ -f "$CANDIDATE/installer/server.mjs" ]; then SERVER="$CANDIDATE/installer/server.mjs"; break; fi
   if [ -f "$CANDIDATE/kit/installer/server.mjs" ]; then SERVER="$CANDIDATE/kit/installer/server.mjs"; break; fi
 done
 
 if [ -z "$SERVER" ] || [ ! -f "$SERVER" ]; then
-  alert "Could not find the kit. Keep this app inside the Agent365-Setup folder."
+  alert "Could not find the setup files inside the app. Re-download Agent365-Setup-macOS.zip."
   exit 1
 fi
 
