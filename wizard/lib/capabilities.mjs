@@ -13,6 +13,16 @@
 export const EXCHANGE_ONLINE_APP = "00000002-0000-0ff1-ce00-000000000000";
 export const GRAPH_APP = "00000003-0000-0000-c000-000000000000";
 
+/** Graph application permissions the Purview guard needs at runtime. */
+export const PURVIEW_ROLES = ["Content.Process.All", "ProtectionScopes.Compute.All"];
+
+/** Graph application permissions Agent 365 registration needs. */
+export const AGENT365_ROLES = [
+  "AgentInstance.ReadWrite.All",
+  "AgentIdentityBlueprint.Create",
+  "AgentIdentityBlueprint.ReadWrite.All",
+];
+
 /** Roles the wizard's stages actually need. */
 export const ROLES = {
   "Global Administrator": "everything (supersedes the rest)",
@@ -84,34 +94,33 @@ export async function probeTenant(azJson) {
       "Connect-IPPSSession will fail, so no DLP or DSPM policy can be created."));
   }
 
-  // --- Purview: is the app role the guard needs even offered here? ---
+  // --- Which Graph app roles this tenant actually offers ---
+  //
+  // NOTE: we deliberately do NOT probe /beta/agentRegistry directly. `az rest`
+  // uses the Azure CLI first-party app, whose token carries no agent scopes at
+  // all, so that call returns 404/403 in every tenant — including ones where
+  // the feature is fully available. The presence of the app roles is the honest
+  // signal, and it's also what the connector app will be granted.
+  let graphRoles = [];
   try {
     const graph = azJson(["ad", "sp", "show", "--id", GRAPH_APP, "-o", "json"]);
-    const roles = (graph?.appRoles ?? []).map((r) => r.value);
-    const need = ["Content.Process.All", "ProtectionScopes.Compute.All"];
-    const missing = need.filter((n) => !roles.includes(n));
+    graphRoles = (graph?.appRoles ?? []).filter((r) => r.isEnabled !== false).map((r) => r.value);
+  } catch (e) {
+    checks.push(warn("Microsoft Graph", "could not inspect app roles", String(e.message).slice(0, 160)));
+  }
+
+  if (graphRoles.length) {
+    const missing = PURVIEW_ROLES.filter((n) => !graphRoles.includes(n));
     checks.push(missing.length
       ? bad("Purview Graph API", `missing app role(s): ${missing.join(", ")}`,
             "The Purview SDK surface isn't available to this tenant.")
       : ok("Purview Graph API", "Content.Process.All + ProtectionScopes.Compute.All available"));
-  } catch (e) {
-    checks.push(warn("Purview Graph API", "could not inspect Microsoft Graph app roles", String(e.message).slice(0, 160)));
-  }
 
-  // --- Agent 365 registry (beta) ---
-  try {
-    azJson(["rest", "--method", "GET", "--url",
-      "https://graph.microsoft.com/beta/agentRegistry/agentInstances", "-o", "json"]);
-    checks.push(ok("Agent 365 registry", "reachable"));
-  } catch (e) {
-    const msg = String(e.message || e);
-    checks.push(/not\s*found|404/i.test(msg)
-      ? bad("Agent 365 registry", "not available in this tenant (404)",
+    const a365Missing = AGENT365_ROLES.filter((n) => !graphRoles.includes(n));
+    checks.push(a365Missing.length
+      ? bad("Agent 365 registry", `missing app role(s): ${a365Missing.join(", ")}`,
             "Agent 365 registration will be skipped. Purview still works.")
-      : /forbid|403|authoriz/i.test(msg)
-      ? bad("Agent 365 registry", "access denied (403)",
-            "Needs the Agent Registry Administrator role.")
-      : warn("Agent 365 registry", "could not be probed", msg.slice(0, 160)));
+      : ok("Agent 365 registry", "AgentInstance + blueprint permissions available"));
   }
 
   // --- roles actually held ---
@@ -124,11 +133,8 @@ export async function probeTenant(azJson) {
     const relevant = Object.keys(ROLES).filter((r) => held.includes(r));
     if (isGA) {
       checks.push(ok("Directory roles", `Global Administrator${relevant.length > 1 ? ` (+ ${relevant.filter(r => r !== "Global Administrator").join(", ")})` : ""}`));
-      if (!held.includes("Agent Registry Administrator")) {
-        checks.push(warn("Agent Registry Administrator",
-          "not held explicitly — Global Administrator normally supersedes it",
-          "If registration returns 403, assign this role and re-run."));
-      }
+      // Registration runs app-only under the connector app, so the operator's
+      // own directory roles only need to cover granting those app roles.
     } else if (relevant.length) {
       checks.push(warn("Directory roles", `holds: ${relevant.join(", ")}`,
         "Global Administrator is what the wizard assumes for the Purview stage."));

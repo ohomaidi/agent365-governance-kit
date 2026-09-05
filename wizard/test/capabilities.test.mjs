@@ -25,8 +25,11 @@ const HEALTHY = {
   "organization?$select": { value: [{ displayName: "Contoso", verifiedDomains: [{ name: "contoso.onmicrosoft.com" }] }] },
   "subscribedSkus": { value: [{ skuPartNumber: "SPE_E5" }, { skuPartNumber: "EXCHANGE_S_ENTERPRISE" }] },
   [`sp show --id ${EXCHANGE_ONLINE_APP}`]: "exo-sp-id",
-  [`sp show --id ${GRAPH_APP}`]: { appRoles: [{ value: "Content.Process.All" }, { value: "ProtectionScopes.Compute.All" }] },
-  "agentRegistry/agentInstances": { value: [] },
+  [`sp show --id ${GRAPH_APP}`]: { appRoles: [
+    { value: "Content.Process.All" }, { value: "ProtectionScopes.Compute.All" },
+    { value: "AgentInstance.ReadWrite.All" }, { value: "AgentIdentityBlueprint.Create" },
+    { value: "AgentIdentityBlueprint.ReadWrite.All" },
+  ] },
   "signed-in-user show": "me-1",
   "memberOf": { value: [{ displayName: "Global Administrator" }] },
 };
@@ -66,20 +69,30 @@ describe("catches the failures that would otherwise surface mid-demo", () => {
     assert.equal(status(r, "Organisation"), "fail");
   });
 
-  test("a 404 registry disables Agent 365 but leaves Purview usable", async () => {
+  test("a tenant without the agent app roles disables Agent 365 but leaves Purview usable", async () => {
     const r = await probeTenant(stubAz({
-      ...HEALTHY, "agentRegistry/agentInstances": new Error("Not Found (404)"),
+      ...HEALTHY,
+      [`sp show --id ${GRAPH_APP}`]: { appRoles: [
+        { value: "Content.Process.All" }, { value: "ProtectionScopes.Compute.All" },
+      ] },
     }));
     assert.equal(status(r, "Agent 365 registry"), "fail");
     assert.equal(r.canRegisterAgent365, false);
     assert.equal(r.canProvisionPurview, true, "Purview must not be blocked by an absent registry");
   });
 
-  test("a 403 registry is reported as a role problem, not an absent feature", async () => {
-    const r = await probeTenant(stubAz({
-      ...HEALTHY, "agentRegistry/agentInstances": new Error("Forbidden 403"),
-    }));
-    assert.match(r.checks.find((c) => c.name === "Agent 365 registry").fix, /Agent Registry Administrator/);
+  test("the registry endpoint is never probed with the CLI token", async () => {
+    // The Azure CLI's token has no agent scopes, so probing it would report a
+    // false 404 in a tenant where the feature is fully available.
+    const seen = [];
+    const az = (args) => {
+      seen.push(args.join(" "));
+      const stub = stubAz(HEALTHY);
+      return stub(args);
+    };
+    await probeTenant(az);
+    assert.equal(seen.some((c) => c.includes("agentRegistry")), false,
+      "must infer availability from app roles, not from an unauthorised call");
   });
 
   test("missing Purview app roles are caught", async () => {
@@ -92,18 +105,9 @@ describe("catches the failures that would otherwise surface mid-demo", () => {
 });
 
 describe("roles", () => {
-  test("Global Administrator passes, with a note about the registry role", async () => {
+  test("Global Administrator passes", async () => {
     const r = await probeTenant(stubAz(HEALTHY));
     assert.equal(status(r, "Directory roles"), "ok");
-    assert.equal(status(r, "Agent Registry Administrator"), "warn");
-  });
-
-  test("holding the registry role explicitly removes the note", async () => {
-    const r = await probeTenant(stubAz({
-      ...HEALTHY,
-      memberOf: { value: [{ displayName: "Global Administrator" }, { displayName: "Agent Registry Administrator" }] },
-    }));
-    assert.equal(r.checks.some((c) => c.name === "Agent Registry Administrator"), false);
   });
 
   test("no privileged role at all is a failure", async () => {

@@ -39,6 +39,14 @@ const ROLE_CONTENT_PROCESS = "5ad511bf-571c-4ef6-8c3c-85b94b85df98"; // Content.
 const ROLE_PROTECTION_SCOPES = "e5a76501-dbb0-492c-ab55-5d09e8837263"; // ProtectionScopes.Compute.All
 const ROLE_EXCHANGE_MANAGE = "dc50a0fb-09a3-484d-be87-e023b12c6440"; // Exchange.ManageAsApp
 const ROLE_COMPLIANCE_ADMIN = "17315797-102d-40b4-93e0-432062caca18"; // Compliance Administrator
+// Agent 365 / Entra Agent ID application permissions. Registration needs these
+// on the connector app: the Azure CLI is a first-party app whose token carries
+// no agent scopes at all, so `az rest` can never perform these calls.
+const ROLE_AGENT_INSTANCE_RW = "07abdd95-78dc-4353-bd32-09f880ea43d0";      // AgentInstance.ReadWrite.All
+const ROLE_AGENT_BLUEPRINT_RW = "7fddd33b-d884-4ec0-8696-72cff90ff825";     // AgentIdentityBlueprint.ReadWrite.All
+const ROLE_AGENT_BLUEPRINT_CREATE = "ea4b2453-ad2d-4d94-9155-10d5d9493ce9"; // AgentIdentityBlueprint.Create
+const ROLE_AGENT_BLUEPRINT_CREDS = "0510736e-bdfb-4b37-9a1f-89b4a074763a";  // AgentIdentityBlueprint.AddRemoveCreds.All
+const ROLE_AGENT_CARD_RW = "228b1a03-f7ca-4348-b50d-e8a547ab61af";          // AgentCardManifest.ReadWrite.All
 const EXO_MODULE_VERSION = "3.5.1"; // 3.10.x throws NullRef on PowerShell 7.6
 
 const IS_WINDOWS = process.platform === "win32";
@@ -78,21 +86,57 @@ function az(args) { return sh("az", args); }
 function azJson(args) { const out = az(args).trim(); return out ? JSON.parse(out) : null; }
 
 /**
- * Graph caller for the Agent 365 registry (beta). Injected into registerAgent so
- * the registration flow stays unit-testable without a tenant.
+ * Graph caller for the Agent 365 registry, authenticated as the CONNECTOR APP.
+ *
+ * This deliberately does not use `az rest`. The Azure CLI is a first-party app
+ * whose delegated token carries no agent-related scopes — AgentInstance.*,
+ * AgentIdentityBlueprint.* and friends are simply absent from it — so registry
+ * calls made through it return 404/403 in every tenant, including ones where
+ * the feature is fully licensed. The app registration this wizard creates holds
+ * the app roles, so it mints its own token instead.
+ *
+ * Injected into registerAgent, so the flow stays unit-testable without a tenant.
  */
-async function azGraph(method, path, body) {
-  const args = ["rest", "--method", method, "--url", `${GRAPH_BETA}${path}`,
-    "--headers", "Content-Type=application/json"];
-  if (body) args.push("--body", JSON.stringify(body));
-  args.push("-o", "json");
-  try {
-    const out = az(args).trim();
-    return out ? JSON.parse(out) : null;
-  } catch (e) {
-    const msg = String(e.stderr || e.stdout || e);
-    throw new Error(`${method} ${path} failed: ${msg.trim().slice(0, 400)}`);
+function makeGraphClient({ tenantId, clientId, clientSecret }) {
+  let token = "", expires = 0;
+
+  async function getToken() {
+    if (token && Date.now() < expires - 60_000) return token;
+    const res = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: clientId, client_secret: clientSecret,
+        scope: "https://graph.microsoft.com/.default", grant_type: "client_credentials",
+      }),
+    });
+    const j = await res.json();
+    if (!j.access_token) throw new Error(`token: ${j.error_description || JSON.stringify(j)}`);
+    token = j.access_token;
+    expires = Date.now() + (j.expires_in ?? 3600) * 1000;
+    return token;
   }
+
+  return async function graph(method, path, body) {
+    // Freshly granted app roles take a little while to reach a minted token.
+    const delays = [0, 5000, 10000, 20000, 30000];
+    let last;
+    for (const d of delays) {
+      if (d) await new Promise((r) => setTimeout(r, d));
+      const t = await getToken();
+      const res = await fetch(`${GRAPH_BETA}${path}`, {
+        method,
+        headers: { authorization: `Bearer ${t}`, ...(body ? { "content-type": "application/json" } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      const text = await res.text();
+      if (res.ok) return text ? JSON.parse(text) : null;
+      last = `${method} ${path} -> HTTP ${res.status}: ${text.slice(0, 300)}`;
+      if (![401, 403].includes(res.status)) break;  // only wait out propagation
+      token = "";                                    // re-mint; roles may have landed
+    }
+    throw new Error(last);
+  };
 }
 
 /** Quote a value for safe embedding in a PowerShell single-quoted literal. */
@@ -406,6 +450,14 @@ async function main(work) {
   assignRole(graphSp, ROLE_CONTENT_PROCESS, "Content.Process.All");
   assignRole(graphSp, ROLE_PROTECTION_SCOPES, "ProtectionScopes.Compute.All");
   assignRole(exoSp, ROLE_EXCHANGE_MANAGE, "Exchange.ManageAsApp");
+  if (wantAgent365) {
+    // Registration is performed by this app, not by the Azure CLI.
+    assignRole(graphSp, ROLE_AGENT_INSTANCE_RW, "AgentInstance.ReadWrite.All");
+    assignRole(graphSp, ROLE_AGENT_BLUEPRINT_RW, "AgentIdentityBlueprint.ReadWrite.All");
+    assignRole(graphSp, ROLE_AGENT_BLUEPRINT_CREATE, "AgentIdentityBlueprint.Create");
+    assignRole(graphSp, ROLE_AGENT_BLUEPRINT_CREDS, "AgentIdentityBlueprint.AddRemoveCreds.All");
+    assignRole(graphSp, ROLE_AGENT_CARD_RW, "AgentCardManifest.ReadWrite.All");
+  }
   ok("App-role assignments granted");
 
   // ---- 3. cert + Compliance Administrator role ----
@@ -479,15 +531,16 @@ async function main(work) {
     try {
       const sponsorId = azJson(["ad", "user", "show", "--id", sponsorUpn, "--query", "id", "-o", "json"]);
       if (!sponsorId) throw new Error(`sponsor "${sponsorUpn}" not found in this tenant`);
+      const graph = makeGraphClient({ tenantId, clientId: appId, clientSecret });
 
       // A stale instance from the retired (pre-June-2026) registry will collide.
       try {
-        const existing = await listAgentInstances(azGraph);
+        const existing = await listAgentInstances(graph);
         const clash = existing.find((i) => i.displayName === agentName);
         if (clash) {
           warn(`  An agent instance named "${agentName}" already exists (${clash.id}).`);
           if (await yes("  Replace it?", false, "replaceInstance")) {
-            await azGraph("DELETE", `/agentRegistry/agentInstances/${clash.id}`);
+            await graph("DELETE", `/agentRegistry/agentInstances/${clash.id}`);
             ok("  removed the previous registration");
           } else {
             throw new Error("registration skipped — an instance with that name already exists");
@@ -498,7 +551,7 @@ async function main(work) {
         info(`  (could not list existing instances: ${String(e.message).slice(0, 120)})`);
       }
 
-      a365 = await registerAgent(azGraph, {
+      a365 = await registerAgent(graph, {
         agentName,
         agentDescription: `${agentName} — governed by the Agent 365 Governance Kit`,
         agentUrl,
@@ -516,8 +569,9 @@ async function main(work) {
     } catch (e) {
       a365 = null;
       warn(`Agent 365 registration failed: ${String(e.message).slice(0, 400)}`);
-      warn("  These are /beta endpoints and need the Agent Registry Administrator and");
-      warn("  Agent ID Administrator roles. Purview provisioning above is unaffected.");
+      warn("  These are /beta endpoints. The connector app was granted");
+      warn("  AgentInstance.ReadWrite.All and the blueprint roles; a new assignment can");
+      warn("  take a few minutes to reach a token. Purview provisioning is unaffected.");
     }
   }
 
