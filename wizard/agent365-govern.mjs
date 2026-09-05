@@ -29,6 +29,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { registerAgent, listAgentInstances, GRAPH_BETA } from "./lib/agent365.mjs";
 
 // --- Microsoft constants (stable GUIDs) ---
 const GRAPH_APP = "00000003-0000-0000-c000-000000000000";
@@ -57,6 +58,24 @@ function sh(cmd, args, opts = {}) {
 }
 function az(args) { return sh("az", args); }
 function azJson(args) { const out = az(args).trim(); return out ? JSON.parse(out) : null; }
+
+/**
+ * Graph caller for the Agent 365 registry (beta). Injected into registerAgent so
+ * the registration flow stays unit-testable without a tenant.
+ */
+async function azGraph(method, path, body) {
+  const args = ["rest", "--method", method, "--url", `${GRAPH_BETA}${path}`,
+    "--headers", "Content-Type=application/json"];
+  if (body) args.push("--body", JSON.stringify(body));
+  args.push("-o", "json");
+  try {
+    const out = az(args).trim();
+    return out ? JSON.parse(out) : null;
+  } catch (e) {
+    const msg = String(e.stderr || e.stdout || e);
+    throw new Error(`${method} ${path} failed: ${msg.trim().slice(0, 400)}`);
+  }
+}
 
 /** Quote a value for safe embedding in a PowerShell single-quoted literal. */
 export const psLit = (v) => `'${String(v ?? "").replace(/'/g, "''")}'`;
@@ -237,13 +256,28 @@ async function main(work) {
   const wantDspm = await yes("Create the DSPM collection policy?", true);
   const dspmIngest = wantDspm ? await yes("  Store full prompt/response content (ingestion)?", false) : false;
 
-  const wantObservability = await yes("\nAlso wire Agent 365 observability (Activity tab)?", true);
-  let blueprintId = "", blueprintSecret = "", agentName = "";
-  if (wantObservability) {
-    agentName = await ask("Agent display name (for observability):", purviewAppName);
-    blueprintId = await ask("Agent blueprint app (client) id [blank to skip]:", "");
-    if (blueprintId) blueprintSecret = await ask("Blueprint app client secret:", "");
+  // --- Agent 365 registration (identity + registry + Activity tab) ---
+  console.log(`\n${C.b}Agent 365 registration${C.reset}`);
+  console.log(`  ${C.d}Creates the agent identity blueprint and registers the agent in the`);
+  console.log(`  Agent 365 registry so admins can see, govern and secure it.`);
+  console.log(`  The agent's endpoint may be ANY https URL — including a governance`);
+  console.log(`  proxy in front of a third-party agent you cannot modify.${C.reset}`);
+  const wantAgent365 = await yes("Register this agent in Agent 365?", true);
+
+  let agentName = "", agentUrl = "", sponsorUpn = "", existingBlueprintId = "", transport = "JSONRPC";
+  if (wantAgent365) {
+    agentName = await ask("  Agent display name:", purviewAppName);
+    agentUrl = await ask("  Agent endpoint URL (https):", "");
+    while (wantAgent365 && !/^https:\/\//i.test(agentUrl)) {
+      warn("  An https endpoint is required to register an agent instance.");
+      agentUrl = await ask("  Agent endpoint URL (https):", "");
+    }
+    transport = (await ask("  Transport (JSONRPC / HTTP+JSON / GRPC):", "JSONRPC")).toUpperCase()
+      .replace("HTTP+JSON", "HTTP+JSON");
+    sponsorUpn = await ask("  Blueprint sponsor (UPN — required by the API):", acct.user.name);
+    existingBlueprintId = await ask("  Reuse an existing blueprint object id [blank = create new]:", "");
   }
+  const wantObservability = wantAgent365;
 
   [["App registration name", appRegName], ["Purview app name", purviewAppName], ["Agent name", agentName]]
     .forEach(([n, v]) => assertEnvSafe(n, v));
@@ -260,13 +294,24 @@ async function main(work) {
   console.log(`      scope: ${scopeChoice === "3" ? `${C.r}${C.b}${scopeLabel}${C.reset}` : `${C.g}${scopeLabel}${C.reset}`}`);
   console.log(`  • DSPM collection policy: ${wantDspm ? `yes (ingestion ${dspmIngest ? `${C.y}ON — stores prompt text${C.reset}` : "OFF"})` : "no"}`);
   console.log(`  • Write ${envPath}${existsSync(envPath) ? `  ${C.d}(backup → ${envPath}.bak)${C.reset}` : ""}`);
-  console.log(`  • Post-provision revoke of admin privileges: ${revokeAfter ? "yes" : `${C.y}no — connector keeps Compliance Administrator${C.reset}`}\n`);
+  console.log(`  • Post-provision revoke of admin privileges: ${revokeAfter ? "yes" : `${C.y}no — connector keeps Compliance Administrator${C.reset}`}`);
+  if (wantAgent365) {
+    console.log(`  • Agent 365: ${existingBlueprintId ? `reuse blueprint ${existingBlueprintId}` : "create identity blueprint + secret"}`);
+    console.log(`               register instance "${agentName}" at ${agentUrl} (${transport})`);
+  } else {
+    console.log(`  • Agent 365: ${C.y}not registered${C.reset}`);
+  }
+  console.log("");
 
   if (DRY_RUN) {
     plan("create the app registration, secret, certificate and role assignments");
     plan(`create DLP policy in ${dlpMode} mode scoped to ${scopeLabel}`);
     plan(`write ${envPath}`);
     plan("validate with token → protectionScopes/compute → processContent");
+    if (wantAgent365) {
+      plan(`create the agent identity blueprint and register "${agentName}" at ${agentUrl}`);
+      plan("verify the registration by reading it back from the Agent 365 registry");
+    }
     console.log(`\n${C.c}Dry run complete — nothing was changed.${C.reset}\n`);
     closeInput();
     return;
@@ -376,6 +421,57 @@ async function main(work) {
     warn("The connector + permissions are still set. Re-run the wizard to retry policy creation.");
   }
 
+  // ---- 4b. Agent 365: blueprint + registry instance ----
+  // This used to be a printed checklist. Microsoft now exposes registration
+  // through Graph, so the wizard does it and verifies the result.
+  let a365 = null;
+  if (wantAgent365) {
+    info("Registering in Agent 365 (identity blueprint + agent registry)…");
+    try {
+      const sponsorId = azJson(["ad", "user", "show", "--id", sponsorUpn, "--query", "id", "-o", "json"]);
+      if (!sponsorId) throw new Error(`sponsor "${sponsorUpn}" not found in this tenant`);
+
+      // A stale instance from the retired (pre-June-2026) registry will collide.
+      try {
+        const existing = await listAgentInstances(azGraph);
+        const clash = existing.find((i) => i.displayName === agentName);
+        if (clash) {
+          warn(`  An agent instance named "${agentName}" already exists (${clash.id}).`);
+          if (await yes("  Replace it?", false)) {
+            await azGraph("DELETE", `/agentRegistry/agentInstances/${clash.id}`);
+            ok("  removed the previous registration");
+          } else {
+            throw new Error("registration skipped — an instance with that name already exists");
+          }
+        }
+      } catch (e) {
+        if (/already exists/.test(String(e.message))) throw e;
+        info(`  (could not list existing instances: ${String(e.message).slice(0, 120)})`);
+      }
+
+      a365 = await registerAgent(azGraph, {
+        agentName,
+        agentDescription: `${agentName} — governed by the Agent 365 Governance Kit`,
+        agentUrl,
+        sponsorIds: [sponsorId],
+        ownerIds: [sponsorId],
+        existingBlueprintId,
+        transport,
+        organization: purviewAppName,
+      }, (m) => info(`  ${m}`));
+
+      for (const st of a365.steps) ok(`  ${st}`);
+      record(`Agent 365 blueprint ${a365.blueprintId}`);
+      record(`Agent 365 instance ${a365.instanceId} — delete with: az rest --method DELETE --url ${GRAPH_BETA}/agentRegistry/agentInstances/${a365.instanceId}`);
+      if (!a365.verified) warn("  Registration could not be read back — check the Agent 365 registry manually.");
+    } catch (e) {
+      a365 = null;
+      warn(`Agent 365 registration failed: ${String(e.message).slice(0, 400)}`);
+      warn("  These are /beta endpoints and need the Agent Registry Administrator and");
+      warn("  Agent ID Administrator roles. Purview provisioning above is unaffected.");
+    }
+  }
+
   // ---- 5. write .env ----
   info(`Writing ${envPath}…`);
   const block = [
@@ -392,16 +488,22 @@ async function main(work) {
     "PURVIEW_TIMEOUT_MS=10000",
     "PURVIEW_MAX_RETRIES=3",
   ];
-  if (wantObservability && blueprintId) {
-    block.push("", "# --- Agent 365 observability ---",
+  if (a365 && a365.blueprintId) {
+    block.push("", "# --- Agent 365 identity + observability ---",
       "ENABLE_A365_OBSERVABILITY_EXPORTER=true",
       "A365_OBSERVABILITY_LOG_LEVEL=info|warn|error",
       `agent365Observability__tenantId=${tenantId}`,
-      `agent365Observability__clientId=${blueprintId}`,
-      `agent365Observability__clientSecret=${blueprintSecret}`,
-      `agent365Observability__agentBlueprintId=${blueprintId}`,
+      `agent365Observability__clientId=${a365.blueprintAppId || a365.blueprintId}`,
+      `agent365Observability__clientSecret=${a365.blueprintSecret}`,
+      `agent365Observability__agentBlueprintId=${a365.blueprintId}`,
       `agent365Observability__agentName=${agentName}`,
-      `agent365Observability__agentDescription=${agentName}`);
+      `agent365Observability__agentDescription=${agentName}`,
+      "",
+      "# Agent 365 registry (written by the wizard; the live instance id is what",
+      "# the observability endpoint authorises against).",
+      `AGENT365_INSTANCE_ID=${a365.instanceId}`,
+      `AGENT365_AGENT_URL=${agentUrl}`);
+    if (a365.agentUserId) block.push(`AGENT365_AGENT_USER_ID=${a365.agentUserId}`);
   }
   const how = writeEnvBlock(envPath, block);
   record(`.env block ${how} at ${envPath}`);
@@ -467,13 +569,18 @@ async function main(work) {
     const setupPath = join(envPath.replace(/[^/\\]*$/, ""), "AGENT365_SETUP.md");
     try { writeFileSync(setupPath, checklist); ok(`Agent 365 completion steps written to ${setupPath}`); }
     catch { /* non-fatal */ }
-    console.log(`\n${C.b}${C.y}Agent 365 still needs these MANUAL admin steps (the wizard can't do them):${C.reset}`);
-    console.log(`  1. Create the manifest:  a365 publish --aiteammate --agent-name "${agentName || purviewAppName}"`);
-    console.log(`  2. Upload it: M365 admin center -> Integrated apps -> Upload custom apps (needs admin + Frontier)`);
-    console.log(`  3. Create the agent instance; note its live instance id`);
-    console.log(`  4. Assign the Agent 365 Frontier license to the agent's owner`);
-    console.log(`  5. Wire observability in code (Node/.NET) — see AGENT365_SETUP.md`);
-    console.log(`  6. Verify in admin center -> your agent -> Activity tab\n`);
+    if (a365) {
+      console.log(`\n${C.g}${C.b}Agent 365 registration complete.${C.reset}`);
+      console.log(`  blueprint : ${a365.blueprintId}`);
+      console.log(`  instance  : ${a365.instanceId}`);
+      console.log(`  endpoint  : ${agentUrl}`);
+      console.log(`\n${C.b}${C.y}Two things the wizard still can't do:${C.reset}`);
+      console.log(`  1. Grant admin consent for the blueprint's Graph permissions (Entra -> the blueprint -> API permissions)`);
+      console.log(`  2. Assign the Agent 365 licence to the agent user, if your tenant requires one`);
+      console.log(`\n  Then verify: M365 admin center -> Agents -> All agents -> "${agentName}"\n`);
+    } else {
+      console.log(`\n${C.b}${C.y}Agent 365 was NOT registered.${C.reset} To do it by hand, see AGENT365_SETUP.md\n`);
+    }
     console.log(`  ${C.d}Full details: AGENT365_SETUP.md${C.reset}`);
   }
 }
@@ -515,33 +622,48 @@ export function agent365Checklist({ agentName, lang, blueprintId }) {
     : "Wire observability with initObservability() + refreshTurnObservability() + withAgentScope() (see the package README).";
   return `# Completing Agent 365 setup for "${agentName}"
 
-The wizard provisioned Purview. These admin steps finish the Agent 365 onboarding
-(only needed for Agent 365 identity + the admin-center Activity tab):
+The wizard now automates most of this through Microsoft Graph:
 
-1. Create the manifest:
-     dotnet tool install -g Microsoft.Agents.A365.DevTools.Cli
-     a365 publish --aiteammate --agent-name "${agentName}"
-   (or use the Microsoft 365 Agents Toolkit VS Code extension). Keep
-   description.short <= 80 chars.
+  POST /beta/agentIdentityBlueprints                 create the identity blueprint
+  POST /beta/agentIdentityBlueprints/{id}/addPassword mint its credential
+  POST /beta/agentRegistry/agentInstances            register the agent + its card
+  GET  /beta/agentRegistry/agentInstances/{id}       verify the registration
 
-2. Upload the manifest (admin):
-     M365 admin center -> Integrated apps -> Upload custom apps -> manifest.zip
-   Requires a Global/Teams admin AND Agent 365 Frontier on the tenant.
+Those endpoints need the *Agent Registry Administrator* and *Agent ID
+Administrator* roles, and the AgentInstance.ReadWrite.All permission. They are
+/beta endpoints, which Microsoft labels subject to change.
 
-3. Create the agent instance and note its LIVE INSTANCE ID (observability
-   authorizes by the instance id, not the blueprint id${blueprintId ? ` ${blueprintId}` : ""}).
+## What still needs a human
 
-4. Assign the Agent 365 Frontier license to the agent's owner/user.
-   (Upload + instance creation fail without it.)
+1. **Admin consent** for the blueprint's Graph permissions:
+     Entra admin center -> Applications -> ${blueprintId || "your blueprint"} -> API permissions -> Grant admin consent.
+   Note that some high-risk Graph permissions are blocked for agent identities
+   and will be rejected with HTTP 400.
 
-5. Wire observability in code. ${obsNote}
-   The OBO token is minted per AUTHENTICATED turn — only Teams/Copilot turns
+2. **Licensing.** Viewing the agent inventory needs only the AI Reader role, but
+   applying identity governance or Conditional Access to agents requires
+   Microsoft Entra Agent ID licensing.
+
+3. **Wire observability in code.** ${obsNote}
+   The OBO token is minted per AUTHENTICATED turn, so only Teams/Copilot turns
    appear in the Activity tab. Off-channel surfaces are governed by Purview but
    won't show there.
 
-6. Verify: message the agent in Teams, then check
-     admin center -> your agent -> Activity tab.
-   Multiple instances each have their own Activity tab — consolidate to one.
+4. **Publishing to Teams** (optional, and separate from registry registration):
+     a365 publish --aiteammate --agent-name "${agentName}"
+     M365 admin center -> Integrated apps -> Upload custom apps
+   Keep description.short <= 80 chars.
+
+## Migration note
+
+The legacy Entra agent registry API retired on 15 June 2026. Agents registered
+before that date must be re-registered through the endpoints above or they stop
+working. Re-run this wizard to do that.
+
+## Verify
+
+  M365 admin center -> Agents -> All agents -> "${agentName}"
+  (needs the AI Reader role at minimum)
 `;
 }
 
