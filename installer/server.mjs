@@ -9,7 +9,7 @@
  */
 import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync, mkdtempSync, rmSync, existsSync, readdirSync, statSync, mkdirSync, createWriteStream, chmodSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, mkdtempSync, rmSync, existsSync, readdirSync, statSync, mkdirSync, createWriteStream, chmodSync } from "node:fs";
 import { tmpdir, homedir, arch } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -241,10 +241,22 @@ const server = createServer(async (req, res) => {
       stdio: ["ignore", "pipe", "pipe"],
     });
 
-    const run = { child, buffer: [], done: false, code: null, answersPath };
+    // Keep a copy of every run on disk: a failure seen only in the browser tab
+    // is gone when the tab is; a file under ~/.agent365/logs can be sent along.
+    const logDir = join(homedir(), ".agent365", "logs");
+    let logFile = "";
+    try {
+      mkdirSync(logDir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const name = String(payload.answers?.agentName ?? "agent").replace(/[^\w-]+/g, "_").slice(0, 40);
+      logFile = join(logDir, `${stamp}-${name}${payload.dryRun ? "-dryrun" : ""}.log`);
+      writeFileSync(logFile, "", { mode: 0o600 });
+    } catch { logFile = ""; }
+    const run = { child, buffer: [], done: false, code: null, answersPath, logFile };
     runs.set(id, run);
     const push = (chunk) => {
       for (const line of String(chunk).split(/\r?\n/)) run.buffer.push(line);
+      if (logFile) { try { appendFileSync(logFile, String(chunk)); } catch { /* best effort */ } }
     };
     child.stdout.on("data", push);
     child.stderr.on("data", push);
@@ -254,7 +266,7 @@ const server = createServer(async (req, res) => {
       // The answers file holds the operator's inputs; don't leave it around.
       try { rmSync(answersPath, { force: true }); } catch { /* best effort */ }
     });
-    return json(res, 200, { id });
+    return json(res, 200, { id, logFile });
   }
 
   if (req.method === "GET" && url.pathname === "/api/log") {

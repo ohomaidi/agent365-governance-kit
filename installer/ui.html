@@ -506,7 +506,7 @@ async function run(dryRun) {
   $("log").hidden = false; $("log").textContent = "";
   $("status").textContent = dryRun ? "Rehearsing…" : "Provisioning…";
 
-  const { id } = await (await fetch("/api/run", {
+  const { id, logFile } = await (await fetch("/api/run", {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ answers: a, dryRun }),
   })).json();
@@ -526,7 +526,7 @@ async function run(dryRun) {
 
     if (code === 0) {
       $("errBox").hidden = true;
-      $("status").textContent = dryRun ? "Rehearsal complete — nothing was changed." : "Done.";
+      $("status").textContent = (dryRun ? "Rehearsal complete — nothing was changed." : "Done.") + (logFile ? ` Log: ${logFile}` : "");
       return;
     }
 
@@ -541,6 +541,7 @@ async function run(dryRun) {
       : lines.slice(jStart + 1).filter((l) => /^\s*\u2022 /.test(l));
 
     let html = `<strong>${fatal ? fatal.replace(/^\s*\u2717\s*/, "") : `Setup stopped (exit ${code}).`}</strong>`;
+    if (logFile) html += `<div class="hint" style="margin-top:.3rem">Full log saved to <code>${logFile}</code></div>`;
     const hint = fatal && HINTS.find(([re]) => re.test(fatal));
     if (hint) html += `<div style="margin-top:.45rem">${hint[1]}</div>`;
     if (warns.length) html += `<div style="margin-top:.5rem" class="hint">${warns.map(w => w.replace(/^\s*!\s*/, "")).join("<br>")}</div>`;

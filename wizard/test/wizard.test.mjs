@@ -4,7 +4,7 @@
  */
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -358,5 +358,44 @@ describe("connector role propagation", () => {
       const r = await waitForConnectorRoles({ tenantId: "t", clientId: "c", clientSecret: "s", required: ["AgentRegistration.ReadWrite.All"], fetchImpl, maxMs: 50 });
       assert.equal(r.ok, false); assert.deepEqual(r.missing, ["AgentRegistration.ReadWrite.All"]);
     } finally { global.setTimeout = orig; }
+  });
+});
+
+describe("guard wiring — the customer never pastes code", () => {
+  const tmp = () => mkdtempSync(join(tmpdir(), "wire-"));
+  test("detects an agent that already calls the guard", async () => {
+    const { detectGuard } = await import("../lib/wire.mjs");
+    const d = tmp();
+    writeFileSync(join(d, "package.json"), JSON.stringify({ dependencies: { "@zaatarlabs/agent365-governance-kit": "file:x" } }));
+    mkdirSync(join(d, "src")); writeFileSync(join(d, "src", "agent.ts"), "const v = await guard.evaluate(text, 'uploadText');");
+    assert.deepEqual(detectGuard(d, "typescript"), { wired: true, how: "calls" });
+    const e = tmp(); writeFileSync(join(e, "package.json"), JSON.stringify({ dependencies: {} }));
+    assert.equal(detectGuard(e, "typescript").wired, false);
+    const p = tmp(); writeFileSync(join(p, "requirements.txt"), "agent365-governance-kit\n");
+    assert.equal(detectGuard(p, "python").wired, true);
+  });
+  test("wires a Node agent: installs from the tarball, writes the preload, prefixes the start script", async () => {
+    const { wireNodeGuard } = await import("../lib/wire.mjs");
+    const d = tmp();
+    writeFileSync(join(d, "package.json"), JSON.stringify({ name: "a", main: "dist/index.js", scripts: { start: "node dist/index.js" }, dependencies: {} }));
+    const tgz = join(d, "..", "zaatarlabs-agent365-governance-kit-0.2.0.tgz"); writeFileSync(tgz, "tgz");
+    const calls = [];
+    const run = (cmd, args, opts) => { calls.push([cmd, ...args]); return ""; };
+    const w = wireNodeGuard({ agentDir: d, tarball: tgz, run });
+    assert.deepEqual(calls[0].slice(0, 2), ["npm", "install"]);
+    assert.ok(existsSync(join(d, "agent365-guard.preload.mjs")));
+    assert.equal(JSON.parse(readFileSync(join(d, "package.json"), "utf8")).scripts.start, "node --import ./agent365-guard.preload.mjs dist/index.js");
+    assert.equal(w.warnings.length, 0);
+    // idempotent
+    const w2 = wireNodeGuard({ agentDir: d, tarball: tgz, run });
+    assert.ok(w2.steps.some((s) => /already loads/.test(s)));
+  });
+  test("a non-node start script is reported, not mangled", async () => {
+    const { wireNodeGuard } = await import("../lib/wire.mjs");
+    const d = tmp();
+    writeFileSync(join(d, "package.json"), JSON.stringify({ scripts: { start: "tsx src/index.ts" }, dependencies: { "@zaatarlabs/agent365-governance-kit": "x" } }));
+    const w = wireNodeGuard({ agentDir: d, tarball: "", run: () => "" });
+    assert.equal(JSON.parse(readFileSync(join(d, "package.json"), "utf8")).scripts.start, "tsx src/index.ts");
+    assert.match(w.warnings[0], /--import/);
   });
 });

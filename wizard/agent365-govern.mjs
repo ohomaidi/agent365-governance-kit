@@ -38,6 +38,7 @@ import { probeTenant } from "./lib/capabilities.mjs";
 import { TokenCache, startDeviceCode, pollDeviceCode, makeDelegatedGraph, makeDevPortal, makeAgent365Service, ensureAgent365ServiceConsent, CLIENTS, GRAPH_SCOPE_STRING } from "./lib/auth.mjs";
 import { buildTeamsPackage, publishToOrgCatalog, installForUsers, registerMessagingEndpoint, proactiveHello,
          registerAgent365Endpoint, ensureAgentUser, assignAgentLicence } from "./lib/teams.mjs";
+import { detectGuard, findKitTarball, wireNodeGuard } from "./lib/wire.mjs";
 
 // --- Microsoft constants (stable GUIDs) ---
 const GRAPH_APP = "00000003-0000-0000-c000-000000000000";
@@ -498,6 +499,19 @@ async function main(work) {
     proxyPort = await ask("  Port the proxy listens on:", "8787", "proxyPort");
   }
 
+  // --- guard wiring: never hand the customer code to paste ---
+  const agentDir = envPath.replace(/[^/\\]*$/, "") || process.cwd();
+  const guardState = detectGuard(agentDir, lang);
+  let wantAutoWire = false;
+  if (lang === "typescript" && !guardState.wired) {
+    console.log(`\n${C.b}Purview guard in the agent${C.reset}`);
+    console.log(`  ${C.d}This Node agent does not call the guard yet. The wizard can wire it in itself: install the kit package,`);
+    console.log(`  add a preload that checks every Teams message and reply, and update the start script. No source edits.${C.reset}`);
+    wantAutoWire = await yes("  Wire the Purview guard into this agent automatically?", true, "wantAutoWire");
+  } else if (guardState.wired && lang !== "proxy") {
+    ok(`Purview guard already wired into this agent (${guardState.how}) — nothing to add.`);
+  }
+
   // --- Microsoft Purview: the DLP / DSPM half. Off = the connector app is still
   // created (Agent 365 registers through it) but no policy, no cert, no
   // Compliance Administrator, and the guard is written disabled. ---
@@ -657,6 +671,7 @@ async function main(work) {
     plan(`create the app registration, secret${wantPurview ? ", certificate" : ""} and role assignments`);
     if (wantPurview) plan(`create DLP policy in ${dlpMode} mode scoped to ${scopeLabel}`);
     plan(`write ${envPath}`);
+    if (wantAutoWire) plan("install the kit into the agent, write agent365-guard.preload.mjs, and update its start script (automatic guard)");
     if (wantPurview) plan("validate with token → protectionScopes/compute → processContent");
     // Render the closing output now (nothing is written) so a rehearsal
     // exercises the same reporting code a real run finishes with.
@@ -1112,10 +1127,28 @@ async function main(work) {
       : `\n${C.y}Purview was not provisioned (your choice).${C.reset} The guard is written disabled; re-run with Purview on to enable it.`);
   } else if (lang === "proxy") {
     console.log(`\n${C.g}${C.b}Purview governance is set up.${C.reset} Nothing to change in the vendor's agent — run the proxy next to this .env:\n`);
+    console.log(C.d + integrationSnippet(lang, { envPath, upstreamUrl, proxyPort, agentUrl }) + C.reset);
+  } else if (guardState.wired) {
+    console.log(`\n${C.g}${C.b}Purview governance is set up.${C.reset} The agent already calls the guard (${guardState.how}); nothing to add.`);
+  } else if (wantAutoWire) {
+    try {
+      const kitRoot = fileURLToPath(new URL("..", import.meta.url));
+      const tarball = findKitTarball(kitRoot);
+      const w = wireNodeGuard({ agentDir, tarball });
+      console.log(`\n${C.g}${C.b}Purview governance is set up and wired into the agent automatically.${C.reset}`);
+      for (const st of w.steps) ok(`  ${st}`);
+      for (const wn of w.warnings) warn(`  ${wn}`);
+      record(`guard preload + start script in ${agentDir} (remove agent365-guard.preload.mjs and the --import flag to undo)`);
+    } catch (e) {
+      warn(`Automatic wiring failed: ${String(e.message || e).slice(0, 300)}`);
+      warn("  Front the agent with the governance proxy instead (choose \"third-party agent\" in the installer), or add the two guard calls:");
+      console.log(C.d + integrationSnippet(lang, { envPath, upstreamUrl, proxyPort, agentUrl }) + C.reset);
+    }
   } else {
-    console.log(`\n${C.g}${C.b}Purview governance is set up.${C.reset} Add these two calls to your agent:\n`);
+    console.log(`\n${C.g}${C.b}Purview governance is set up.${C.reset} ${lang === "typescript" ? "Automatic wiring was declined." : "Automatic wiring exists for Node agents only."}`);
+    console.log(`  Either front this agent with the governance proxy (no code), or add these two calls:\n`);
+    console.log(C.d + integrationSnippet(lang, { envPath, upstreamUrl, proxyPort, agentUrl }) + C.reset);
   }
-  console.log(C.d + integrationSnippet(lang, { envPath, upstreamUrl, proxyPort, agentUrl }) + C.reset);
   console.log(`\n  ${C.y}Note:${C.reset} DLP policies take up to ~1h to propagate before they take effect.`);
   if (dlpMode !== "Enable") {
     console.log(`  ${C.y}Note:${C.reset} the policy is in ${C.b}${dlpMode}${C.reset} — it audits but ${C.b}does not block${C.reset}.`);

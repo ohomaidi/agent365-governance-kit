@@ -9,8 +9,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$ROOT/dist-installer"
 rm -rf "$OUT"; mkdir -p "$OUT"
 
+# The kit's Node package, as a tarball the wizard can install into a customer's
+# agent without network access to a registry (zero-code guard wiring).
+( cd "$ROOT/packages/typescript" && npm run build --silent >/dev/null 2>&1 && npm pack --silent --pack-destination "$OUT" >/dev/null )
+KIT_TGZ="$(ls "$OUT"/zaatarlabs-agent365-governance-kit-*.tgz | head -1)"
+
 stage() {                    # $1 = staging dir
-  mkdir -p "$1/kit/installer" "$1/kit/wizard/lib"
+  mkdir -p "$1/kit/installer" "$1/kit/wizard/lib" "$1/kit/packages"
+  cp "$KIT_TGZ"                                                    "$1/kit/packages/"
   cp "$ROOT/installer/server.mjs" "$ROOT/installer/ui.html"        "$1/kit/installer/"
   cp "$ROOT/wizard/agent365-govern.mjs"                            "$1/kit/wizard/"
   cp "$ROOT/wizard/lib/agent365.mjs" "$ROOT/wizard/lib/capabilities.mjs" \
