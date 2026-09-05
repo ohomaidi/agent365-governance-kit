@@ -41,6 +41,10 @@ import { buildTeamsPackage, publishToOrgCatalog, installForUsers, registerMessag
 import { detectGuard, findKitTarball, wireNodeGuard } from "./lib/wire.mjs";
 import { detectRunner } from "./lib/restart.mjs";
 import { findProxyTarballs, scaffoldProxy, startProxy } from "./lib/proxy.mjs";
+import { makeArm, makeKeyVault, ARM_SCOPE } from "./lib/auth.mjs";
+import { linesToSettings, listSubscriptions, listWebApps, listContainerApps, getAppSettings, setAppSettings, restartWebApp,
+         ensureWebAppIdentity, setContainerAppEnv, storeSecretsInKeyVault, grantKeyVaultSecretsUser, findKeyVault,
+         ensureProxyWebApp, waitForEndpoint } from "./lib/azure.mjs";
 
 // --- Microsoft constants (stable GUIDs) ---
 const GRAPH_APP = "00000003-0000-0000-c000-000000000000";
@@ -494,7 +498,12 @@ async function main(work) {
   const appRegName = await ask("App registration name for the Purview connector:", "Agent Purview Connector", "appRegName");
   const purviewAppName = await ask("App name to show in Purview audit/DSPM:", "Custom AI App", "purviewAppName");
   const attribUpn = await ask("User to attribute interactions to (UPN):", acct.user.name, "attribUpn");
-  const envPath = await ask("Path to your agent's .env to write:", join(process.cwd(), ".env"), "envPath");
+  console.log(`\n${C.b}Where does the agent run?${C.reset}`);
+  console.log(`  ${C.d}1) On this machine — settings are written to its .env`);
+  console.log(`  2) Azure App Service — settings become App Settings, then the app is restarted`);
+  console.log(`  3) Azure Container Apps — settings become the container's env (secrets as secrets); a new revision rolls${C.reset}`);
+  const hosting = { "1": "local", "2": "webapp", "3": "containerapp" }[await ask("Choose 1/2/3:", "1", "hosting")] ?? "local";
+  const envPath = hosting === "local" ? await ask("Path to your agent's .env to write:", join(process.cwd(), ".env"), "envPath") : join(process.cwd(), ".env");
   const lang = (await ask("Your agent's language (typescript / python / dotnet / proxy = a third-party agent fronted by the governance proxy):", "typescript", "lang")).toLowerCase();
   // A third-party agent you cannot modify: the proxy IS the agent as far as
   // Purview, Agent 365 and Teams are concerned. Its .env gets the same block
@@ -510,12 +519,44 @@ async function main(work) {
     upstreamDialect = (await ask("  Its wire format (a2a / openai / generic / auto):", "auto", "upstreamDialect")).toLowerCase();
     upstreamPath = await ask("  Path of its chat endpoint (what a Teams turn is posted to):", upstreamDialect === "openai" ? "/v1/chat/completions" : "/", "upstreamPath");
     proxyPort = await ask("  Port the proxy listens on:", "8787", "proxyPort");
-    wantProxyStart = await yes("  Install and start the proxy on this machine when done?", true, "wantProxyStart");
+    wantProxyStart = hosting === "local" ? await yes("  Install and start the proxy on this machine when done?", true, "wantProxyStart") : false;
+  }
+
+  // --- Azure details (App Service / Container Apps) ---
+  let arm = null, azureApp = null, azureSubscription = "", azureKeyVault = "", azureProxy = null;
+  if (hosting !== "local") {
+    if (!cache.signedIn(CLIENTS.azurePowerShell)) {
+      if (ANSWERS) die("Azure hosting needs the Azure sign-in (the installer's optional third sign-in).");
+      const dc = await startDeviceCode({ tenant: account.tenantId, clientId: CLIENTS.azurePowerShell, scope: ARM_SCOPE });
+      console.log(`\n  ${C.b}Azure sign-in:${C.reset} open ${dc.verificationUri} and enter ${C.c}${C.b}${dc.userCode}${C.reset}\n`);
+      cache.addSignIn(CLIENTS.azurePowerShell, await pollDeviceCode({ tenant: account.tenantId, clientId: CLIENTS.azurePowerShell, deviceCode: dc.deviceCode, interval: dc.interval, expiresIn: dc.expiresIn }), ARM_SCOPE);
+    }
+    arm = makeArm(cache);
+    const subs = await listSubscriptions(arm);
+    if (!subs.length) die("The Azure sign-in sees no enabled subscriptions.");
+    azureSubscription = await ask(`  Subscription id (${subs.map((x) => `${x.name}=${x.id}`).join("; ")}):`, subs[0].id, "azureSubscription");
+    if (lang === "proxy") {
+      azureProxy = {
+        resourceGroup: await ask("  Resource group for the proxy (created if missing):", "rg-agent365-governance", "azureResourceGroup"),
+        location: await ask("  Azure region:", "westeurope", "azureLocation"),
+        name: await ask("  App Service name for the proxy (globally unique):", slugify(`${purviewAppName}-proxy`), "azureAppName"),
+      };
+      azureProxy.planName = await ask("  App Service plan name:", `${azureProxy.name}-plan`, "azurePlanName");
+    } else {
+      const apps = hosting === "webapp" ? await listWebApps(arm, azureSubscription) : await listContainerApps(arm, azureSubscription);
+      if (!apps.length) die(`No ${hosting === "webapp" ? "App Service apps" : "Container Apps"} in subscription ${azureSubscription}.`);
+      const pick = await ask(`  The agent's app (${apps.map((x) => x.name).join(", ")}) — name or resource id:`, apps[0].name, "azureApp");
+      azureApp = apps.find((x) => x.id === pick || x.name.toLowerCase() === pick.toLowerCase()) ?? null;
+      if (!azureApp) die(`App "${pick}" not found in subscription ${azureSubscription}.`);
+      ok(`Target: ${hosting === "webapp" ? "App Service" : "Container App"} ${azureApp.name} (${azureApp.resourceGroup}, ${azureApp.location}) — https://${azureApp.host}`);
+    }
+    if (hosting === "webapp") azureKeyVault = await ask("  Key Vault name for the secrets (blank = App Settings):", "", "azureKeyVault");
   }
 
   // --- guard wiring: never hand the customer code to paste ---
   const agentDir = envPath.replace(/[^/\\]*$/, "") || process.cwd();
-  const guardState = detectGuard(agentDir, lang);
+  const guardState = hosting === "local" ? detectGuard(agentDir, lang)
+    : (lang === "proxy" ? { wired: true, how: "proxy" } : { wired: true, how: "assumed for an Azure-hosted agent (the kit cannot inspect deployed code); if it does not call the guard, front it with the proxy" });
   let wantAutoWire = false;
   if (lang === "typescript" && !guardState.wired) {
     console.log(`\n${C.b}Purview guard in the agent${C.reset}`);
@@ -619,7 +660,8 @@ async function main(work) {
   let wantConsent = false, wantObservability = false, teamsPublish = false, teamsInstall = false, teamsEndpoint = false, teamsHello = false, teamsMode = "teammate", wantLicence = true;
   if (wantAgent365) {
     agentName = await ask("  Agent display name:", purviewAppName, "agentName");
-    agentUrl = await ask("  Agent endpoint URL (https):", "", "agentUrl");
+    const urlDefault = azureApp?.host ? `https://${azureApp.host}` : (azureProxy ? `https://${azureProxy.name}.azurewebsites.net` : "");
+    agentUrl = await ask("  Agent endpoint URL (https):", urlDefault, "agentUrl");
     while (wantAgent365 && !/^https:\/\//i.test(agentUrl)) {
       warn("  An https endpoint is required to register an agent instance.");
       agentUrl = await ask("  Agent endpoint URL (https):", "", "agentUrl");
@@ -651,8 +693,8 @@ async function main(work) {
   [["App registration name", appRegName], ["Purview app name", purviewAppName], ["Agent name", agentName]]
     .forEach(([n, v]) => assertEnvSafe(n, v));
 
-  const runner = lang === "proxy" ? { kind: "", detail: "" } : detectRunner(agentDir);
-  const wantRestart = lang === "proxy" ? false : await yes(
+  const runner = (lang === "proxy" || hosting !== "local") ? { kind: "", detail: "" } : detectRunner(agentDir);
+  const wantRestart = (lang === "proxy" || hosting !== "local") ? false : await yes(
     runner.kind
       ? `\nRestart the agent when done? (found ${runner.detail})`
       : "\nRestart the agent when done? (no running process, pm2, launchd or systemd unit found for that folder — it will be reported instead)", true, "wantRestart");
@@ -671,7 +713,11 @@ async function main(work) {
   } else {
   console.log(`  • Purview: ${C.y}not provisioned${C.reset} (guard written disabled)`);
   }
-  console.log(`  • Write ${envPath}${existsSync(envPath) ? `  ${C.d}(backup → ${envPath}.bak)${C.reset}` : ""}`);
+  const settingsTarget = hosting === "local" ? envPath
+    : (azureProxy ? `App Settings on a new App Service "${azureProxy.name}" (${azureProxy.resourceGroup}, ${azureProxy.location}) running the proxy image`
+      : hosting === "webapp" ? `App Settings on App Service ${azureApp?.name}${azureKeyVault ? ` (secrets in Key Vault ${azureKeyVault})` : ""}, then restart`
+      : `env of Container App ${azureApp?.name} (secrets as secrets), new revision`);
+  console.log(`  • Write ${settingsTarget}${hosting === "local" && existsSync(envPath) ? `  ${C.d}(backup → ${envPath}.bak)${C.reset}` : ""}`);
   console.log(`  • Post-provision revoke of admin privileges: ${revokeAfter ? "yes" : `${C.y}no — connector keeps Compliance Administrator${C.reset}`}`);
   if (wantAgent365) {
     console.log(`  • Agent 365: ${existingBlueprintId ? `reuse blueprint ${existingBlueprintId}` : "create identity blueprint + secret"}`);
@@ -689,7 +735,7 @@ async function main(work) {
     if (pilotPlan) plan(`create pilot group "${pilotPlan.displayName}" with ${pilotPlan.memberIds.length} member(s) and scope the DLP policy to it`);
     plan(`create the app registration, secret${wantPurview ? ", certificate" : ""} and role assignments`);
     if (wantPurview) plan(`create DLP policy in ${dlpMode} mode scoped to ${scopeLabel}`);
-    plan(`write ${envPath}`);
+    plan(`write ${settingsTarget}`);
     if (wantAutoWire) plan("install the kit into the agent, write agent365-guard.preload.mjs, and update its start script (automatic guard)");
     if (wantPurview) plan("validate with token → protectionScopes/compute → processContent");
     // Render the closing output now (nothing is written) so a rehearsal
@@ -999,10 +1045,12 @@ async function main(work) {
   }
 
   // ---- 5. write .env ----
-  info(`Writing ${envPath}…`);
+  info(`Writing ${settingsTarget}…`);
   // Lines a previous run wrote inside the managed block, so a partial re-run
   // (Purview only, or Agent 365 only) never erases the other half.
-  const prevBlock = (() => {
+  const prevBlock = await (async () => {
+    if (hosting === "webapp" && azureApp) { try { return Object.entries(await getAppSettings(arm, azureApp)).map(([k, v]) => `${k}=${v}`); } catch { return []; } }
+    if (hosting !== "local") return [];
     if (!existsSync(envPath)) return [];
     const prev = readFileSync(envPath, "utf8").split("\n");
     const i = prev.indexOf(BEGIN), j = prev.indexOf(END);
@@ -1078,10 +1126,51 @@ async function main(work) {
       `GOVERNANCE_UPSTREAM_PATH=${upstreamPath || "/"}`,
       `GOVERNANCE_PROXY_PORT=${proxyPort}`);
   }
-  try { const dir = envPath.replace(/[^/\\]*$/, ""); if (dir && !existsSync(dir)) mkdirSync(dir, { recursive: true }); } catch { /* writeEnvBlock reports */ }
-  const how = writeEnvBlock(envPath, block);
-  record(`.env block ${how} at ${envPath}`);
-  ok(`.env ${how} (${envPath})`);
+  let how = "";
+  if (hosting === "local") {
+    try { const dir = envPath.replace(/[^/\\]*$/, ""); if (dir && !existsSync(dir)) mkdirSync(dir, { recursive: true }); } catch { /* writeEnvBlock reports */ }
+    how = writeEnvBlock(envPath, block);
+    record(`.env block ${how} at ${envPath}`);
+    ok(`.env ${how} (${envPath})`);
+  } else {
+    // Azure: the same keys, as App Settings / container env. Existing settings are kept.
+    let settings = linesToSettings(block);
+    if (lang === "proxy" && azureProxy) {
+      info(`Deploying the governance proxy to App Service ${azureProxy.name}…`);
+      const px = await ensureProxyWebApp(arm, { subscriptionId: azureSubscription, ...azureProxy, settings });
+      azureApp = { kind: "webapp", id: px.id, name: px.name, resourceGroup: px.resourceGroup, host: px.host };
+      ok(`  proxy App Service ${px.created ? "created" : "updated"}: https://${px.host} (image ${"ghcr.io/ohomaidi/agent365-governance-proxy"})`);
+      record(`App Service ${px.name} in ${px.resourceGroup} (${azureSubscription}) — delete the resource group to undo`);
+      how = "written as App Settings on the proxy";
+    } else if (hosting === "webapp") {
+      if (azureKeyVault) {
+        const vault = await findKeyVault(arm, azureSubscription, azureKeyVault);
+        if (!vault) die(`Key Vault "${azureKeyVault}" not found in subscription ${azureSubscription}.`);
+        const kv = makeKeyVault(cache, azureKeyVault);
+        const refs = await storeSecretsInKeyVault(kv, settings, slugify(purviewAppName));
+        const principalId = await ensureWebAppIdentity(arm, azureApp);
+        const g = await grantKeyVaultSecretsUser(arm, vault.id, principalId);
+        ok(`  ${Object.keys(refs).length} secret(s) stored in Key Vault ${azureKeyVault}; app identity ${principalId} ${g} Key Vault Secrets User`);
+        settings = { ...settings, ...refs };
+      }
+      const keys = await setAppSettings(arm, azureApp, settings);
+      ok(`  ${keys.length} App Settings written on ${azureApp.name} (existing settings kept)`);
+      record(`App Settings on ${azureApp.name}: ${keys.join(", ")}`);
+      ok(`  ${await restartWebApp(arm, azureApp)}`);
+      how = "written as App Settings";
+    } else {
+      const keys = await setContainerAppEnv(arm, azureApp, settings);
+      ok(`  ${keys.length} env value(s) set on container app ${azureApp.name} (secrets as secrets); a new revision is rolling`);
+      record(`Container App env on ${azureApp.name}: ${keys.join(", ")}`);
+      how = "written to the container app";
+    }
+    if (messagingEndpoint) {
+      info(`Waiting for ${messagingEndpoint} to come back and demand a token…`);
+      const ep = await waitForEndpoint(messagingEndpoint);
+      if (ep.ok) ok(`  endpoint answers HTTP ${ep.status} (authentication required) after ${ep.attempts} check(s)`);
+      else warn(`  endpoint did not come back as expected (last HTTP ${ep.status}); check the app's logs`);
+    }
+  }
 
   // ---- 6. validate: token → computeScopes → processContent ----
   if (wantPurview) {
@@ -1152,7 +1241,9 @@ async function main(work) {
       : `\n${C.y}Purview was not provisioned (your choice).${C.reset} The guard is written disabled; re-run with Purview on to enable it.`);
   } else if (lang === "proxy") {
     console.log(`\n${C.g}${C.b}Purview governance is set up.${C.reset} Nothing changes in the vendor's agent; the proxy is the governed endpoint.`);
-    if (wantProxyStart) {
+    if (hosting !== "local") {
+      console.log(`  ${C.g}Proxy running in Azure at ${agentUrl}${C.reset} — the vendor API stays where it is; Teams and Agent 365 talk to the proxy.`);
+    } else if (wantProxyStart) {
       try {
         const kitRoot = fileURLToPath(new URL("..", import.meta.url));
         const already = existsSync(join(agentDir, "node_modules", "@zaatarlabs", "agent365-governance-proxy"));

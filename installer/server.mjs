@@ -17,7 +17,8 @@ import { randomUUID } from "node:crypto";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import { probeTenant } from "../wizard/lib/capabilities.mjs";
-import { TokenCache, startDeviceCode, pollDeviceCode, makeDelegatedGraph, CLIENTS, GRAPH_SCOPE_STRING, DEVPORTAL_SCOPE } from "../wizard/lib/auth.mjs";
+import { TokenCache, startDeviceCode, pollDeviceCode, makeDelegatedGraph, makeArm, CLIENTS, GRAPH_SCOPE_STRING, DEVPORTAL_SCOPE, ARM_SCOPE } from "../wizard/lib/auth.mjs";
+import { listSubscriptions, listWebApps, listContainerApps } from "../wizard/lib/azure.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..");
@@ -38,6 +39,8 @@ const SIGNINS = [
     label: "Microsoft 365 (Entra, Purview, Teams app catalog)", consent: "Tick \u201cConsent on behalf of your organization\u201d." },
   { key: "devportal", clientId: CLIENTS.teamsToolkit, scope: DEVPORTAL_SCOPE, optional: true,
     label: "Teams Developer Portal (only for the classic app/bot option)", consent: "" },
+  { key: "azure", clientId: CLIENTS.azurePowerShell, scope: ARM_SCOPE, optional: true,
+    label: "Azure (only for agents hosted in App Service or Container Apps)", consent: "" },
 ];
 const signinState = () => SIGNINS.map((s) => ({ key: s.key, label: s.label, consent: s.consent, optional: Boolean(s.optional), done: cache.signedIn(s.clientId) }));
 
@@ -172,6 +175,21 @@ const server = createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/api/tenant") {
     try { return json(res, 200, await probeTenant(makeDelegatedGraph(cache), cache.account(CLIENTS.graphCli))); }
     catch (e) { return json(res, 500, { error: String(e.message) }); }
+  }
+
+  // Azure discovery for agents hosted there (needs the optional Azure sign-in).
+  if (req.method === "GET" && url.pathname.startsWith("/api/azure/")) {
+    if (!cache.signedIn(CLIENTS.azurePowerShell)) return json(res, 401, { error: "Sign in to Azure first (the optional Azure sign-in)." });
+    const arm = makeArm(cache);
+    try {
+      if (url.pathname === "/api/azure/subscriptions") return json(res, 200, { subscriptions: await listSubscriptions(arm) });
+      if (url.pathname === "/api/azure/apps") {
+        const sub = url.searchParams.get("subscription") || "";
+        const [web, ca] = await Promise.all([listWebApps(arm, sub).catch(() => []), listContainerApps(arm, sub).catch(() => [])]);
+        return json(res, 200, { apps: [...web, ...ca] });
+      }
+    } catch (e) { return json(res, 500, { error: String(e.message) }); }
+    return json(res, 404, { error: "unknown" });
   }
 
   // Download a portable PowerShell 7 into the user's profile. Streamed so the

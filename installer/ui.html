@@ -86,7 +86,12 @@
     <div id="pfActions" class="actions" style="margin-top:.8rem" hidden>
       <button id="btnLogin" class="ghost" type="button">Sign in</button>
       <button id="btnLoginDev" class="ghost" type="button" hidden>Also sign in to the Teams Developer Portal (classic bot option only)</button>
+      <button id="btnLoginAzure" class="ghost" type="button" hidden>Also sign in to Azure (agents hosted in Azure)</button>
       <button id="btnRecheck" class="ghost" type="button">Re-check</button>
+    </div>
+    <div id="tenantBox" style="margin-top:.8rem" hidden>
+      <div class="hint" style="margin-bottom:.3rem">What this tenant can do</div>
+      <div id="tenant"></div>
     </div>
   </fieldset>
 
@@ -95,9 +100,26 @@
       <legend>2 · Your agent</legend>
       <div class="row"><label for="agentKind">What kind of agent?</label>
         <select id="agentKind">
-          <option value="own">One we built (the code is on this machine)</option>
+          <option value="own">One we built</option>
           <option value="proxy">A third-party or vendor agent we can't modify (front it with the governance proxy)</option>
         </select></div>
+      <div class="row"><label for="hosting">Where does it run?</label>
+        <select id="hosting">
+          <option value="1">On this machine (a folder here)</option>
+          <option value="2">Azure App Service</option>
+          <option value="3">Azure Container Apps</option>
+        </select>
+        <span class="hint">Azure needs the optional Azure sign-in in section 1. Settings are written as App Settings / container env, never as a file.</span></div>
+      <div id="azureFields" hidden>
+        <div class="row"><label for="azureSubscription">Subscription</label><select id="azureSubscription"><option value="">Sign in to Azure to list</option></select></div>
+        <div class="row" id="rowAzureApp"><label for="azureApp">The agent&rsquo;s app</label><select id="azureApp"><option value="">Pick a subscription first</option></select><span class="hint">Its https address becomes the agent&rsquo;s web address and messaging endpoint.</span></div>
+        <div id="azureProxyFields" hidden>
+          <div class="row"><label for="azureResourceGroup">Resource group for the proxy</label><input type="text" id="azureResourceGroup" placeholder="e.g. rg-agent365-governance"></div>
+          <div class="row"><label for="azureLocation">Region</label><input type="text" id="azureLocation" placeholder="e.g. westeurope"></div>
+          <div class="row"><label for="azureAppName">App Service name for the proxy</label><input type="text" id="azureAppName" placeholder="globally unique, e.g. contoso-hr-agent-proxy"><span class="hint">The proxy runs as the published container image at https://&lt;name&gt;.azurewebsites.net.</span></div>
+        </div>
+        <div class="row"><label for="azureKeyVault">Key Vault (optional)</label><input type="text" id="azureKeyVault" placeholder="vault name — secrets stored there and referenced"><span class="hint">Leave blank to store secrets as App Settings (Microsoft&rsquo;s baseline).</span></div>
+      </div>
       <div id="ownFields">
         <div class="row">
           <label for="agentDir">Where is your agent?</label>
@@ -271,6 +293,8 @@ async function preflight() {
     `<div class="tool"><span>${x.label}</span><span class="${x.done ? "ok" : (x.optional ? "" : "no")}">${x.done ? "signed in" : (x.optional ? "optional" : "needed")}</span></div>`).join("");
   const devportal = pf.signins.find(x => x.key === "devportal");
   $("btnLoginDev").hidden = !pf.signedIn || !devportal || devportal.done;
+  const az = pf.signins.find(x => x.key === "azure");
+  $("btnLoginAzure").hidden = !pf.signedIn || !az || az.done;
   $("pf").innerHTML = banner + rows;
   $("pwshBox").hidden = !needsPwsh;
   $("pfActions").hidden = false;
@@ -365,6 +389,13 @@ $("btnLogin").onclick = async () => {
   await preflight();
   if (pf && pf.account) tenantCheck();
 };
+$("btnLoginAzure").onclick = async () => {
+  $("btnLoginAzure").disabled = true;
+  const which = (pf?.signins ?? []).find(x => x.key === "azure");
+  if (which) { const st = await signIn(which); $("status").textContent = st.code === 0 ? "" : (st.error || "Sign-in didn't complete."); }
+  $("btnLoginAzure").disabled = false;
+  azureLoaded = false; await preflight(); if ($("hosting").value !== "1") loadAzure();
+};
 $("btnLoginDev").onclick = async () => {
   $("btnLoginDev").disabled = true;
   const which = (pf?.signins ?? []).find(x => x.key === "devportal");
@@ -409,11 +440,37 @@ async function detect() {
     $("agentName").value = detected.name.replace(/[-_]/g, " ").replace(/\b\w/g, c => c.toUpperCase());
   }
 }
-$("agentKind").onchange = (e) => {
-  const proxy = e.target.value === "proxy";
-  $("ownFields").hidden = proxy; $("proxyFields").hidden = !proxy;
+function refreshKindHosting() {
+  const proxy = $("agentKind").value === "proxy", azure = $("hosting").value !== "1";
+  $("ownFields").hidden = proxy || azure;
+  $("proxyFields").hidden = !proxy;
+  $("proxyDir").parentElement.hidden = azure;
+  $("wantProxyStart").parentElement.hidden = azure;
+  $("azureFields").hidden = !azure;
+  $("rowAzureApp").hidden = proxy;                 // a vendor agent has no app of ours to configure
+  $("azureProxyFields").hidden = !(proxy && azure);
   $("agentUrl").placeholder = proxy ? "https://agent-proxy.example.com — the proxy's public address" : "https://your-agent.example.com";
+  if (azure) loadAzure();
+}
+$("agentKind").onchange = refreshKindHosting;
+$("hosting").onchange = refreshKindHosting;
+let azureLoaded = false;
+async function loadAzure() {
+  if (azureLoaded) return;
+  const r = await (await fetch("/api/azure/subscriptions")).json();
+  if (r.error) { $("azureSubscription").innerHTML = `<option value="">${r.error}</option>`; return; }
+  azureLoaded = true;
+  $("azureSubscription").innerHTML = `<option value="">Choose…</option>` + r.subscriptions.map(s => `<option value="${s.id}">${s.name}</option>`).join("");
+}
+$("azureSubscription").onchange = async (e) => {
+  $("azureApp").innerHTML = `<option value="">Loading…</option>`;
+  const r = await (await fetch(`/api/azure/apps?subscription=${encodeURIComponent(e.target.value)}`)).json();
+  const want = $("hosting").value === "2" ? "webapp" : "containerapp";
+  const apps = (r.apps || []).filter(a => a.kind === want);
+  $("azureApp").innerHTML = `<option value="">Choose…</option>` + apps.map(a => `<option value="${a.id}" data-host="${a.host}">${a.name} (${a.resourceGroup}, ${a.location})</option>`).join("");
 };
+$("azureApp").onchange = (e) => { const host = e.target.selectedOptions[0]?.dataset.host; if (host && !$("agentUrl").value) $("agentUrl").value = `https://${host}`; };
+$("azureAppName").oninput = (e) => { if (e.target.value && $("agentKind").value === "proxy") $("agentUrl").value = `https://${e.target.value}.azurewebsites.net`; };
 $("agentDir").onchange = detect;
 $("agentDir").onblur = detect;
 $("agentName").oninput = (e) => { e.target.dataset.touched = "1"; };
@@ -435,6 +492,10 @@ function answers() {
     envPath: or("envPath", proxy ? proxyEnv : (detected?.envPath || "")),
     lang: proxy ? "proxy" : or("lang", detected?.language || "typescript"),
     upstreamUrl: $("upstreamUrl").value.trim().replace(/\/+$/, ""),
+    hosting: $("hosting").value,
+    azureSubscription: $("azureSubscription").value, azureApp: $("azureApp").value,
+    azureResourceGroup: $("azureResourceGroup").value.trim(), azureLocation: $("azureLocation").value.trim(), azureAppName: $("azureAppName").value.trim(),
+    azureKeyVault: $("azureKeyVault").value.trim(),
     upstreamDialect: $("upstreamDialect").value,
     upstreamPath: $("upstreamPath").value.trim() || ($("upstreamDialect").value === "openai" ? "/v1/chat/completions" : "/"),
     wantProxyStart: $("wantProxyStart").checked,
@@ -490,7 +551,13 @@ function validate(a) {
   if (!$("agentName").value.trim()) return "Give the agent a name.";
   if ($("agentKind").value === "proxy") {
     if (!/^https?:\/\//i.test(a.upstreamUrl)) return "Enter the vendor agent\u2019s API address (http:// or https://).";
-  } else if (!a.envPath) return "Point me at the agent\u2019s folder.";
+  } else if (a.hosting === "1" && !a.envPath) return "Point me at the agent\u2019s folder.";
+  if (a.hosting !== "1") {
+    if (!(pf?.signins ?? []).find(x => x.key === "azure")?.done) return "Sign in to Azure first (section 1).";
+    if (!a.azureSubscription) return "Choose the Azure subscription.";
+    if ($("agentKind").value !== "proxy" && !a.azureApp) return "Choose the agent\u2019s app in Azure.";
+    if ($("agentKind").value === "proxy" && (!a.azureResourceGroup || !a.azureLocation || !a.azureAppName)) return "Resource group, region and a name for the proxy app are needed.";
+  }
   if (!a.wantPurview && !a.wantAgent365) return "Nothing selected: turn on Purview, Agent 365, or both.";
   if (a.wantPurview && $("scopeChoice").value === "1" && !a.pilotGroup) return "Name the group, or choose \u201cJust me\u201d.";
   if (a.wantPurview && $("scopeChoice").value === "2" && !a.pilotUsers) return "List at least one person.";

@@ -18,14 +18,17 @@ to itself.
    Purview policies. If either is missing, the launcher or the page offers to
    download an official copy into your user folder (`~/.agent365`). Nothing
    system-wide is changed and no admin password is asked for.
-2. **Signs you in, twice, as a Global Administrator.** Both are short device-code
+2. **Signs you in as a Global Administrator** (once, plus two optional sign-ins). All are short device-code
    sign-ins: the page shows a code, opens Microsoft's sign-in page, and you type
    the code there. Your password never touches this tool.
    - Microsoft 365 — appears in your sign-in log as *Microsoft Graph Command
      Line Tools*. Tick **Consent on behalf of your organization** the first
      time; it is a one-time consent for the permissions the setup needs.
-   - Teams Developer Portal — appears as *Teams Toolkit*. This is what registers
-     the agent's messaging endpoint so Teams can reach it.
+   - Teams Developer Portal — appears as *Teams Toolkit*. Optional; only the
+     classic app/bot option uses it.
+   - Azure — appears as *Microsoft Azure PowerShell*. Optional; only for an
+     agent hosted in Azure App Service or Container Apps, where the settings
+     are written as App Settings / container env instead of a file.
 3. **Checks the tenant** — licences, Exchange Online, the Purview and Agent 365
    permissions, your roles — before anything is created.
 4. **Asks a few plain questions.** Which agent (a folder on this machine, or a

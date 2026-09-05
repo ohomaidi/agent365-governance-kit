@@ -291,3 +291,45 @@ export function makeAgent365Service(cache, { clientId = CLIENTS.graphCli } = {})
     throw last;
   };
 }
+
+/* ------------------------------------------------------------- Azure ---- */
+
+/**
+ * Azure Resource Manager and Key Vault, for agents hosted in Azure. The
+ * "Microsoft Azure PowerShell" public client is pre-authorised for both
+ * resources (it is what Connect-AzAccount uses), so no consent prompt beyond
+ * the sign-in itself. Delegated: the admin's own subscription rights apply.
+ */
+CLIENTS.azurePowerShell = "1950a258-227b-4e31-a9cf-717495945fc2";
+export const ARM_SCOPE = "https://management.azure.com/.default";
+export const KEYVAULT_SCOPE = "https://vault.azure.net/.default";
+export const ARM_BASE = "https://management.azure.com";
+
+/** ARM client: arm(method, pathWithApiVersion, body?) → parsed body on 2xx; throws with .status/.body. */
+export function makeArm(cache, { clientId = CLIENTS.azurePowerShell } = {}) {
+  return async function arm(method, path, body, headers = {}) {
+    const t = await cache.token(ARM_SCOPE, clientId);
+    const res = await fetchRetry(`${ARM_BASE}${path}`, {
+      method, headers: { authorization: `Bearer ${t}`, ...(body !== undefined ? { "content-type": "application/json" } : {}), ...headers },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const text = await res.text();
+    let parsed = null; try { parsed = text ? JSON.parse(text) : null; } catch { parsed = { raw: text }; }
+    if (res.ok) return parsed;
+    throw Object.assign(new Error(`${method} ${path.split("?")[0]} -> HTTP ${res.status}: ${(parsed?.error?.message ?? parsed?.message ?? text).slice(0, 300)}`), { status: res.status, body: parsed });
+  };
+}
+
+/** Key Vault data-plane client bound to one vault: kv(method, path, body?) with api-version added. */
+export function makeKeyVault(cache, vaultName, { clientId = CLIENTS.azurePowerShell } = {}) {
+  const base = `https://${vaultName}.vault.azure.net`;
+  return async function kv(method, path, body) {
+    const t = await cache.token(KEYVAULT_SCOPE, clientId);
+    const url = `${base}${path}${path.includes("?") ? "&" : "?"}api-version=7.4`;
+    const res = await fetchRetry(url, { method, headers: { authorization: `Bearer ${t}`, ...(body !== undefined ? { "content-type": "application/json" } : {}) }, body: body === undefined ? undefined : JSON.stringify(body) });
+    const text = await res.text();
+    let parsed = null; try { parsed = text ? JSON.parse(text) : null; } catch { parsed = { raw: text }; }
+    if (res.ok) return parsed;
+    throw Object.assign(new Error(`${method} ${vaultName}${path} -> HTTP ${res.status}: ${(parsed?.error?.message ?? text).slice(0, 300)}`), { status: res.status, body: parsed });
+  };
+}

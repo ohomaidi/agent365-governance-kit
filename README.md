@@ -120,6 +120,9 @@ identities; the page says so next to the option.
     Teams; the registry, identity, Teams app and endpoint ids for reference.
 19. For a **vendor agent**: the same `.env` plus `GOVERNANCE_UPSTREAM` and the
     wire format, ready for the governance proxy (below).
+20. For an agent **hosted in Azure**: no file at all — the same keys become
+    App Settings (App Service) or container env (Container Apps), the app is
+    restarted, and the messaging endpoint is checked (see *Where the agent runs*).
 
 **Licences** apply to the agent *user* (AI teammate) and the installer assigns
 one. A bot-only blueprint carries none.
@@ -185,6 +188,49 @@ npx --package @zaatarlabs/agent365-governance-proxy agent365-govern-proxy
 The proxy only governs traffic that traverses it: a SaaS agent users open
 directly in a browser must be forced through it (DNS/network policy) or
 covered by endpoint DLP.
+
+---
+
+## Where the agent runs
+
+The installer asks *where does it run?* and adapts how it delivers the
+settings and restarts the agent. Nothing else changes: the tenant side is
+identical for all three.
+
+| Target | Settings go to | Restart | Endpoint |
+|---|---|---|---|
+| **This machine** (a folder) | the agent's `.env` (backed up first) | pm2 / launchd / systemd / running node processes in that folder | the https address you give it |
+| **Azure App Service** | App Settings, **merged** into the existing ones; secrets optionally in **Key Vault** with `@Microsoft.KeyVault(SecretUri=…)` references and the app's managed identity granted *Key Vault Secrets User* | `POST …/restart` | `https://<app>.azurewebsites.net` by default |
+| **Azure Container Apps** | the first container's env; the three secrets as Container App secrets by `secretRef` | a new revision rolls | the ingress FQDN by default |
+
+The Azure targets need the optional **Azure sign-in** in section 1 (the same
+device-code flow, Azure Resource Manager scope). The installer then lists your
+subscriptions and apps; you pick one. After writing, it posts to the messaging
+endpoint until it answers *401 token required* — a deployed Agents SDK app's
+normal response — so a restart that did not come back is reported, not assumed.
+
+This is the hosting Microsoft documents for Agent 365 agents (App Service with
+App Settings/Key Vault, Container Apps, AKS, or anywhere else); the kit does
+not require Azure — the *this machine* target works on any Linux/macOS/Windows
+box and inside your own container.
+
+**Vendor agent + Azure.** Choose *third-party agent* and an Azure target, and
+the installer creates a resource group, a B1 Linux App Service plan and an
+App Service running the published proxy image
+`ghcr.io/ohomaidi/agent365-governance-proxy` with all the governance
+settings. Its `https://<name>.azurewebsites.net` becomes the agent's address for
+Agent 365 and Teams. The image is built by GitHub Actions from
+[`packages/proxy/Dockerfile`](packages/proxy/Dockerfile) on every push.
+
+```bash
+# run the proxy image yourself, anywhere
+docker run -p 8787:8787 --env-file .env ghcr.io/ohomaidi/agent365-governance-proxy:latest
+```
+
+**Guard wiring in Azure.** The installer cannot inspect code that is already
+deployed, so for an Azure-hosted agent *you built* it assumes the agent calls
+the guard (the kit package, or the zero-code preload in its start script). If
+it doesn't, front it with the proxy instead — that path needs no code.
 
 ---
 
@@ -274,7 +320,8 @@ Microsoft ships for this purpose.
 | `agent365Observability__*` | written | Blueprint id/secret, agent identity id, tenant, name — for the Activity tab. |
 | `agent_id`, `connections__service_connection__settings__*` | written | Agents SDK connection: Teams replies as the blueprint. |
 | `AGENT365_REGISTRATION_ID`, `AGENT365_AGENT_IDENTITY_ID`, `AGENT365_TEAMS_APP_ID`, `AGENT365_MESSAGING_ENDPOINT`, … | written | Reference ids for the registry, identity, Teams app and endpoint. |
-| `GOVERNANCE_UPSTREAM`, `GOVERNANCE_DIALECT`, `GOVERNANCE_PROXY_PORT` | written (proxy) | Vendor API, wire format (`a2a`/`openai`/`generic`/`auto`), listen port. |
+| `GOVERNANCE_UPSTREAM`, `GOVERNANCE_DIALECT`, `GOVERNANCE_UPSTREAM_PATH`, `GOVERNANCE_PROXY_PORT` | written (proxy) | Vendor API, wire format (`a2a`/`openai`/`generic`/`auto`), chat endpoint path, listen port. |
+| `APPLICATIONINSIGHTS_LOG_DESTINATION`, `OTEL_LOG_LEVEL` | `console` / `WARN` | Where the observability exporter's own diagnostics go (default would be a file). |
 
 ### Tests
 
@@ -287,10 +334,10 @@ npm run test:all       # TypeScript + wizard + Python + .NET + proxy
 | TypeScript guard | 20 | defaults, misconfiguration, verdicts, retries, timeouts, caching, payload, redaction |
 | Python guard | 19 | same behaviours, mirrored |
 | .NET guard | 18 | same behaviours, mirrored |
-| Wizard | 84 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 call order + replication, inheritable permissions, consent, Teams package/catalog/install/endpoint, tenant probe |
+| Wizard | 105 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 call order + replication, inheritable permissions, consent, Teams package/catalog/install/endpoint, tenant probe, guard wiring, restart detection, proxy scaffold, Azure targets (App Settings merge, Container App secrets, Key Vault refs, proxy App Service, endpoint check) |
 | Proxy | 29 | enforcement, protocol-shaped refusals, attribution, health, Teams bridge through the real Agents SDK adapter |
 
-**170 tests.** CI runs all of them on every push. The tenant-side flow
+**191 tests.** CI runs all of them on every push. The tenant-side flow
 (Purview policies, DSPM recreate, blueprint, identity, consent, registration,
 Agent 365 endpoint, agent user, licence, and a real Teams round-trip) was
 exercised live against a licensed tenant with two agents before this release.
