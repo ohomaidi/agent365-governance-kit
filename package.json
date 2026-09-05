@@ -11,15 +11,18 @@
     "init": "node wizard/agent365-govern.mjs",
     "plan": "node wizard/agent365-govern.mjs --dry-run",
     "build": "npm run build --workspace @zaatarlabs/agent365-governance-kit",
-    "test": "npm run test:ts && npm run test:wizard",
+    "test": "npm run test:ts && npm run test:wizard && npm run test:proxy",
     "test:ts": "npm run build && node --test packages/typescript/test/*.test.mjs",
     "test:wizard": "node --test wizard/test/*.test.mjs",
     "test:python": "cd packages/python && python3 -m unittest discover -s tests",
     "test:dotnet": "cd packages/dotnet/tests && dotnet test --nologo",
-    "test:all": "npm run test:ts && npm run test:wizard && npm run test:python && npm run test:dotnet"
+    "test:all": "npm run test:ts && npm run test:wizard && npm run test:proxy && npm run test:python && npm run test:dotnet",
+    "test:proxy": "node --test --test-timeout=20000 packages/proxy/test/*.test.mjs",
+    "proxy": "node packages/proxy/src/bin.mjs"
   },
   "workspaces": [
-    "packages/typescript"
+    "packages/typescript",
+    "packages/proxy"
   ],
   "keywords": [
     "microsoft",
