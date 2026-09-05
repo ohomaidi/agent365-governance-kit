@@ -76,12 +76,18 @@
   <form id="f">
     <fieldset>
       <legend>2 · Your agent</legend>
-      <div class="row"><label for="purviewAppName">App name in Purview</label><input type="text" id="purviewAppName" value="Custom AI App"></div>
-      <div class="row"><label for="appRegName">Connector app registration</label><input type="text" id="appRegName" value="Agent Purview Connector"></div>
-      <div class="row"><label for="attribUpn">Attribute activity to (UPN)</label><input type="text" id="attribUpn"></div>
-      <div class="row"><label for="envPath">Write settings to</label><input type="text" id="envPath" placeholder="/path/to/your/agent/.env"></div>
-      <div class="row"><label for="lang">Language</label>
-        <select id="lang"><option>typescript</option><option>python</option><option>dotnet</option></select></div>
+      <div class="row">
+        <label for="agentDir">Where is your agent?</label>
+        <input type="text" id="agentDir" placeholder="/path/to/your/agent — the folder containing it">
+        <span class="hint">Drag the folder from Finder or Explorer into this box.</span>
+      </div>
+      <div id="detected"></div>
+      <div class="row"><label for="agentName">What is it called?</label><input type="text" id="agentName" placeholder="e.g. HR Assistant"></div>
+      <div class="row">
+        <label for="agentUrl">Its web address</label>
+        <input type="text" id="agentUrl" placeholder="https://your-agent.example.com">
+        <span class="hint">Where the agent answers. Can be a governance proxy in front of one you can&rsquo;t change.</span>
+      </div>
     </fieldset>
 
     <fieldset style="margin-top:1.5rem">
@@ -122,18 +128,29 @@
       <legend>6 · Agent 365 registration</legend>
       <div class="check"><input type="checkbox" id="wantAgent365" checked><label for="wantAgent365">Register this agent in the Agent 365 registry</label></div>
       <div id="a365Fields">
-        <div class="row"><label for="agentName">Agent display name</label><input type="text" id="agentName"></div>
-        <div class="row"><label for="agentUrl">Agent endpoint (https)</label><input type="text" id="agentUrl" placeholder="https://your-agent.example.com/a2a">
-          <span class="hint">May be a <strong>governance proxy</strong> in front of an agent you cannot modify.</span></div>
-        <div class="row"><label for="transport">Transport</label>
-          <select id="transport"><option>JSONRPC</option><option>HTTP+JSON</option><option>GRPC</option></select></div>
-        <div class="row"><label for="sponsorUpn">Blueprint sponsor (UPN)</label><input type="text" id="sponsorUpn"></div>
-        <div class="row"><label for="existingBlueprintId">Reuse blueprint id</label><input type="text" id="existingBlueprintId" placeholder="leave blank to create a new one"></div>
+        <span class="hint">Uses the name and address from section 2. Nothing else needed.</span>
       </div>
     </fieldset>
 
     <fieldset style="margin-top:1.5rem">
-      <legend>7 · Afterwards</legend>
+      <legend>7 · Advanced</legend>
+      <div class="check"><input type="checkbox" id="showAdv"><label for="showAdv">Change the defaults (you shouldn&rsquo;t need to)</label></div>
+      <div id="advFields" hidden>
+        <div class="row"><label for="attribUpn">Attribute activity to (UPN)</label><input type="text" id="attribUpn"></div>
+        <div class="row"><label for="sponsorUpn">Blueprint sponsor (UPN)</label><input type="text" id="sponsorUpn"></div>
+        <div class="row"><label for="lang">Language</label>
+          <select id="lang"><option value="">auto-detected</option><option>typescript</option><option>python</option><option>dotnet</option></select></div>
+        <div class="row"><label for="transport">Transport</label>
+          <select id="transport"><option>JSONRPC</option><option>HTTP+JSON</option><option>GRPC</option></select></div>
+        <div class="row"><label for="envPath">Settings file</label><input type="text" id="envPath" placeholder="auto: &lt;agent folder&gt;/.env"></div>
+        <div class="row"><label for="purviewAppName">Name shown in Purview</label><input type="text" id="purviewAppName" placeholder="auto: same as the agent name"></div>
+        <div class="row"><label for="appRegName">Connector app registration</label><input type="text" id="appRegName" placeholder="auto: &lt;agent name&gt; Purview Connector"></div>
+        <div class="row"><label for="existingBlueprintId">Reuse blueprint id</label><input type="text" id="existingBlueprintId" placeholder="blank = create a new one"></div>
+      </div>
+    </fieldset>
+
+    <fieldset style="margin-top:1.5rem">
+      <legend>8 · Afterwards</legend>
       <div class="check"><input type="checkbox" id="revokeAfter" checked><label for="revokeAfter">Revoke the connector's Compliance Administrator and Exchange access once provisioning finishes — the runtime needs neither.</label></div>
     </fieldset>
   </form>
@@ -228,16 +245,46 @@ $("scopeChoice").onchange = (e) => {
 };
 $("modeChoice").onchange = (e) => { $("modeWarn").hidden = e.target.value !== "3"; };
 $("wantAgent365").onchange = (e) => { $("a365Fields").hidden = !e.target.checked; };
-$("purviewAppName").oninput = (e) => {
-  if (!$("agentName").dataset.touched) $("agentName").value = e.target.value;
-};
+$("showAdv").onchange = (e) => { $("advFields").hidden = !e.target.checked; };
+
+// --- learn what we can from the agent's own folder ---
+let detected = null;
+async function detect() {
+  const dir = $("agentDir").value.trim().replace(/^['"]|['"]$/g, "").replace(/\\ /g, " ");
+  $("agentDir").value = dir;
+  if (!dir) { $("detected").innerHTML = ""; detected = null; return; }
+  detected = await (await fetch(`/api/detect?dir=${encodeURIComponent(dir)}`)).json();
+
+  if (detected.error && !detected.language) {
+    $("detected").innerHTML = `<div class="warn">${detected.error}</div>`;
+  } else {
+    const pretty = { typescript: "Node / TypeScript", python: "Python", dotnet: ".NET" }[detected.language];
+    $("detected").innerHTML =
+      `<div class="good">Found a <strong>${pretty}</strong> agent (${detected.evidence.join(", ")}). ` +
+      `Settings will be written to <code>${detected.envPath}</code>` +
+      `${detected.envExists ? " — the existing file is backed up first." : "."}</div>`;
+  }
+  if (detected.name && !$("agentName").dataset.touched) {
+    $("agentName").value = detected.name.replace(/[-_]/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+  }
+}
+$("agentDir").onchange = detect;
+$("agentDir").onblur = detect;
 $("agentName").oninput = (e) => { e.target.dataset.touched = "1"; };
 
 function answers() {
   const scope = $("scopeChoice").value, mode = $("modeChoice").value;
+  const name = $("agentName").value.trim() || "My Agent";
+  const me = pf?.account?.user || "";
+  // Everything a customer shouldn't have to know is derived, and only
+  // overridden if they opened Advanced and typed something.
+  const or = (id, fallback) => ($(id).value.trim() || fallback);
   return {
-    appRegName: $("appRegName").value, purviewAppName: $("purviewAppName").value,
-    attribUpn: $("attribUpn").value, envPath: $("envPath").value, lang: $("lang").value,
+    appRegName: or("appRegName", `${name} Purview Connector`),
+    purviewAppName: or("purviewAppName", name),
+    attribUpn: or("attribUpn", me),
+    envPath: or("envPath", detected?.envPath || ""),
+    lang: or("lang", detected?.language || "typescript"),
     scopeChoice: scope,
     pilotGroup: $("pilotGroup").value, pilotUsers: $("pilotUsers").value,
     // The CLI asks for these confirmations; the UI already made them explicit choices.
@@ -249,8 +296,9 @@ function answers() {
     failClosed: $("failClosed").checked,
     wantDspm: $("wantDspm").checked, dspmIngest: $("dspmIngest").checked,
     wantAgent365: $("wantAgent365").checked,
-    agentName: $("agentName").value, agentUrl: $("agentUrl").value,
-    transport: $("transport").value, sponsorUpn: $("sponsorUpn").value,
+    agentName: name, agentUrl: $("agentUrl").value.trim().replace(/\/+$/, ""),
+    transport: or("transport", "JSONRPC"),
+    sponsorUpn: or("sponsorUpn", me),
     existingBlueprintId: $("existingBlueprintId").value,
     revokeAfter: $("revokeAfter").checked,
     reuseExistingApp: true, replaceInstance: false,
@@ -259,10 +307,12 @@ function answers() {
 }
 
 function validate(a) {
-  if (!a.envPath) return "Tell me where to write your agent's .env file.";
+  if (!$("agentDir").value.trim()) return "Point me at your agent's folder first.";
+  if (!a.envPath) return "Couldn't work out where to write the settings file — set it under Advanced.";
+  if (!$("agentName").value.trim()) return "Give the agent a name.";
   if (a.scopeChoice === "1" && !a.pilotGroup) return "A pilot group is required for that scope.";
   if (a.scopeChoice === "2" && !a.pilotUsers) return "List at least one pilot user.";
-  if (a.wantAgent365 && !/^https:\/\//i.test(a.agentUrl)) return "The agent endpoint must be an https URL.";
+  if (a.wantAgent365 && !/^https:\/\//i.test(a.agentUrl)) return "The agent's web address must start with https://";
   return null;
 }
 
@@ -302,9 +352,7 @@ async function run(dryRun) {
 $("btnDry").onclick = () => run(true);
 $("btnGo").onclick = () => run(false);
 
-fetch("/api/defaults").then(r => r.json()).then(d => {
-  if (!$("envPath").value) $("envPath").value = d.cwd + d.sep + ".env";
-});
+
 preflight().then(() => { if (pf && pf.signedIn) tenantCheck(); });
 </script>
 </body>

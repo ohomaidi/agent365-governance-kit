@@ -1,5 +1,27 @@
 # Agent 365 Governance Kit
 
+## Download and run
+
+Hand a customer **one file**. They unzip it and double-click. No cloning, no terminal.
+
+| Platform | Download | Then double-click |
+|---|---|---|
+| **macOS** | [Agent365-Setup-macOS.zip](https://github.com/ohomaidi/agent365-governance-kit/releases/latest/download/Agent365-Setup-macOS.zip) | **Agent 365 Setup** |
+| **Windows** | [Agent365-Setup-Windows.zip](https://github.com/ohomaidi/agent365-governance-kit/releases/latest/download/Agent365-Setup-Windows.zip) | **Agent 365 Setup.vbs** |
+
+The browser opens onto the setup wizard. It asks for three things — where the agent
+lives, what it's called, and its web address — and works the rest out itself.
+
+**Requires** Node.js 18+, Azure CLI and PowerShell 7 on the machine running setup, plus a
+tenant Global Administrator. Anything missing is named with a download link rather than
+a stack trace. **Rehearse** runs the whole thing and changes nothing.
+
+> Not yet notarised for macOS: the first launch may need right-click → Open.
+
+Everything below is for working on the kit itself.
+
+---
+
 Drop-in **Microsoft governance for any custom AI agent** — in **TypeScript/Node, Python, and .NET**. Three layers:
 
 - **Purview guard** — runs every prompt and reply through Microsoft Purview (Graph `processContent`) so they're audited, classified, captured for DSPM-for-AI, and **blocked inline** by your DLP policies. Works on *any* channel, including non-Microsoft surfaces (web portals, APIs). Available in all three languages.
@@ -47,16 +69,24 @@ production agent. Its defaults are chosen so that a mistake fails safe:
 Every HTTP call is bounded by a timeout and retries throttling (429) and transient
 5xx with backoff. Client secrets are redacted from all log output.
 
-## 0. No terminal? Double-click instead
+## 0. Build the installer packages
 
-| Platform | Double-click |
-|---|---|
-| macOS | `installer/macos/Agent 365 Setup.app` |
-| Windows | `installer/windows/Agent 365 Setup.vbs` |
+```bash
+./installer/package.sh          # -> dist-installer/*.zip
+```
 
-Checks prerequisites, signs you in, and runs the whole thing from a browser
-form with a live log. It drives the same CLI wizard underneath via `--answers`,
-so there is no second implementation to drift. See
+Produces the two files linked at the top of this README. Each zip carries the
+launcher plus only the kit files the installer needs — the wizard and installer
+use nothing but Node built-ins, so there is nothing to install on the far side.
+
+To run it from a checkout without packaging:
+
+```bash
+node installer/server.mjs
+```
+
+The browser wizard drives the same CLI wizard underneath via `--answers`, so
+there is no second implementation to drift. See
 [`installer/README.md`](installer/README.md).
 
 ## 0b. Check the tenant can actually do it

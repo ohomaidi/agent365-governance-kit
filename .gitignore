@@ -23,3 +23,6 @@ packages/python/*.egg-info/
 packages/dotnet/tests/bin/
 packages/dotnet/tests/obj/
 .env.bak
+
+# installer build output (published as GitHub Release assets)
+dist-installer/

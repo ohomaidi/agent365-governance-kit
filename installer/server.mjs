@@ -9,7 +9,7 @@
  */
 import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, existsSync, readdirSync, statSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -55,6 +55,47 @@ function preflight() {
     account: account ? { user: account.user?.name, tenantId: account.tenantId, name: account.name } : null,
     ready: missing.length === 0,
   };
+}
+
+/**
+ * Work out what we can from the agent's own folder, so the customer isn't asked
+ * questions only a developer could answer.
+ */
+function inspectAgent(dir) {
+  const out = { ok: false, dir, language: null, envPath: null, name: null, evidence: [] };
+  try {
+    if (!dir || !existsSync(dir) || !statSync(dir).isDirectory()) {
+      out.error = "That folder doesn't exist.";
+      return out;
+    }
+  } catch { out.error = "That folder can't be read."; return out; }
+
+  const has = (f) => existsSync(join(dir, f));
+  const files = (() => { try { return readdirSync(dir); } catch { return []; } })();
+
+  if (has("package.json")) {
+    out.language = "typescript";
+    out.evidence.push("package.json");
+    try {
+      const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+      if (pkg.name) out.name = pkg.name;
+      // A JS project without TypeScript still uses the same Node package.
+      if (!has("tsconfig.json") && !pkg.devDependencies?.typescript) out.evidence.push("plain JavaScript");
+    } catch { /* name is a nicety */ }
+  } else if (has("pyproject.toml") || has("requirements.txt") || files.some((f) => f.endsWith(".py"))) {
+    out.language = "python";
+    out.evidence.push(has("pyproject.toml") ? "pyproject.toml" : has("requirements.txt") ? "requirements.txt" : "*.py");
+  } else if (files.some((f) => f.endsWith(".csproj") || f.endsWith(".sln"))) {
+    out.language = "dotnet";
+    out.evidence.push(files.find((f) => f.endsWith(".csproj")) || files.find((f) => f.endsWith(".sln")));
+  }
+
+  out.envPath = join(dir, ".env");
+  out.envExists = existsSync(out.envPath);
+  if (!out.name) out.name = dir.split(/[/\\]/).filter(Boolean).pop() || "My Agent";
+  out.ok = Boolean(out.language);
+  if (!out.ok) out.error = "Couldn't tell what this agent is built with — pick the language yourself under Advanced.";
+  return out;
 }
 
 const json = (res, code, body) => {
@@ -151,8 +192,14 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === "GET" && url.pathname === "/api/detect") {
+    return json(res, 200, inspectAgent(url.searchParams.get("dir") || ""));
+  }
+
   if (req.method === "GET" && url.pathname === "/api/defaults") {
-    return json(res, 200, { home: homedir(), cwd: process.cwd(), sep: IS_WINDOWS ? "\\" : "/" });
+    // Deliberately NOT process.cwd(): that is the kit's own folder, and
+    // defaulting to it would write the customer's config into our repo.
+    return json(res, 200, { home: homedir(), sep: IS_WINDOWS ? "\\" : "/" });
   }
 
   res.writeHead(404, { "content-type": "text/plain" });
