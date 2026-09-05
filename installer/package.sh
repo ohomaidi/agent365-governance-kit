@@ -24,7 +24,34 @@ MAC="$MACTMP/Agent365-Setup"        # named, so the zip doesn't carry a temp nam
 mkdir -p "$MAC"
 stage "$MAC"
 cp -R "$ROOT/installer/macos/Agent 365 Setup.app" "$MAC/"
-chmod +x "$MAC/Agent 365 Setup.app/Contents/MacOS/launch"
+APP="$MAC/Agent 365 Setup.app"
+# The executable is a small universal binary (Apple notarises real code, not a
+# bare script bundle); it hands over to launch.sh. Rebuild it from source so the
+# zip never ships a stale binary.
+clang -O2 -arch arm64 -arch x86_64 -mmacosx-version-min=11.0 \
+  -o "$APP/Contents/MacOS/launch" "$ROOT/installer/macos/launcher.c"
+chmod +x "$APP/Contents/MacOS/launch" "$APP/Contents/MacOS/launch.sh"
+
+# Sign + notarise when a Developer ID identity and a notarytool keychain
+# profile ("AC_PASSWORD") exist on this Mac; otherwise ship unsigned and say so.
+IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"' || true)"
+if [ -n "$IDENTITY" ]; then
+  echo "Signing with: $IDENTITY"
+  codesign --force --deep --options runtime --timestamp --sign "$IDENTITY" "$APP"
+  codesign --verify --strict --verbose=2 "$APP"
+  if xcrun notarytool history --keychain-profile AC_PASSWORD >/dev/null 2>&1; then
+    NOTZIP="$MACTMP/notarize.zip"
+    ditto -c -k --keepParent "$APP" "$NOTZIP"
+    echo "Submitting to Apple notary service (usually 1-5 minutes)…"
+    xcrun notarytool submit "$NOTZIP" --keychain-profile AC_PASSWORD --wait
+    xcrun stapler staple "$APP"
+    spctl --assess --type execute --verbose=2 "$APP" || true
+  else
+    echo "WARNING: no notarytool keychain profile AC_PASSWORD — signed but NOT notarised (Gatekeeper will still block)." >&2
+  fi
+else
+  echo "WARNING: no 'Developer ID Application' identity — macOS app is UNSIGNED; customers must use Open Anyway." >&2
+fi
 # ditto preserves the bundle and the executable bit; plain zip can drop it.
 # --norsrc/--noextattr keep the __MACOSX sidecar files out of the archive.
 ( cd "$MACTMP" && ditto -c -k --norsrc --noextattr "Agent365-Setup" "$OUT/Agent365-Setup-macOS.zip" )
