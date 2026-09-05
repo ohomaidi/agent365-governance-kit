@@ -19,8 +19,11 @@ stage() {                    # $1 = staging dir
   cp "$KIT_TGZ"                                                    "$1/kit/packages/"
   cp "$ROOT/installer/server.mjs" "$ROOT/installer/ui.html"        "$1/kit/installer/"
   cp "$ROOT/wizard/agent365-govern.mjs"                            "$1/kit/wizard/"
-  cp "$ROOT/wizard/lib/agent365.mjs" "$ROOT/wizard/lib/capabilities.mjs" \
-     "$ROOT/wizard/lib/auth.mjs" "$ROOT/wizard/lib/teams.mjs"              "$1/kit/wizard/lib/"
+  cp "$ROOT"/wizard/lib/*.mjs                                      "$1/kit/wizard/lib/"
+  # Prove the staged wizard resolves every import BEFORE it is zipped — a
+  # module missing from the package is exactly the failure a customer hits first.
+  ( cd "$1/kit" && node --input-type=module -e 'await import("./wizard/agent365-govern.mjs")' >/dev/null 2>&1 && node --check installer/server.mjs \
+    || { echo "ERROR: staged kit does not import cleanly" >&2; ( cd "$1/kit" && node --input-type=module -e 'await import("./wizard/agent365-govern.mjs")' ); exit 1; } )
   cp "$ROOT/installer/README.md"                                   "$1/README.txt"
 }
 
