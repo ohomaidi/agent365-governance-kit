@@ -13,8 +13,12 @@ The browser opens onto the setup wizard. It asks for three things — where the 
 lives, what it's called, and its web address — and works the rest out itself.
 
 **Requires** Node.js 18+, Azure CLI and PowerShell 7 on the machine running setup, plus a
-tenant Global Administrator. Anything missing is named with a download link rather than
-a stack trace. **Rehearse** runs the whole thing and changes nothing.
+tenant Global Administrator. All three have ordinary installers; anything missing is
+named with a download link rather than a stack trace.
+
+**No terminal at any point** — signing in to Azure is a button on the first screen, with
+a tenant box and a device-code option for machines that can't pop a sign-in window.
+**Rehearse** runs the whole thing and changes nothing.
 
 > Not yet notarised for macOS: the first launch may need right-click → Open.
 

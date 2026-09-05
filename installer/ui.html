@@ -67,6 +67,17 @@
   <fieldset>
     <legend>1 · Before we start</legend>
     <div id="pf">Checking…</div>
+    <div id="loginBox" hidden style="margin-top:.8rem">
+      <div class="row">
+        <label for="tenantHint">Which tenant?</label>
+        <input type="text" id="tenantHint" placeholder="contoso.onmicrosoft.com — leave blank for your default">
+      </div>
+      <div class="check"><input type="checkbox" id="deviceCode"><label for="deviceCode">This machine can't open a sign-in window (remote desktop, server console)</label></div>
+    </div>
+    <div id="codeBox" hidden class="good" style="margin-top:.8rem">
+      <div>Go to <a href="https://login.microsoft.com/device" target="_blank" rel="noopener"><strong>login.microsoft.com/device</strong></a> and enter:</div>
+      <div id="theCode" style="font:700 2rem/1.3 var(--mono);letter-spacing:.12em;margin-top:.4rem"></div>
+    </div>
     <div id="pfActions" class="actions" style="margin-top:.8rem" hidden>
       <button id="btnLogin" class="ghost" type="button">Sign in to Azure</button>
       <button id="btnRecheck" class="ghost" type="button">Re-check</button>
@@ -195,7 +206,9 @@ async function preflight() {
   }
   $("pf").innerHTML = banner + rows;
   $("pfActions").hidden = false;
-  $("btnLogin").hidden = pf.signedIn || pf.missing.length > 0;
+  $("btnLogin").hidden = pf.missing.length > 0;
+  $("btnLogin").textContent = pf.signedIn ? "Sign in as someone else" : "Sign in to Azure";
+  $("loginBox").hidden = pf.missing.length > 0;
   const ready = pf.ready && pf.signedIn;
   $("btnGo").disabled = !ready;
   $("btnDry").disabled = !ready;
@@ -230,11 +243,39 @@ async function tenantCheck() {
 $("btnRecheck").onclick = () => preflight().then(tenantCheck);
 $("btnLogin").onclick = async () => {
   $("btnLogin").disabled = true;
-  $("status").textContent = "A browser window has opened for Azure sign-in…";
-  try { await fetch("/api/login", { method: "POST" }); } finally {
-    $("btnLogin").disabled = false; $("status").textContent = "";
-    await preflight(); if (pf && pf.signedIn) tenantCheck();
-  }
+  $("codeBox").hidden = true;
+  $("status").textContent = "Opening Microsoft sign-in…";
+
+  const { id } = await (await fetch("/api/login", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      tenant: $("tenantHint").value.trim(),
+      deviceCode: $("deviceCode").checked,
+    }),
+  })).json();
+
+  // Poll rather than block: the server stays responsive, and a device code can
+  // appear at any point during the attempt.
+  await new Promise((resolve) => {
+    const t = setInterval(async () => {
+      const st = await (await fetch(`/api/login-status?id=${id}`)).json();
+      if (st.deviceCode) {
+        $("theCode").textContent = st.deviceCode;
+        $("codeBox").hidden = false;
+        $("status").textContent = "Waiting for you to finish signing in…";
+      }
+      if (st.done) {
+        clearInterval(t);
+        $("status").textContent = st.code === 0 ? "" : "Sign-in didn't complete.";
+        resolve();
+      }
+    }, 1200);
+  });
+
+  $("codeBox").hidden = true;
+  $("btnLogin").disabled = false;
+  await preflight();
+  if (pf && pf.signedIn) tenantCheck();
 };
 
 $("scopeChoice").onchange = (e) => {

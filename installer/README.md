@@ -16,8 +16,11 @@ itself and says so plainly if it can't.
 1. **Checks prerequisites** — Node 18+, Azure CLI, PowerShell 7, and OpenSSL on
    macOS/Linux (Windows uses `New-SelfSignedCertificate` instead). Anything
    missing is listed with a download link rather than a stack trace.
-2. **Signs in** — a button runs `az login`, which opens the normal Microsoft
-   sign-in page.
+2. **Signs in** — a button runs `az login`. No terminal: the customer can name a
+   tenant (leave blank for their default), and if the machine can't open a
+   sign-in window — remote desktop, a server console — they tick a box and the
+   page shows the device code in large type. Sign-in is streamed, not awaited,
+   so the page stays responsive throughout.
 3. **Collects the same decisions the CLI asks for**, with the safe option
    preselected and the risky ones behind visible warnings.
 4. **Rehearse** runs a full dry run and changes nothing. **Provision** asks for

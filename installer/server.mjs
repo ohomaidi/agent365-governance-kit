@@ -115,6 +115,19 @@ const server = createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/api/preflight") return json(res, 200, preflight());
 
   // Tooling readiness says nothing about whether the TENANT can do this.
+  if (req.method === "GET" && url.pathname === "/api/tenants") {
+    // Which directories can this account actually reach?
+    try {
+      const out = execFileSync("az", ["account", "list", "--all", "-o", "json"],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      const seen = new Map();
+      for (const a of JSON.parse(out || "[]")) {
+        if (!seen.has(a.tenantId)) seen.set(a.tenantId, { tenantId: a.tenantId, name: a.name, isDefault: a.isDefault });
+      }
+      return json(res, 200, { tenants: [...seen.values()] });
+    } catch { return json(res, 200, { tenants: [] }); }
+  }
+
   if (req.method === "GET" && url.pathname === "/api/tenant") {
     const azJson = (args) => {
       const out = execFileSync("az", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -125,13 +138,51 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method === "POST" && url.pathname === "/api/login") {
-    // az login opens the system browser itself; we just wait for it.
-    try {
-      execFileSync("az", ["login"], { stdio: "ignore" });
-      return json(res, 200, preflight());
-    } catch (e) {
-      return json(res, 500, { error: "az login failed or was cancelled" });
-    }
+    // Sign-in is streamed, not awaited. execFileSync here would block the whole
+    // single-threaded server, freezing the page for the duration of the login,
+    // and swallowing the device code when az can't open a browser (RDP, a
+    // server console, a locked-down desktop) — leaving the customer staring at
+    // nothing forever.
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    await new Promise((r) => req.on("end", r));
+    let opts = {};
+    try { opts = JSON.parse(raw || "{}"); } catch { /* defaults are fine */ }
+
+    const args = ["login"];
+    if (opts.tenant) args.push("--tenant", String(opts.tenant));
+    if (opts.deviceCode) args.push("--use-device-code");
+    args.push("--only-show-errors");
+
+    const id = randomUUID();
+    const child = spawn("az", args, { stdio: ["ignore", "pipe", "pipe"] });
+    const run = { child, buffer: [], done: false, code: null, deviceCode: null };
+    runs.set(id, run);
+
+    const push = (chunk) => {
+      const text = String(chunk);
+      for (const line of text.split(/\r?\n/)) if (line.trim()) run.buffer.push(line);
+      // Surface the device code so the page can show it in large type.
+      const m = text.match(/code\s+([A-Z0-9]{6,})\s+to authenticate/i);
+      if (m) run.deviceCode = m[1];
+    };
+    child.stdout.on("data", push);
+    child.stderr.on("data", push);
+    child.on("close", (code) => { run.done = true; run.code = code; });
+
+    // Don't let a cancelled sign-in hang around forever.
+    setTimeout(() => { if (!run.done) { try { child.kill(); } catch {} } }, 10 * 60 * 1000);
+
+    return json(res, 200, { id });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/login-status") {
+    const run = runs.get(url.searchParams.get("id"));
+    if (!run) return json(res, 404, { error: "unknown login" });
+    return json(res, 200, {
+      done: run.done, code: run.code, deviceCode: run.deviceCode,
+      lines: run.buffer.slice(-6),
+    });
   }
 
   if (req.method === "POST" && url.pathname === "/api/run") {
