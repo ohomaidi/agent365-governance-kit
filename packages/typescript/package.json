@@ -1,6 +1,6 @@
 {
   "name": "@zaatarlabs/agent365-governance-kit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Drop-in Microsoft governance for any custom AI agent: a Purview DLP/audit guard plus Agent 365 agentic identity + observability wiring, with an auto-provisioning setup wizard.",
   "type": "module",
   "main": "dist/index.js",
@@ -16,7 +16,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "keywords": [
     "microsoft",

@@ -18,4 +18,4 @@ from .config import PurviewConfig, load_config
 from .purview import PurviewGuard, EvalResult
 
 __all__ = ["PurviewConfig", "load_config", "PurviewGuard", "EvalResult"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

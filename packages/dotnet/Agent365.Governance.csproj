@@ -8,8 +8,14 @@
     <RootNamespace>ZaatarLabs.Agent365.Governance</RootNamespace>
     <AssemblyName>ZaatarLabs.Agent365.Governance</AssemblyName>
     <PackageId>ZaatarLabs.Agent365.Governance</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Description>Drop-in Microsoft Purview governance for any .NET AI agent.</Description>
   </PropertyGroup>
+
+  <!-- The test project lives under tests/; keep it out of the library build. -->
+  <ItemGroup>
+    <Compile Remove="tests/**" />
+    <None Remove="tests/**" />
+  </ItemGroup>
 
 </Project>

@@ -1,19 +1,36 @@
 {
   "name": "agent365-governance-kit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Drop-in Microsoft Purview + Agent 365 governance for custom AI agents (Node, Python, .NET), with an auto-provisioning setup wizard.",
+  "description": "Drop-in Microsoft Purview + Agent 365 governance for custom AI agents (Node, Python, .NET), with a safe-by-default auto-provisioning setup wizard.",
   "type": "module",
   "bin": {
     "agent365-govern": "wizard/agent365-govern.mjs"
   },
   "scripts": {
-    "init": "node wizard/agent365-govern.mjs"
+    "init": "node wizard/agent365-govern.mjs",
+    "plan": "node wizard/agent365-govern.mjs --dry-run",
+    "build": "npm run build --workspace @zaatarlabs/agent365-governance-kit",
+    "test": "npm run test:ts && npm run test:wizard",
+    "test:ts": "npm run build && node --test packages/typescript/test/*.test.mjs",
+    "test:wizard": "node --test wizard/test/*.test.mjs",
+    "test:python": "cd packages/python && python3 -m unittest discover -s tests",
+    "test:dotnet": "cd packages/dotnet/tests && dotnet test --nologo",
+    "test:all": "npm run test:ts && npm run test:wizard && npm run test:python && npm run test:dotnet"
   },
   "workspaces": [
     "packages/typescript"
   ],
-  "keywords": ["microsoft", "purview", "agent365", "dlp", "governance", "ai-agent"],
+  "keywords": [
+    "microsoft",
+    "purview",
+    "agent365",
+    "dlp",
+    "governance",
+    "ai-agent"
+  ],
   "license": "UNLICENSED",
-  "engines": { "node": ">=18" }
+  "engines": {
+    "node": ">=18"
+  }
 }

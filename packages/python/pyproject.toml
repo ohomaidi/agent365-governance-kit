@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent365-governance-kit"
-version = "0.1.0"
+version = "0.2.0"
 description = "Drop-in Microsoft Purview governance for any Python AI agent."
 readme = "README.md"
 requires-python = ">=3.9"

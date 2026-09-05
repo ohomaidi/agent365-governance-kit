@@ -12,11 +12,11 @@
  *   const verdict = await guard.evaluate(userPrompt, "uploadText", { correlationId });
  *   if (verdict.blocked) return verdict.reason;   // don't call the model
  */
-export { loadConfig, purviewReady } from "./config.js";
-export type { GovernanceConfig, PurviewConfig, ObservabilityConfig } from "./config.js";
+export { loadConfig, purviewReady, purviewState, missingFields } from "./config.js";
+export type { GovernanceConfig, PurviewConfig, ObservabilityConfig, GuardState } from "./config.js";
 
 export { createPurviewGuard } from "./purview.js";
-export type { PurviewGuard, EvalResult, EvaluateOptions, Activity } from "./purview.js";
+export type { PurviewGuard, EvalResult, EvaluateOptions, Activity, DegradedReason } from "./purview.js";
 
 export { initObservability } from "./observability.js";
 export {

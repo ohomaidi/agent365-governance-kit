@@ -18,3 +18,8 @@ __pycache__/
 *.pyc
 packages/python/build/
 packages/python/*.egg-info/
+
+# test artifacts
+packages/dotnet/tests/bin/
+packages/dotnet/tests/obj/
+.env.bak
