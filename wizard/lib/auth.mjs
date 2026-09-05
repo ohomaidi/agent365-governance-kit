@@ -133,22 +133,38 @@ export class TokenCache {
    * Access token for `scope` under `clientId`, from cache or by refresh-token
    * exchange (which also rotates the refresh token).
    */
+  /** Re-read the file: another process (installer + wizard) may have rotated the refresh token. */
+  reload() {
+    if (!this.path || !existsSync(this.path)) return;
+    try { const d = JSON.parse(readFileSync(this.path, "utf8")); this.data = { clients: d.clients ?? {}, tokens: d.tokens ?? {} }; } catch { /* keep what we have */ }
+  }
   async token(scope, clientId = CLIENTS.graphCli) {
     const key = `${clientId}|${scope}`;
     const hit = this.data.tokens[key];
     if (hit && Date.now() < hit.exp - 120_000) return hit.token;
-    const cl = this.data.clients[clientId];
-    if (!cl?.refreshToken) throw new Error(`not signed in (${clientId})`);
-    const res = await fetch(`${LOGIN}/${cl.tenant}/oauth2/v2.0/token`,
-      form({ grant_type: "refresh_token", client_id: clientId, refresh_token: cl.refreshToken, scope: `${scope} openid profile offline_access` }));
-    const j = await res.json();
-    if (!j.access_token) {
-      throw Object.assign(new Error(`token for ${scope}: ${j.error_description || j.error || "refused"}`), { code: j.error, body: j });
+    this.reload();
+    const fresh = this.data.tokens[key];
+    if (fresh && Date.now() < fresh.exp - 120_000) return fresh.token;
+    let last;
+    for (const delay of [0, 2000, 5000]) {
+      if (delay) await new Promise((r) => setTimeout(r, delay));
+      const cl = this.data.clients[clientId];
+      if (!cl?.refreshToken) throw new Error(`not signed in (${clientId})`);
+      const res = await fetch(`${LOGIN}/${cl.tenant}/oauth2/v2.0/token`,
+        form({ grant_type: "refresh_token", client_id: clientId, refresh_token: cl.refreshToken, scope: `${scope} openid profile offline_access` }));
+      const j = await res.json();
+      if (j.access_token) {
+        if (j.refresh_token) cl.refreshToken = j.refresh_token;
+        this.data.tokens[key] = { token: j.access_token, exp: Date.now() + (j.expires_in ?? 3600) * 1000 };
+        this.save();
+        return j.access_token;
+      }
+      last = Object.assign(new Error(`token for ${scope}: ${j.error_description || j.error || "refused"}`), { code: j.error, body: j });
+      // A rotated refresh token (used by a sibling process) or a transient STS error: pick up the file again and retry.
+      if (!/invalid_grant|temporarily_unavailable|server_error/i.test(String(j.error))) break;
+      this.reload();
     }
-    if (j.refresh_token) cl.refreshToken = j.refresh_token;
-    this.data.tokens[key] = { token: j.access_token, exp: Date.now() + (j.expires_in ?? 3600) * 1000 };
-    this.save();
-    return j.access_token;
+    throw last;
   }
 }
 

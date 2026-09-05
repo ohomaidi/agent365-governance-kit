@@ -245,6 +245,17 @@ describe("pilot group scope", () => {
     assert.match(adds[0], /directoryObjects\/u-2/);
   });
 
+  test("a just-created pilot group is waited for, not reported as a failure", () => {
+    const ps = buildProvisionScript({
+      appId: "app", org: "o.onmicrosoft.com", pfx: "/x.pfx", purviewAppName: "A", wantCreditCard: false,
+      customSitTerms: [], work: "/tmp", dlpMode: "TestWithNotifications",
+      scopeInclusions: [{ Type: "Group", Identity: "a-pilot@o.onmicrosoft.com" }], wantDspm: false, dspmIngest: false,
+    });
+    assert.match(ps, /couldn't be found\|could not be found\|ManagementObjectNotFound/, "retries on the Exchange recipient-not-found error");
+    assert.match(ps, /foreach \(\$attempt in 1\.\.20\)/);
+    assert.match(ps, /never became visible to Exchange Online/, "gives up with a message, not a stack trace");
+  });
+
   test("Purview binds to Tenant or Group only — a per-user binding is never emitted", () => {
     const ps = buildProvisionScript({
       appId: "app", org: "o.onmicrosoft.com", pfx: "/x.pfx", purviewAppName: "A", wantCreditCard: true,
@@ -266,8 +277,10 @@ describe("DSPM collection policy is per-tenant", () => {
   test("a second agent is appended to the existing policy, not skipped", () => {
     const ps = buildProvisionScript({ ...base, wantDspm: true, dspmIngest: false });
     assert.match(ps, /New-FeatureConfiguration/, "creates it when absent");
-    assert.match(ps, /Set-FeatureConfiguration -Identity \$fc\.Identity -Locations \$merged/, "appends when present");
-    assert.match(ps, /could not be appended/, "says so honestly if the append does not take");
+    assert.match(ps, /Remove-FeatureConfiguration -Identity \$fc\.Identity/, "removes the existing policy (Set cannot append — verified live)");
+    assert.match(ps, /New-FeatureConfiguration -FeatureScenario KnowYourData -Name \$fcName -Mode \$mode -ScenarioConfig \$cfg -Locations \$merged/, "recreates it with the merged locations and the original config");
+    assert.match(ps, /already exists/, "retries while Microsoft releases the name");
+    assert.equal(/^\s*Set-FeatureConfiguration/m.test(ps), false, "never invokes the no-op Set");
   });
   test("no DSPM means no DSPM cmdlets at all", () => {
     const ps = buildProvisionScript({ ...base, wantDspm: false, dspmIngest: false });

@@ -128,7 +128,13 @@
     </fieldset>
 
     <fieldset style="margin-top:1.5rem">
-      <legend>3 · Who the policy applies to</legend>
+      <legend>3 · Microsoft Purview</legend>
+      <div class="check"><input type="checkbox" id="wantPurview" checked><label for="wantPurview"><strong>Provision Purview</strong> — DLP policy for the agent, live validation, and the guard settings in its <code>.env</code>. Untick to do Agent 365 only.</label></div>
+    </fieldset>
+
+    <div id="purviewFields">
+    <fieldset style="margin-top:1.5rem">
+      <legend>3a · Who the policy applies to</legend>
       <div class="row"><label for="scopeChoice">Scope</label>
         <select id="scopeChoice">
           <option value="me">Just me (recommended for a first run)</option>
@@ -143,7 +149,7 @@
     </fieldset>
 
     <fieldset style="margin-top:1.5rem">
-      <legend>4 · How it enforces</legend>
+      <legend>3b · How it enforces</legend>
       <div class="row"><label for="modeChoice">Mode</label>
         <select id="modeChoice">
           <option value="1">Test with notifications (recommended)</option>
@@ -157,24 +163,32 @@
     </fieldset>
 
     <fieldset style="margin-top:1.5rem">
-      <legend>5 · Activity capture</legend>
+      <legend>3c · Activity capture</legend>
       <div class="check"><input type="checkbox" id="wantDspm" checked><label for="wantDspm">Create the DSPM for AI collection policy</label></div>
       <div class="check"><input type="checkbox" id="dspmIngest"><label for="dspmIngest">Store full prompt and response text in Purview
         <span class="hint" style="display:block">A privacy and data-residency decision — confirm with the data owner first.</span></label></div>
     </fieldset>
+    </div>
 
     <fieldset style="margin-top:1.5rem">
-      <legend>6 · Agent 365 registration</legend>
-      <div class="check"><input type="checkbox" id="wantAgent365" checked><label for="wantAgent365">Register this agent in the Agent 365 registry</label></div>
+      <legend>4 · Agent 365</legend>
+      <div class="check"><input type="checkbox" id="wantAgent365" checked><label for="wantAgent365"><strong>Register in Agent 365</strong> — identity blueprint, agent identity, inheritable permissions, registry entry (shows under Agents → All agents).</label></div>
       <div id="a365Fields">
-        <span class="hint">Uses the name and address from section 2.</span>
         <div class="row" style="margin-top:.6rem"><label for="agentDescription">One-line description</label><input type="text" id="agentDescription" placeholder="auto: &lt;name&gt; — governed by Microsoft Agent 365"><span class="hint">Shown in Teams and in the Agent 365 inventory.</span></div>
-        <div class="check"><input type="checkbox" id="wantTeams" checked><label for="wantTeams"><strong>Publish to Teams</strong> — adds the agent to your organisation&rsquo;s app catalog, installs it for the people in scope, registers its messaging endpoint, and sends you a hello from the agent so you can reply to it.</label></div>
+        <div class="check"><input type="checkbox" id="wantConsent" checked><label for="wantConsent">Grant tenant-wide admin consent to the Messaging Bot API, Observability API and Agent 365 Tools (needed for Teams delivery and the Activity tab)</label></div>
+        <div class="check"><input type="checkbox" id="wantObservability" checked><label for="wantObservability">Turn on observability — turns appear in the Agent 365 Activity tab</label></div>
+        <div class="check"><input type="checkbox" id="wantTeams" checked><label for="wantTeams"><strong>Publish to Teams</strong></label></div>
+        <div id="teamsFields" style="margin-left:1.6rem">
+          <div class="check"><input type="checkbox" id="teamsPublish" checked><label for="teamsPublish">Add the app to the organisation&rsquo;s app catalog</label></div>
+          <div class="check"><input type="checkbox" id="teamsInstall" checked><label for="teamsInstall">Install it for the people in scope (their Teams app bar)</label></div>
+          <div class="check"><input type="checkbox" id="teamsEndpoint" checked><label for="teamsEndpoint">Register the messaging endpoint in the Teams Developer Portal</label></div>
+          <div class="check"><input type="checkbox" id="teamsHello" checked><label for="teamsHello">Send me a hello from the agent in Teams, as proof</label></div>
+        </div>
       </div>
     </fieldset>
 
     <fieldset style="margin-top:1.5rem">
-      <legend>7 · Advanced</legend>
+      <legend>5 · Advanced</legend>
       <div class="check"><input type="checkbox" id="showAdv"><label for="showAdv">Change the defaults (you shouldn&rsquo;t need to)</label></div>
       <div id="advFields" hidden>
         <div class="row"><label for="attribUpn">Attribute activity to (UPN)</label><input type="text" id="attribUpn"></div>
@@ -192,7 +206,7 @@
     </fieldset>
 
     <fieldset style="margin-top:1.5rem">
-      <legend>8 · Afterwards</legend>
+      <legend>6 · Afterwards</legend>
       <div class="check"><input type="checkbox" id="revokeAfter" checked><label for="revokeAfter">Revoke the connector's Compliance Administrator and Exchange access once provisioning finishes — the runtime needs neither.</label></div>
     </fieldset>
   </form>
@@ -347,6 +361,8 @@ $("scopeChoice").onchange = (e) => {
 };
 $("modeChoice").onchange = (e) => { $("modeWarn").hidden = e.target.value !== "3"; };
 $("wantAgent365").onchange = (e) => { $("a365Fields").hidden = !e.target.checked; };
+$("wantTeams").onchange = (e) => { $("teamsFields").hidden = !e.target.checked; };
+$("wantPurview").onchange = (e) => { $("purviewFields").hidden = !e.target.checked; };
 $("showAdv").onchange = (e) => { $("advFields").hidden = !e.target.checked; };
 
 // --- learn what we can from the agent's own folder ---
@@ -411,7 +427,11 @@ function answers() {
     wantCreditCard: $("wantCreditCard").checked,
     customSitTerms: $("customSitTerms").value,
     failClosed: $("failClosed").checked,
+    wantPurview: $("wantPurview").checked,
     wantDspm: $("wantDspm").checked, dspmIngest: $("dspmIngest").checked,
+    wantConsent: $("wantConsent").checked, wantObservability: $("wantObservability").checked,
+    teamsPublish: $("teamsPublish").checked, teamsInstall: $("teamsInstall").checked,
+    teamsEndpoint: $("teamsEndpoint").checked, teamsHello: $("teamsHello").checked,
     wantAgent365: $("wantAgent365").checked,
     agentName: name, agentUrl: $("agentUrl").value.trim().replace(/\/+$/, ""),
     transport: or("transport", "JSONRPC"),
@@ -447,8 +467,9 @@ function validate(a) {
   if ($("agentKind").value === "proxy") {
     if (!/^https?:\/\//i.test(a.upstreamUrl)) return "Enter the vendor agent\u2019s API address (http:// or https://).";
   } else if (!a.envPath) return "Point me at the agent\u2019s folder.";
-  if ($("scopeChoice").value === "1" && !a.pilotGroup) return "Name the group, or choose \u201cJust me\u201d.";
-  if ($("scopeChoice").value === "2" && !a.pilotUsers) return "List at least one person.";
+  if (!a.wantPurview && !a.wantAgent365) return "Nothing selected: turn on Purview, Agent 365, or both.";
+  if (a.wantPurview && $("scopeChoice").value === "1" && !a.pilotGroup) return "Name the group, or choose \u201cJust me\u201d.";
+  if (a.wantPurview && $("scopeChoice").value === "2" && !a.pilotUsers) return "List at least one person.";
   if (a.wantAgent365 && !/^https:\/\//i.test(a.agentUrl)) return "The agent's web address must start with https://";
   return null;
 }

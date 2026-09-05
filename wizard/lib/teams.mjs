@@ -262,25 +262,45 @@ export async function deleteBotRegistration(devPortal, botId) {
 /* ---------------------------------------------------------- smoke test --- */
 
 /**
+ * Token AS THE AGENT IDENTITY, the way the Microsoft 365 Agents SDK does it.
+ * Entra refuses plain app-only tokens for a blueprint against the Messaging
+ * Bot API (AADSTS82001); the agentic flow is two steps:
+ *   1. blueprint (client secret) → token for api://AzureAdTokenExchange with
+ *      fmi_path = <agent identity id>
+ *   2. client_id = <agent identity id>, client_assertion = that token →
+ *      app-only token for the resource.
+ */
+export async function agentIdentityToken({ tenantId, blueprintAppId, blueprintSecret, agentIdentityId, scope }) {
+  const url = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
+  const post = (body) => fetch(url, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(body) }).then((r) => r.json());
+  const step1 = await post({ client_id: blueprintAppId, client_secret: blueprintSecret, grant_type: "client_credentials",
+    scope: "api://AzureAdTokenExchange/.default", fmi_path: agentIdentityId, client_info: "2" });
+  if (!step1.access_token) throw new Error(`blueprint token: ${step1.error_description || step1.error}`);
+  const step2 = await post({ client_id: agentIdentityId, grant_type: "client_credentials", scope,
+    client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer", client_assertion: step1.access_token, client_info: "2" });
+  if (!step2.access_token) throw new Error(`agent identity token: ${step2.error_description || step2.error}`);
+  return step2.access_token;
+}
+
+/**
  * Prove the Teams path from the agent's side: mint a token as the agent
- * (blueprint credentials, Messaging Bot API scope), open a personal
- * conversation with the user and send one message. Works only once the app
- * is installed for that user — which the wizard did a moment earlier.
+ * identity, open a personal conversation with the user and send one message.
+ * Works only once the app is installed for that user — which the wizard did a
+ * moment earlier.
  *
  * Returns {ok, detail}. Never throws: the outcome is reported, not fatal.
  */
-export async function proactiveHello({ tenantId, blueprintAppId, blueprintSecret, messagingBotApiAppId, userId, agentName, text, serviceUrl = "https://smba.trafficmanager.net/teams/" }) {
-  const tok = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
-    method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ client_id: blueprintAppId, client_secret: blueprintSecret, grant_type: "client_credentials", scope: `${messagingBotApiAppId}/.default` }),
-  }).then((r) => r.json());
-  if (!tok.access_token) return { ok: false, detail: `agent token: ${tok.error_description || tok.error}` };
+export async function proactiveHello({ tenantId, blueprintAppId, blueprintSecret, agentIdentityId, messagingBotApiAppId, userId, agentName, text, serviceUrl = "https://smba.trafficmanager.net/teams/" }) {
+  let token;
+  try {
+    token = await agentIdentityToken({ tenantId, blueprintAppId, blueprintSecret, agentIdentityId, scope: `${messagingBotApiAppId}/.default` });
+  } catch (e) { return { ok: false, detail: e.message }; }
   const base = serviceUrl.replace(/\/+$/, "");
   const conv = await fetch(`${base}/v3/conversations`, {
-    method: "POST", headers: { authorization: `Bearer ${tok.access_token}`, "content-type": "application/json" },
+    method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify({
       bot: { id: `28:${blueprintAppId}`, name: agentName },
-      members: [{ id: userId }], // aadObjectId form is accepted by Teams for member ids
+      members: [{ id: userId }],
       tenantId, isGroup: false,
       channelData: { tenant: { id: tenantId } },
     }),
@@ -289,7 +309,7 @@ export async function proactiveHello({ tenantId, blueprintAppId, blueprintSecret
   if (!conv.ok) return { ok: false, detail: `create conversation HTTP ${conv.status}: ${convText.slice(0, 300)}` };
   const convId = JSON.parse(convText).id;
   const msg = await fetch(`${base}/v3/conversations/${encodeURIComponent(convId)}/activities`, {
-    method: "POST", headers: { authorization: `Bearer ${tok.access_token}`, "content-type": "application/json" },
+    method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify({ type: "message", from: { id: `28:${blueprintAppId}`, name: agentName }, text }),
   });
   const msgText = await msg.text();

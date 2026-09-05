@@ -117,7 +117,13 @@ async function ensureSp(appId, graph = dg) {
 }
 /** Object id of a user given a UPN or object id; throws when not found. */
 async function userIdOf(upnOrId, graph = dg) {
-  const u = await graph("GET", `/v1.0/users/${encodeURIComponent(upnOrId)}?$select=id`);
+  let u;
+  try { u = await graph("GET", `/v1.0/users/${encodeURIComponent(upnOrId)}?$select=id`); }
+  catch (e) {
+    // Only a 404 means "no such user"; anything else (token, throttling, outage) is its own message.
+    if (e?.status === 404) throw Object.assign(new Error(`user "${upnOrId}" not found`), { status: 404 });
+    throw new Error(`looking up "${upnOrId}": ${e.message}`);
+  }
   if (!u?.id) throw new Error(`user "${upnOrId}" not found`);
   return u.id;
 }
@@ -464,77 +470,85 @@ async function main(work) {
     proxyPort = await ask("  Port the proxy listens on:", "8787", "proxyPort");
   }
 
-  // --- policy scope: pilot group by default, tenant-wide only on purpose ---
-  console.log(`\n${C.b}Who should this DLP policy apply to?${C.reset}`);
-  console.log(`  ${C.d}1) A pilot group  (recommended — start small, expand later)`);
-  console.log(`  2) Specific users`);
-  console.log(`  3) Everyone in the tenant  (production-wide)${C.reset}`);
-  const scopeChoice = await ask("Choose 1/2/3:", "1", "scopeChoice");
+  // --- Microsoft Purview: the DLP / DSPM half. Off = the connector app is still
+  // created (Agent 365 registers through it) but no policy, no cert, no
+  // Compliance Administrator, and the guard is written disabled. ---
+  console.log(`\n${C.b}Microsoft Purview${C.reset}`);
+  const wantPurview = await yes("Provision Microsoft Purview (DLP policy, DSPM, live validation)?", true, "wantPurview");
+  let scopeInclusions = [{ Type: "Tenant", Identity: "All" }], scopeLabel = "n/a (Purview not provisioned)", pilotPlan = null, scopeChoice = "1";
+  let dlpMode = "TestWithNotifications", wantCreditCard = false, customSitTerms = [], failClosed = true, wantDspm = false, dspmIngest = false;
+  if (wantPurview) {
+    // --- policy scope: pilot group by default, tenant-wide only on purpose ---
+    console.log(`\n${C.b}Who should this DLP policy apply to?${C.reset}`);
+    console.log(`  ${C.d}1) A pilot group  (recommended — start small, expand later)`);
+    console.log(`  2) Specific users`);
+    console.log(`  3) Everyone in the tenant  (production-wide)${C.reset}`);
+    scopeChoice = await ask("Choose 1/2/3:", "1", "scopeChoice");
 
-  let scopeInclusions, scopeLabel, pilotPlan = null;
-  if (scopeChoice === "3") {
-    warn("Tenant-wide means EVERY user in this tenant is subject to the policy.");
-    if (!(await yes("Are you sure you want tenant-wide scope?", false, "confirmTenantWide"))) { closeInput(); die("Aborted — re-run and pick a pilot group."); }
-    if ((await ask(`Type ${C.b}TENANT-WIDE${C.reset} to confirm:`, "", "typeTenantWide")) !== "TENANT-WIDE") { closeInput(); die("Not confirmed. Aborted."); }
-    scopeInclusions = [{ Type: "Tenant", Identity: "All" }];
-    scopeLabel = "ALL USERS IN TENANT";
-  } else if (scopeChoice === "2") {
-    const upns = (await ask("Pilot user UPNs (comma-separated):", attribUpn, "pilotUsers")).split(",").map((s) => s.trim()).filter(Boolean);
-    if (!upns.length) { closeInput(); die("No users given."); }
-    const ids = [];
-    for (const u of upns) {
-      try { ids.push(await userIdOf(u)); }
-      catch { closeInput(); die(`User "${u}" not found in this tenant.`); }
+    if (scopeChoice === "3") {
+      warn("Tenant-wide means EVERY user in this tenant is subject to the policy.");
+      if (!(await yes("Are you sure you want tenant-wide scope?", false, "confirmTenantWide"))) { closeInput(); die("Aborted — re-run and pick a pilot group."); }
+      if ((await ask(`Type ${C.b}TENANT-WIDE${C.reset} to confirm:`, "", "typeTenantWide")) !== "TENANT-WIDE") { closeInput(); die("Not confirmed. Aborted."); }
+      scopeInclusions = [{ Type: "Tenant", Identity: "All" }];
+      scopeLabel = "ALL USERS IN TENANT";
+    } else if (scopeChoice === "2") {
+      const upns = (await ask("Pilot user UPNs (comma-separated):", attribUpn, "pilotUsers")).split(",").map((s) => s.trim()).filter(Boolean);
+      if (!upns.length) { closeInput(); die("No users given."); }
+      const ids = [];
+      for (const u of upns) {
+        try { ids.push(await userIdOf(u)); }
+        catch { closeInput(); die(`User "${u}" not found in this tenant.`); }
+      }
+      // Purview can't bind to users, so these people go into a pilot group
+      // that is created after "Proceed" (never during a rehearsal).
+      pilotPlan = {
+        displayName: `${purviewAppName} Pilot`,
+        mailNickname: slugify(`${purviewAppName}-pilot`),
+        memberIds: ids, upns,
+      };
+      scopeLabel = `pilot group "${pilotPlan.displayName}" (${upns.length}: ${upns.join(", ")})`;
+    } else {
+      const grp = await ask("Pilot group email / object id:", "", "pilotGroup");
+      if (!grp) { closeInput(); die("A pilot group is required for scope 1. Create one in Entra, or pick option 2 or 3."); }
+      // Checked even in a dry run: it's a read-only lookup, and a rehearsal that
+      // can't catch what provisioning would fail on is worthless.
+      let g;
+      try { g = await groupLookup(grp); }
+      catch { closeInput(); die(`Group "${grp}" not found in this tenant. Pick "Just me", or create the group in Entra first.`); }
+      if (!g?.mail) {
+        closeInput();
+        die(`Group "${g?.displayName ?? grp}" has no mail address. Purview DLP can only bind to a Microsoft 365 group or a mail-enabled group — pick one of those, or choose "Just me".`);
+      }
+      scopeInclusions = [{ Type: "Group", Identity: g.mail }];
+      scopeLabel = `group ${g.displayName} <${g.mail}>`;
     }
-    // Purview can't bind to users, so these people go into a pilot group
-    // that is created after "Proceed" (never during a rehearsal).
-    pilotPlan = {
-      displayName: `${purviewAppName} Pilot`,
-      mailNickname: slugify(`${purviewAppName}-pilot`),
-      memberIds: ids, upns,
-    };
-    scopeLabel = `pilot group "${pilotPlan.displayName}" (${upns.length}: ${upns.join(", ")})`;
-  } else {
-    const grp = await ask("Pilot group email / object id:", "", "pilotGroup");
-    if (!grp) { closeInput(); die("A pilot group is required for scope 1. Create one in Entra, or pick option 2 or 3."); }
-    // Checked even in a dry run: it's a read-only lookup, and a rehearsal that
-    // can't catch what provisioning would fail on is worthless.
-    let g;
-    try { g = await groupLookup(grp); }
-    catch { closeInput(); die(`Group "${grp}" not found in this tenant. Pick "Just me", or create the group in Entra first.`); }
-    if (!g?.mail) {
-      closeInput();
-      die(`Group "${g?.displayName ?? grp}" has no mail address. Purview DLP can only bind to a Microsoft 365 group or a mail-enabled group — pick one of those, or choose "Just me".`);
-    }
-    scopeInclusions = [{ Type: "Group", Identity: g.mail }];
-    scopeLabel = `group ${g.displayName} <${g.mail}>`;
+
+    // --- enforcement mode: test by default ---
+    console.log(`\n${C.b}Enforcement mode?${C.reset}`);
+    console.log(`  ${C.d}1) Test with notifications  (recommended — audits and alerts, blocks nothing)`);
+    console.log(`  2) Test without notifications  (silent audit only)`);
+    console.log(`  3) Enable  (actively BLOCKS matching prompts)${C.reset}`);
+    const modeChoice = await ask("Choose 1/2/3:", "1", "modeChoice");
+    if (modeChoice === "3") {
+      warn("Enable means matching prompts are BLOCKED for everyone in scope, in production.");
+      if (!(await yes("Turn on active blocking now?", false, "confirmEnforce"))) { closeInput(); die("Aborted — re-run and choose a test mode."); }
+      if ((await ask(`Type ${C.b}ENFORCE${C.reset} to confirm:`, "", "typeEnforce")) !== "ENFORCE") { closeInput(); die("Not confirmed. Aborted."); }
+      dlpMode = "Enable";
+    } else if (modeChoice === "2") dlpMode = "TestWithoutNotifications";
+
+    wantCreditCard = await yes("Create a DLP rule for Credit Card Numbers?", true, "wantCreditCard");
+    customSitTerms = (await ask("Extra block keywords (comma-separated, e.g. salary,compensation) or blank:", "", "customSitTerms")).split(",").map((s) => s.trim()).filter(Boolean);
+    failClosed = await yes("Fail CLOSED (block when Purview is unreachable)?", true, "failClosed");
+
+    // --- DSPM ingestion is a data-residency decision, not a checkbox ---
+    console.log(`\n${C.b}DSPM for AI collection policy${C.reset}`);
+    console.log(`  ${C.d}Captures prompts and replies so they appear in DSPM for AI and Activity Explorer.`);
+    console.log(`  This STORES the full text of user prompts and model responses in Microsoft Purview.`);
+    console.log(`  Confirm with the customer's privacy/data-residency owner before enabling.${C.reset}`);
+    wantDspm = await yes("Create the DSPM collection policy?", true, "wantDspm");
+    dspmIngest = wantDspm ? await yes("  Store full prompt/response content (ingestion)?", false, "dspmIngest") : false;
+
   }
-
-  // --- enforcement mode: test by default ---
-  console.log(`\n${C.b}Enforcement mode?${C.reset}`);
-  console.log(`  ${C.d}1) Test with notifications  (recommended — audits and alerts, blocks nothing)`);
-  console.log(`  2) Test without notifications  (silent audit only)`);
-  console.log(`  3) Enable  (actively BLOCKS matching prompts)${C.reset}`);
-  const modeChoice = await ask("Choose 1/2/3:", "1", "modeChoice");
-  let dlpMode = "TestWithNotifications";
-  if (modeChoice === "3") {
-    warn("Enable means matching prompts are BLOCKED for everyone in scope, in production.");
-    if (!(await yes("Turn on active blocking now?", false, "confirmEnforce"))) { closeInput(); die("Aborted — re-run and choose a test mode."); }
-    if ((await ask(`Type ${C.b}ENFORCE${C.reset} to confirm:`, "", "typeEnforce")) !== "ENFORCE") { closeInput(); die("Not confirmed. Aborted."); }
-    dlpMode = "Enable";
-  } else if (modeChoice === "2") dlpMode = "TestWithoutNotifications";
-
-  const wantCreditCard = await yes("Create a DLP rule for Credit Card Numbers?", true, "wantCreditCard");
-  const customSitTerms = (await ask("Extra block keywords (comma-separated, e.g. salary,compensation) or blank:", "", "customSitTerms")).split(",").map((s) => s.trim()).filter(Boolean);
-  const failClosed = await yes("Fail CLOSED (block when Purview is unreachable)?", true, "failClosed");
-
-  // --- DSPM ingestion is a data-residency decision, not a checkbox ---
-  console.log(`\n${C.b}DSPM for AI collection policy${C.reset}`);
-  console.log(`  ${C.d}Captures prompts and replies so they appear in DSPM for AI and Activity Explorer.`);
-  console.log(`  This STORES the full text of user prompts and model responses in Microsoft Purview.`);
-  console.log(`  Confirm with the customer's privacy/data-residency owner before enabling.${C.reset}`);
-  const wantDspm = await yes("Create the DSPM collection policy?", true, "wantDspm");
-  const dspmIngest = wantDspm ? await yes("  Store full prompt/response content (ingestion)?", false, "dspmIngest") : false;
 
   // --- Agent 365 registration (identity + registry + Activity tab) ---
   console.log(`\n${C.b}Agent 365 registration${C.reset}`);
@@ -546,6 +560,7 @@ async function main(work) {
 
   let agentName = "", agentUrl = "", sponsorUpn = "", existingBlueprintId = "", transport = "JSONRPC", messagingEndpoint = "";
   let wantTeams = false, agentDescription = "";
+  let wantConsent = false, wantObservability = false, teamsPublish = false, teamsInstall = false, teamsEndpoint = false, teamsHello = false;
   if (wantAgent365) {
     agentName = await ask("  Agent display name:", purviewAppName, "agentName");
     agentUrl = await ask("  Agent endpoint URL (https):", "", "agentUrl");
@@ -560,30 +575,43 @@ async function main(work) {
     existingBlueprintId = await ask("  Reuse an existing blueprint object id [blank = create new]:", "", "existingBlueprintId");
     messagingEndpoint = await ask("  Messaging endpoint (where Teams delivers messages):", `${agentUrl.replace(/\/+$/, "")}/api/messages`, "messagingEndpoint");
     agentDescription = await ask("  One-line description (shown in Teams):", `${agentName} — governed by Microsoft Agent 365`, "agentDescription");
-    wantTeams = await yes("  Publish to Teams (org app catalog, install for the pilot users, register the messaging endpoint)?", true, "wantTeams");
+    wantConsent = await yes("  Grant tenant-wide admin consent (Messaging Bot API, Observability API, Agent 365 Tools)?", true, "wantConsent");
+    wantObservability = await yes("  Turn on observability (Agent 365 Activity tab)?", true, "wantObservability");
+    wantTeams = await yes("  Publish to Teams?", true, "wantTeams");
+    if (wantTeams) {
+      teamsPublish = await yes("    Publish the app to the org app catalog?", true, "teamsPublish");
+      teamsInstall = await yes("    Install it for the pilot users?", true, "teamsInstall");
+      teamsEndpoint = await yes("    Register the messaging endpoint (Teams Developer Portal)?", true, "teamsEndpoint");
+      teamsHello = await yes("    Send a hello from the agent into your Teams?", true, "teamsHello");
+    }
   }
-  const wantObservability = wantAgent365;
+  if (!wantPurview && !wantAgent365) { closeInput(); die("Nothing selected: turn on Purview, Agent 365, or both."); }
 
   [["App registration name", appRegName], ["Purview app name", purviewAppName], ["Agent name", agentName]]
     .forEach(([n, v]) => assertEnvSafe(n, v));
 
-  const revokeAfter = await yes(
+  const revokeAfter = !wantPurview ? false : await yes(
     "\nAfter provisioning, revoke the connector's Compliance Administrator + Exchange.ManageAsApp?\n" +
     `  ${C.d}(Only needed to CREATE policies. Runtime needs neither. Re-grant to change policies later.)${C.reset}`, true, "revokeAfter");
 
   console.log(`\n${C.b}About to provision in tenant ${tenantId}:${C.reset}`);
-  console.log(`  • App registration "${appRegName}" + secret + cert`);
+  console.log(`  • App registration "${appRegName}" + secret${wantPurview ? " + cert" : ""}`);
+  if (wantPurview) {
   console.log(`  • Graph: Content.Process.All, ProtectionScopes.Compute.All; Exchange.ManageAsApp; Compliance Administrator role`);
   console.log(`  • DLP policy "${purviewAppName} DLP"${wantCreditCard ? " + Credit Card rule" : ""}${customSitTerms.length ? ` + custom SIT (${customSitTerms.join(", ")})` : ""}`);
   console.log(`      mode:  ${dlpMode === "Enable" ? `${C.r}${C.b}Enable (ACTIVE BLOCKING)${C.reset}` : `${C.g}${dlpMode}${C.reset}`}`);
   console.log(`      scope: ${scopeChoice === "3" ? `${C.r}${C.b}${scopeLabel}${C.reset}` : `${C.g}${scopeLabel}${C.reset}`}`);
   console.log(`  • DSPM collection policy: ${wantDspm ? `yes (ingestion ${dspmIngest ? `${C.y}ON — stores prompt text${C.reset}` : "OFF"})` : "no"}`);
+  } else {
+  console.log(`  • Purview: ${C.y}not provisioned${C.reset} (guard written disabled)`);
+  }
   console.log(`  • Write ${envPath}${existsSync(envPath) ? `  ${C.d}(backup → ${envPath}.bak)${C.reset}` : ""}`);
   console.log(`  • Post-provision revoke of admin privileges: ${revokeAfter ? "yes" : `${C.y}no — connector keeps Compliance Administrator${C.reset}`}`);
   if (wantAgent365) {
     console.log(`  • Agent 365: ${existingBlueprintId ? `reuse blueprint ${existingBlueprintId}` : "create identity blueprint + secret"}`);
     console.log(`               register instance "${agentName}" at ${agentUrl} (${transport})`);
-    console.log(`  • Teams: ${wantTeams ? `publish "${agentName}" to the org app catalog, install it for the pilot users, register ${messagingEndpoint}` : `${C.y}not published${C.reset}`}`);
+    console.log(`               consent ${wantConsent ? "yes" : "no"}, observability ${wantObservability ? "on" : "off"}`);
+    console.log(`  • Teams: ${wantTeams ? [teamsPublish && "publish to the org app catalog", teamsInstall && "install for the pilot users", teamsEndpoint && `register ${messagingEndpoint}`, teamsHello && "send a hello"].filter(Boolean).join(", ") : `${C.y}not published${C.reset}`}`);
   } else {
     console.log(`  • Agent 365: ${C.y}not registered${C.reset}`);
   }
@@ -591,10 +619,10 @@ async function main(work) {
 
   if (DRY_RUN) {
     if (pilotPlan) plan(`create pilot group "${pilotPlan.displayName}" with ${pilotPlan.memberIds.length} member(s) and scope the DLP policy to it`);
-    plan("create the app registration, secret, certificate and role assignments");
-    plan(`create DLP policy in ${dlpMode} mode scoped to ${scopeLabel}`);
+    plan(`create the app registration, secret${wantPurview ? ", certificate" : ""} and role assignments`);
+    if (wantPurview) plan(`create DLP policy in ${dlpMode} mode scoped to ${scopeLabel}`);
     plan(`write ${envPath}`);
-    plan("validate with token → protectionScopes/compute → processContent");
+    if (wantPurview) plan("validate with token → protectionScopes/compute → processContent");
     // Render the closing output now (nothing is written) so a rehearsal
     // exercises the same reporting code a real run finishes with.
     void integrationSnippet(lang, { envPath, upstreamUrl, proxyPort, agentUrl });
@@ -602,11 +630,11 @@ async function main(work) {
     if (wantAgent365) {
       plan(`create the agent identity blueprint and register "${agentName}" at ${agentUrl}`);
       plan("verify the registration by reading it back from the Agent 365 registry");
-      if (wantTeams) {
-        plan(`build the Teams app package (id = blueprint appId) and publish it to the org app catalog`);
-        plan("install the Teams app for the pilot users and register the messaging endpoint in the Teams Developer Portal");
-        plan("send a hello from the agent into your Teams to prove the path");
-      }
+      if (wantConsent) plan("grant tenant-wide admin consent from the blueprint to the Agent 365 resources");
+      if (teamsPublish) plan("build the Teams app package (id = blueprint appId) and publish it to the org app catalog");
+      if (teamsInstall) plan("install the Teams app for the pilot users");
+      if (teamsEndpoint) plan("register the messaging endpoint in the Teams Developer Portal");
+      if (teamsHello) plan("send a hello from the agent into your Teams to prove the path");
     }
     console.log(`\n${C.c}Dry run complete — nothing was changed.${C.reset}\n`);
     closeInput();
@@ -653,11 +681,11 @@ async function main(work) {
       record(`app role ${label} on SP ${spId}`);
     } catch (e) { if (!/already exists/i.test(String(e.message || e))) throw e; }
   };
-  const roles = [
+  const roles = wantPurview ? [
     [graphSp, ROLE_CONTENT_PROCESS, "Content.Process.All"],
     [graphSp, ROLE_PROTECTION_SCOPES, "ProtectionScopes.Compute.All"],
     [exoSp, ROLE_EXCHANGE_MANAGE, "Exchange.ManageAsApp"],
-  ];
+  ] : [];
   if (wantAgent365) {
     // Registration is performed by this app: the admin's delegated token has no agent scopes.
     roles.push(
@@ -676,11 +704,13 @@ async function main(work) {
   for (const [rid, role, label] of roles) await assignRole(rid, role, label);
   ok("App-role assignments granted");
 
+  let complianceAssignmentId = "", pfxPw = "", pfx = "", policiesOk = true;
+  if (wantPurview) {
   // ---- 3. cert + Compliance Administrator role ----
   info("Creating certificate and assigning Compliance Administrator…");
   // Random, high-entropy, and never placed on a command line or in a file.
-  const pfxPw = randomBytes(24).toString("base64url");
-  const { certPem, pfxPath: pfx } = makeCertificate({ work, subjectName: appRegName, pfxPw });
+  pfxPw = randomBytes(24).toString("base64url");
+  const { certPem, pfxPath } = makeCertificate({ work, subjectName: appRegName, pfxPw }); pfx = pfxPath;
   const certDer = readFileSync(certPem, "utf8").replace(/-----[A-Z ]+-----|\s+/g, "");
   {
     // keyCredentials is replaced wholesale on PATCH: keep what is there.
@@ -691,7 +721,7 @@ async function main(work) {
   }
   record(`certificate credential on app ${appId}`);
 
-  let complianceAssignmentId = "";
+  complianceAssignmentId = "";
   try {
     const ra = await withReplicationLocal(() => dg("POST", "/v1.0/roleManagement/directory/roleAssignments",
       { principalId: spId, roleDefinitionId: ROLE_COMPLIANCE_ADMIN, directoryScopeId: "/" }));
@@ -717,10 +747,13 @@ async function main(work) {
   }
   ok("Certificate uploaded, Compliance Administrator assigned");
 
+  }
+
   // ---- resolve attributed user + onmicrosoft domain ----
   const userId = await userIdOf(attribUpn);
   if (!org) die("This tenant has no *.onmicrosoft.com verified domain; Connect-IPPSSession needs one.");
 
+  if (wantPurview) {
   // ---- 4. DLP + collection policies via Security & Compliance PowerShell ----
   info("Provisioning Purview policies (this can retry while permissions propagate)…");
   const ps = buildProvisionScript({
@@ -729,7 +762,7 @@ async function main(work) {
   });
   const psPath = join(work, "provision.ps1");
   writeFileSync(psPath, ps, { mode: 0o600 });
-  let policiesOk = true;
+  policiesOk = true;
   try {
     // Password crosses to pwsh via the environment, never via the script text.
     // Output is forwarded line by line minus MSAL's raw token-error dump, which
@@ -744,6 +777,8 @@ async function main(work) {
     warn("The connector + permissions are still set. Re-run the wizard to retry policy creation.");
   }
 
+  }
+
   // ---- 4b. Agent 365: blueprint → secret → principal → identity → registration ----
   // Every call here has been run live against a licensed tenant. Failures are
   // reported, not fatal: Purview provisioning above already succeeded.
@@ -753,7 +788,7 @@ async function main(work) {
     try {
       let sponsorId;
       try { sponsorId = await userIdOf(sponsorUpn); }
-      catch { throw new Error(`sponsor "${sponsorUpn}" not found in this tenant`); }
+      catch (e) { throw new Error(e.status === 404 ? `sponsor "${sponsorUpn}" not found in this tenant` : `sponsor lookup failed — ${e.message}`); }
       // The resource service principals must exist BEFORE the blueprint makes
       // their scopes inheritable: Graph accepts the POST for a missing SP and
       // silently drops it (observed live: 3 reported, 1 read back).
@@ -774,11 +809,15 @@ async function main(work) {
       }, (m) => info(`  ${m}`));
       for (const st of a365.steps) ok(`  ${st}`);
       // Admin consent — the step that makes the Activity tab and Teams delivery possible.
-      try {
-        for (const line of await grantBlueprintConsent({ blueprintPrincipalId: a365.blueprintPrincipalId })) {
-          (line.startsWith("WARNING") ? warn : ok)(`  ${line}`);
-        }
-      } catch (e) { warn(`  consent grants failed: ${String(e.message || e).slice(0, 200)}`); }
+      if (wantConsent) {
+        try {
+          for (const line of await grantBlueprintConsent({ blueprintPrincipalId: a365.blueprintPrincipalId })) {
+            (line.startsWith("WARNING") ? warn : ok)(`  ${line}`);
+          }
+        } catch (e) { warn(`  consent grants failed: ${String(e.message || e).slice(0, 200)}`); }
+      } else {
+        warn("  admin consent skipped by choice — Teams delivery and the Activity tab need it; grant it in Entra later or re-run.");
+      }
       record(`Agent 365 blueprint ${a365.blueprintId} (appId ${a365.blueprintAppId}) — delete in Entra → Agent identities`);
       record(`Agent 365 registration ${a365.registrationId} — delete with: DELETE https://graph.microsoft.com/beta/copilot/agentRegistrations/${a365.registrationId}`);
       if (!a365.verified) warn("  Registration could not be read back — check M365 admin center → Agents.");
@@ -796,7 +835,7 @@ async function main(work) {
   if (a365 && wantTeams) {
     info("Publishing to Teams…");
     teams = { teamsAppId: "", installed: [], endpoint: null, errors: [] };
-    try {
+    if (teamsPublish) try {
       const { zip } = buildTeamsPackage({
         blueprintAppId: a365.blueprintAppId, agentName, description: agentDescription, agentUrl,
         developer: { name: orgName || purviewAppName },
@@ -807,23 +846,7 @@ async function main(work) {
       record(`Teams app ${pub.teamsAppId} in the org catalog — remove in Teams admin center → Manage apps`);
     } catch (e) { teams.errors.push(`publish: ${String(e.message || e).slice(0, 300)}`); warn(`  Teams publish failed: ${String(e.message || e).slice(0, 300)}`); }
 
-    if (teams.teamsAppId) {
-      // Who gets it in their app bar: the attributed user, the admin, and the pilot group.
-      const targets = new Set([userId, account.id]);
-      if (pilotGroupId) {
-        try {
-          const members = await dg("GET", `/v1.0/groups/${pilotGroupId}/members/microsoft.graph.user?$select=id&$top=200`);
-          for (const m of members?.value ?? []) targets.add(m.id);
-        } catch (e) { warn(`  could not list pilot group members: ${String(e.message || e).slice(0, 120)}`); }
-      }
-      teams.installed = await installForUsers(dg, teams.teamsAppId, [...targets]);
-      const done = teams.installed.filter((x) => x.status !== "failed").length;
-      const failed = teams.installed.filter((x) => x.status === "failed");
-      ok(`  installed for ${done}/${teams.installed.length} user(s)`);
-      for (const f of failed) warn(`    ${f.userId}: ${f.error.slice(0, 160)}`);
-    }
-
-    try {
+    if (teamsEndpoint) try {
       if (!(await devPortalSignIn())) throw new Error("no Teams Developer Portal sign-in (the installer asks for it)");
       teams.endpoint = await registerMessagingEndpoint(devPortal, {
         botId: a365.blueprintAppId, name: agentName, description: agentDescription, messagingEndpoint,
@@ -835,13 +858,49 @@ async function main(work) {
       warn(`  messaging endpoint not registered: ${String(e.message || e).slice(0, 300)}`);
       warn(`  Do it by hand: Teams Developer Portal → Tools → Bot management → New bot → Bot ID ${a365.blueprintAppId}, endpoint ${messagingEndpoint}`);
     }
+
+    if (teams.teamsAppId && teamsInstall) {
+      // Who gets it in their app bar: the attributed user, the admin, and the pilot group.
+      const targets = new Set([userId, account.id]);
+      if (pilotGroupId) {
+        try {
+          const members = await dg("GET", `/v1.0/groups/${pilotGroupId}/members/microsoft.graph.user?$select=id&$top=200`);
+          for (const m of members?.value ?? []) targets.add(m.id);
+        } catch (e) { warn(`  could not list pilot group members: ${String(e.message || e).slice(0, 120)}`); }
+      }
+      // Teams creates the chat thread with the bot on install, which needs the
+      // bot registration (previous step) to have reached its backend.
+      let attempt = 0;
+      for (;;) {
+        teams.installed = await installForUsers(dg, teams.teamsAppId, [...targets]);
+        const transient = teams.installed.filter((x) => x.status === "failed" && /CreateThreadS2SRequest|Skype backend/i.test(x.error));
+        if (!transient.length || ++attempt >= 6) break;
+        info(`  ${transient.length} install(s) not accepted yet (bot registration propagating) — retrying in 20s`);
+        await new Promise((r) => setTimeout(r, 20000));
+      }
+      const done = teams.installed.filter((x) => x.status !== "failed").length;
+      const failed = teams.installed.filter((x) => x.status === "failed");
+      ok(`  installed for ${done}/${teams.installed.length} user(s)`);
+      for (const f of failed) warn(`    ${f.userId}: ${f.error.slice(0, 160)}`);
+    }
   }
 
   // ---- 5. write .env ----
   info(`Writing ${envPath}…`);
-  const block = [
+  // Lines a previous run wrote inside the managed block, so a partial re-run
+  // (Purview only, or Agent 365 only) never erases the other half.
+  const prevBlock = (() => {
+    if (!existsSync(envPath)) return [];
+    const prev = readFileSync(envPath, "utf8").split("\n");
+    const i = prev.indexOf(BEGIN), j = prev.indexOf(END);
+    return i > -1 && j > i ? prev.slice(i + 1, j) : [];
+  })();
+  const prevPurview = prevBlock.filter((l) => /^PURVIEW_/.test(l));
+  const block = !wantPurview && prevPurview.length
+    ? ["# --- Agent 365 Governance Kit (Purview — kept from the previous run) ---", ...prevPurview]
+    : [
     "# --- Agent 365 Governance Kit (Purview) ---",
-    "PURVIEW_ENABLED=true",
+    `PURVIEW_ENABLED=${wantPurview}`,
     `PURVIEW_TENANT_ID=${tenantId}`,
     `PURVIEW_CLIENT_ID=${appId}`,
     `PURVIEW_CLIENT_SECRET=${clientSecret}`,
@@ -855,7 +914,7 @@ async function main(work) {
   ];
   if (a365 && a365.blueprintId) {
     block.push("", "# --- Agent 365 identity + observability ---",
-      "ENABLE_A365_OBSERVABILITY_EXPORTER=true",
+      `ENABLE_A365_OBSERVABILITY_EXPORTER=${wantObservability}`,
       "A365_OBSERVABILITY_LOG_LEVEL=info|warn|error",
       `agent365Observability__tenantId=${tenantId}`,
       `agent365Observability__clientId=${a365.blueprintAppId}`,
@@ -886,6 +945,12 @@ async function main(work) {
       "agentic_scopes=https://graph.microsoft.com/.default",
       "agentic_connectionName=AgenticAuthConnection");
   }
+  if (!(a365 && a365.blueprintId)) {
+    // A Purview-only re-run must not erase the Agent 365 wiring a previous run wrote.
+    const keep = prevBlock
+      .filter((l) => /^(ENABLE_A365_|A365_OBSERVABILITY|agent365Observability__|AGENT365_|agent_id=|connections__|connectionsMap__|agentic_)/.test(l));
+    if (keep.length) { block.push("", "# --- Agent 365 (kept from the previous run) ---", ...keep); info(`  kept ${keep.length} Agent 365 setting(s) from the previous run`); }
+  }
   if (lang === "proxy") {
     block.push("", "# --- governance proxy (fronts a third-party agent) ---",
       `GOVERNANCE_UPSTREAM=${upstreamUrl}`,
@@ -898,26 +963,32 @@ async function main(work) {
   ok(`.env ${how} (${envPath})`);
 
   // ---- 6. validate: token → computeScopes → processContent ----
-  info("Validating end to end…");
-  try {
-    const steps = await validate({ tenantId, appId, clientSecret, userId, purviewAppName });
-    for (const s of steps) ok(`  ${s}`);
-  } catch (e) {
-    warn("Validation failed (often just permission/policy propagation — retry in ~15 min):");
-    warn(`  ${e.message || e}`);
+  if (wantPurview) {
+    info("Validating end to end…");
+    try {
+      const steps = await validate({ tenantId, appId, clientSecret, userId, purviewAppName });
+      for (const s of steps) ok(`  ${s}`);
+    } catch (e) {
+      warn("Validation failed (often just permission/policy propagation — retry in ~15 min):");
+      warn(`  ${e.message || e}`);
+    }
   }
 
   // ---- 6b. prove the Teams path from the agent's side ----
   let hello = null;
-  if (teams?.teamsAppId && a365?.blueprintSecret) {
+  if (teams?.teamsAppId && a365?.blueprintSecret && teamsHello) {
     info("Sending a hello from the agent into your Teams…");
     hello = await proactiveHello({
-      tenantId, blueprintAppId: a365.blueprintAppId, blueprintSecret: a365.blueprintSecret,
+      tenantId, blueprintAppId: a365.blueprintAppId, blueprintSecret: a365.blueprintSecret, agentIdentityId: a365.agentIdentityId,
       messagingBotApiAppId: MESSAGING_BOT_API_APP, userId: account.id, agentName,
       text: `Hi, I'm ${agentName}. I'm registered in Microsoft Agent 365 and every message here is checked by Purview. Reply to talk to me.`,
     });
     if (hello.ok) ok(`  ${hello.detail}`);
-    else warn(`  hello not delivered yet: ${hello.detail}`);
+    else {
+      warn(`  hello not sent: ${hello.detail}`);
+      warn(`  Teams did not accept a proactive message at the generic service URL. Everything else is in place:`);
+      warn(`  open Teams → Apps → "${agentName}" (already installed for you) and send it a message.`);
+    }
   }
 
   // ---- 7. drop provisioning-only privileges ----
@@ -951,7 +1022,11 @@ async function main(work) {
   closeInput();
 
   // ---- integration snippet (per language) ----
-  if (lang === "proxy") {
+  if (!wantPurview) {
+    console.log(prevPurview.length
+      ? `\n${C.d}Purview not touched this run; the previous run's settings are kept.${C.reset}`
+      : `\n${C.y}Purview was not provisioned (your choice).${C.reset} The guard is written disabled; re-run with Purview on to enable it.`);
+  } else if (lang === "proxy") {
     console.log(`\n${C.g}${C.b}Purview governance is set up.${C.reset} Nothing to change in the vendor's agent — run the proxy next to this .env:\n`);
   } else {
     console.log(`\n${C.g}${C.b}Purview governance is set up.${C.reset} Add these two calls to your agent:\n`);
@@ -966,7 +1041,7 @@ async function main(work) {
   }
 
   // ---- Agent 365 manual completion steps ----
-  if (wantObservability) {
+  if (wantAgent365) {
     const checklist = agent365Checklist({
       agentName: agentName || purviewAppName, lang, blueprintId: a365?.blueprintId ?? "",
       blueprintAppId: a365?.blueprintAppId ?? "", messagingEndpoint, teams,
@@ -1220,13 +1295,28 @@ try {
     if ($existing | Where-Object { $_.Location -eq ${psLit(appId)} }) {
       Write-Host "  DSPM collection policy already covers this app"
     } else {
+      # Verified live: Set-FeatureConfiguration -Locations returns OK and changes
+      # NOTHING, whatever the payload shape. The only way to add a second agent is
+      # to remove the policy and recreate it with the merged locations. Microsoft
+      # takes a few minutes to release the name after a delete, so creation is
+      # retried; the policy is absent for that window and the log says so.
+      $clean = @($existing | ForEach-Object { [ordered]@{ Workload=$_.Workload; Location=$_.Location; LocationSource=$_.LocationSource; LocationType=$_.LocationType; Inclusions=@($_.Inclusions | ForEach-Object { [ordered]@{ Type=$_.Type; Identity=$_.Identity } }) } })
       $add = @(${psLit(collLoc)} | ConvertFrom-Json)
-      $merged = ConvertTo-Json -InputObject @(@($existing) + @($add)) -Depth 8 -Compress
-      Set-FeatureConfiguration -Identity $fc.Identity -Locations $merged -ErrorAction Stop | Out-Null
-      Start-Sleep -Seconds 15
-      $n = @((Get-FeatureConfiguration -FeatureScenario KnowYourData | Where-Object { $_.Name -eq $fc.Name }).Locations | ConvertFrom-Json).Count
-      if ($n -gt $existing.Count) { Write-Host ("  added this app to the existing DSPM collection policy (" + $n + " location(s))") }
-      else { Write-Host "  WARNING: DSPM collection policy exists but this app could not be appended - add it in Purview > DSPM for AI > collection policy > locations" }
+      $merged = ConvertTo-Json -InputObject @(@($clean) + @($add)) -Depth 8 -Compress
+      $cfg = $fc.ScenarioConfig; $mode = $fc.Mode; $fcName = $fc.Name
+      Write-Host ("  DSPM collection policy exists (" + $existing.Count + " app(s)); recreating it with this app added (Set cannot append)")
+      Remove-FeatureConfiguration -Identity $fc.Identity -Confirm:$false -ErrorAction Stop
+      $made = $false
+      foreach ($attempt in 1..24) {
+        Start-Sleep -Seconds 15
+        try { New-FeatureConfiguration -FeatureScenario KnowYourData -Name $fcName -Mode $mode -ScenarioConfig $cfg -Locations $merged -ErrorAction Stop | Out-Null; $made = $true; break }
+        catch { if ($_.Exception.Message -notmatch "already exists") { throw } }
+      }
+      if (-not $made) { throw "the DSPM collection policy was removed but could not be recreated within 6 minutes; recreate it in Purview > DSPM for AI with these locations: $merged" }
+      Start-Sleep -Seconds 20
+      $n = @((Get-FeatureConfiguration -FeatureScenario KnowYourData | Where-Object { $_.Name -eq $fcName }).Locations | ConvertFrom-Json).Count
+      if ($n -gt $existing.Count) { Write-Host ("  DSPM collection policy recreated with " + $n + " location(s)") }
+      else { Write-Host "  WARNING: DSPM collection policy recreated but this app is not listed - add it in Purview > DSPM for AI > collection policy > locations" }
     }
   }
 } catch { Write-Host ("  collection policy: " + $_.Exception.Message) }`;
@@ -1275,7 +1365,20 @@ if (-not $connected) { Write-Host "Could not connect to Security & Compliance Po
 Write-Host "Connected. Creating policies…"
 try {
   if (-not (Get-DlpCompliancePolicy -Identity ${psLit(policyName)} -ErrorAction SilentlyContinue)) {
-    New-DlpCompliancePolicy -Name ${psLit(policyName)} -Mode ${dlpMode} -Locations ${psLit(loc)} -EnforcementPlanes @("Application") | Out-Null
+    # A pilot group created seconds ago is not yet a recipient Exchange can see
+    # ("The specified recipient ... couldn't be found"). Wait for it rather than fail.
+    $created = $false
+    foreach ($attempt in 1..20) {
+      try {
+        New-DlpCompliancePolicy -Name ${psLit(policyName)} -Mode ${dlpMode} -Locations ${psLit(loc)} -EnforcementPlanes @("Application") -ErrorAction Stop | Out-Null
+        $created = $true; break
+      } catch {
+        if ($_.Exception.Message -notmatch "couldn't be found|could not be found|ManagementObjectNotFound") { throw }
+        Write-Host ("  pilot group not yet visible to Exchange (attempt " + $attempt + "/20) — waiting 30s")
+        Start-Sleep -Seconds 30
+      }
+    }
+    if (-not $created) { throw "the pilot group never became visible to Exchange Online; re-run the wizard in a few minutes" }
     Write-Host "  created policy ${policyName} (mode ${dlpMode})"
   } else {
     Write-Host "  policy ${policyName} already exists — leaving its mode and scope untouched"

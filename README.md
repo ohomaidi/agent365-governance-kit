@@ -53,8 +53,12 @@ to verify. Nothing on this list is a manual step.
 5. **DLP policy** for the Applications workload, in **test mode** by default,
    scoped to the pilot group: credit-card rule, optional custom keyword
    sensitive-information type, notifications.
-6. **DSPM for AI collection policy** (one per tenant; a second agent is appended
-   to it). Prompt/response ingestion is **off** unless the data owner turns it on.
+6. **DSPM for AI collection policy** (one per tenant). A second agent is added by
+   recreating the policy with both locations — verified live that Microsoft's
+   `Set-FeatureConfiguration -Locations` returns OK and changes nothing, so the
+   installer removes and recreates it, retrying while the name is released
+   (the policy is absent for a couple of minutes and the log says so).
+   Prompt/response ingestion is **off** unless the data owner turns it on.
 7. **Validation**: connector token → `protectionScopes/compute` →
    `processContent`, live.
 8. **Revoke** Compliance Administrator and `Exchange.ManageAsApp`.
@@ -82,9 +86,12 @@ to verify. Nothing on this list is a manual step.
     every member of the pilot group, so it is in their Teams app bar.
 16. **Messaging endpoint registered** in the Teams Developer Portal (bot id =
     blueprint appId, endpoint `https://<agent>/api/messages`).
-17. **Proof**: the installer mints a token *as the agent* and sends a hello into
-    the admin's Teams. If it arrives, the identity, consent, catalog, install
-    and endpoint all work. The admin replies to it to test the agent itself.
+17. **Proof attempt**: the installer mints a token *as the agent identity* (the
+    SDK's two-step agentic flow) and tries to send a hello into the admin's
+    Teams. Teams' generic connector currently refuses proactive messages from
+    an agent identity, so the installer says so and points the admin at the
+    app, already in their Teams app bar: the first message is theirs, and the
+    reply proves the path. Each step is an individual checkbox.
 
 ### On the agent
 
@@ -261,13 +268,13 @@ npm run test:all       # TypeScript + wizard + Python + .NET + proxy
 | TypeScript guard | 20 | defaults, misconfiguration, verdicts, retries, timeouts, caching, payload, redaction |
 | Python guard | 19 | same behaviours, mirrored |
 | .NET guard | 18 | same behaviours, mirrored |
-| Wizard | 77 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 call order + replication, inheritable permissions, consent, Teams package/catalog/install/endpoint, tenant probe |
+| Wizard | 78 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 call order + replication, inheritable permissions, consent, Teams package/catalog/install/endpoint, tenant probe |
 | Proxy | 29 | enforcement, protocol-shaped refusals, attribution, health, Teams bridge through the real Agents SDK adapter |
 
-**163 tests.** CI runs all of them on every push. The tenant-side flow
-(Purview policies, blueprint, identity, consent, registration, Teams catalog,
-installs, endpoint, hello) is also exercised live against a licensed tenant
-before each release.
+**164 tests.** CI runs all of them on every push. The tenant-side flow
+(Purview policies, DSPM recreate, blueprint, identity, consent, registration,
+Teams catalog, installs, endpoint) was exercised live against a licensed
+tenant with two agents before this release.
 
 ### Cleaning a tenant up
 
@@ -283,7 +290,7 @@ Administrator to the connector first); the pilot group; the connector app.
 ## Notes & limits
 
 - **Block direction:** the Applications enforcement plane blocks **UploadText** (the prompt), not the model's response. Govern by blocking the *question*; the reply check is belt and braces.
-- **Propagation:** a new DLP policy can take up to ~1 hour to start enforcing.
+- **Propagation:** a new DLP policy can take up to ~1 hour to start enforcing. A freshly created pilot group takes a minute or two to become visible to Exchange; the installer waits for it.
 - **Test mode blocks nothing.** Re-run and choose *Enable* once the audit results look right.
 - **Attribution:** pass the real signed-in user per call in a multi-user app; the Teams bridge and the sample agent do (`from.aadObjectId`).
 - **DSPM ingestion stores prompt and response text** in Purview. Off by default.
