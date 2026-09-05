@@ -184,12 +184,39 @@ async function preflight() {
   $("btnDry").disabled = !ready;
 }
 
-$("btnRecheck").onclick = preflight;
+async function tenantCheck() {
+  $("tenantBox").hidden = false;
+  $("tenant").textContent = "Checking the tenant…";
+  let t;
+  try { t = await (await fetch("/api/tenant")).json(); }
+  catch { $("tenant").innerHTML = '<div class="warn">Could not probe the tenant.</div>'; return; }
+  if (t.error) { $("tenant").innerHTML = `<div class="warn">${t.error}</div>`; return; }
+
+  const icon = { ok: "ok", warn: "no", fail: "no" };
+  const rows = t.checks.map(c =>
+    `<div class="tool"><span>${c.name}${c.fix ? `<br><span class="hint">${c.fix}</span>` : ""}</span>` +
+    `<span class="${icon[c.status]}">${c.status === "ok" ? "ok" : c.detail}</span></div>`).join("");
+
+  let banner = "";
+  if (!t.canProvisionPurview) {
+    banner = `<div class="bad" style="margin-bottom:.7rem"><strong>This tenant cannot support Purview provisioning.</strong> Fix the items below before running.</div>`;
+  } else if (!t.canRegisterAgent365) {
+    banner = `<div class="warn" style="margin-bottom:.7rem">Purview is available. The <strong>Agent 365 registry is not</strong> — registration will be skipped.</div>`;
+    $("wantAgent365").checked = false; $("a365Fields").hidden = true;
+  } else {
+    banner = `<div class="good" style="margin-bottom:.7rem">Tenant supports Purview provisioning and Agent 365 registration.</div>`;
+  }
+  $("tenant").innerHTML = banner + rows;
+  if (!t.canProvisionPurview) { $("btnGo").disabled = true; }
+}
+
+$("btnRecheck").onclick = () => preflight().then(tenantCheck);
 $("btnLogin").onclick = async () => {
   $("btnLogin").disabled = true;
   $("status").textContent = "A browser window has opened for Azure sign-in…";
   try { await fetch("/api/login", { method: "POST" }); } finally {
-    $("btnLogin").disabled = false; $("status").textContent = ""; preflight();
+    $("btnLogin").disabled = false; $("status").textContent = "";
+    await preflight(); if (pf && pf.signedIn) tenantCheck();
   }
 };
 
@@ -278,7 +305,7 @@ $("btnGo").onclick = () => run(false);
 fetch("/api/defaults").then(r => r.json()).then(d => {
   if (!$("envPath").value) $("envPath").value = d.cwd + d.sep + ".env";
 });
-preflight();
+preflight().then(() => { if (pf && pf.signedIn) tenantCheck(); });
 </script>
 </body>
 </html>

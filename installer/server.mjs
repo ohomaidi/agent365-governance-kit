@@ -14,6 +14,7 @@ import { tmpdir, homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import { probeTenant } from "../wizard/lib/capabilities.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..");
@@ -71,6 +72,16 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && url.pathname === "/api/preflight") return json(res, 200, preflight());
+
+  // Tooling readiness says nothing about whether the TENANT can do this.
+  if (req.method === "GET" && url.pathname === "/api/tenant") {
+    const azJson = (args) => {
+      const out = execFileSync("az", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+      return out ? JSON.parse(out) : null;
+    };
+    try { return json(res, 200, await probeTenant(azJson)); }
+    catch (e) { return json(res, 500, { error: String(e.message) }); }
+  }
 
   if (req.method === "POST" && url.pathname === "/api/login") {
     // az login opens the system browser itself; we just wait for it.

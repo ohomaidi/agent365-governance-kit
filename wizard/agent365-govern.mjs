@@ -30,6 +30,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { registerAgent, listAgentInstances, GRAPH_BETA } from "./lib/agent365.mjs";
+import { probeTenant } from "./lib/capabilities.mjs";
 
 // --- Microsoft constants (stable GUIDs) ---
 const GRAPH_APP = "00000003-0000-0000-c000-000000000000";
@@ -144,6 +145,22 @@ export function writeEnvBlock(envPath, lines) {
   return prev.split("\n").some((l) => stale.test(l)) ? "replaced (old loose keys commented out)" : "appended";
 }
 
+/** Print the tenant capability report. Returns true if provisioning can proceed. */
+async function runTenantCheck() {
+  console.log(`${C.b}\n  Tenant capability check${C.reset}\n`);
+  const r = await probeTenant(azJson);
+  const mark = { ok: `${C.g}✓${C.reset}`, warn: `${C.y}!${C.reset}`, fail: `${C.r}✗${C.reset}` };
+  for (const c of r.checks) {
+    console.log(`  ${mark[c.status]} ${c.name.padEnd(28)} ${c.detail}`);
+    if (c.fix) console.log(`      ${C.d}${c.fix}${C.reset}`);
+  }
+  console.log("");
+  console.log(`  Purview provisioning: ${r.canProvisionPurview ? `${C.g}available${C.reset}` : `${C.r}NOT available${C.reset}`}`);
+  console.log(`  Agent 365 registration: ${r.canRegisterAgent365 ? `${C.g}available${C.reset}` : `${C.r}NOT available${C.reset}`}`);
+  console.log("");
+  return r.canProvisionPurview;
+}
+
 async function main(work) {
   console.log(`${C.b}\n  Agent 365 Governance Kit — setup wizard${C.reset}\n  ${C.d}Purview guard + Agent 365 identity, auto-provisioned.${C.reset}`);
   if (DRY_RUN) console.log(`  ${C.c}${C.b}DRY RUN — nothing will be created or modified.${C.reset}`);
@@ -169,6 +186,11 @@ async function main(work) {
     warn(`PowerShell Gallery is unreachable and ExchangeOnlineManagement ${EXO_MODULE_VERSION} isn't installed locally.`);
     warn(`  Policy provisioning will fail. Pre-install it on this machine, or run the wizard somewhere with PSGallery access:`);
     warn(`  ${C.d}Install-Module ExchangeOnlineManagement -RequiredVersion ${EXO_MODULE_VERSION} -Scope CurrentUser${C.reset}`);
+  }
+
+  if (argv.includes("--check")) {
+    const okToGo = await runTenantCheck();
+    process.exit(okToGo ? 0 : 1);
   }
 
   let acct;

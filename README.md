@@ -50,7 +50,22 @@ form with a live log. It drives the same CLI wizard underneath via `--answers`,
 so there is no second implementation to drift. See
 [`installer/README.md`](installer/README.md).
 
-## 0b. Rehearse (recommended before any customer run)
+## 0b. Check the tenant can actually do it
+
+```bash
+node wizard/agent365-govern.mjs --check
+```
+
+Tooling readiness ("is `az` installed?") says nothing about whether the *tenant*
+supports any of this. An unlicensed tenant passes every tooling check and then
+fails ten minutes later at `Connect-IPPSSession`, in front of the customer.
+
+This asks the tenant directly — licences, `.onmicrosoft.com` domain, Exchange
+Online, the Purview Graph app roles, the Agent 365 registry, and the directory
+roles you actually hold — and prints what to fix. The wizard also runs it before
+the interview, and the installer shows it on the first screen.
+
+## 0c. Rehearse (recommended before any customer run)
 
 ```bash
 node wizard/agent365-govern.mjs --dry-run     # or: npm run plan
@@ -164,7 +179,7 @@ npm run test:all       # TypeScript + wizard + Python + .NET
 | TypeScript | 20 | defaults, misconfiguration, verdicts, retries, timeouts, caching, payload, redaction |
 | Python | 19 | same behaviours, mirrored |
 | .NET | 18 | same behaviours, mirrored |
-| Wizard | 40 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 payloads and call ordering |
+| Wizard | 51 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 payloads and call ordering |
 | Proxy | 20 | enforcement, protocol-shaped refusals, attribution, health |
 
 CI runs all of them on every push ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
