@@ -1,20 +1,29 @@
 # Agent 365 Governance Kit
 
-Drop-in **Microsoft governance for any custom AI agent** — in **TypeScript/Node, Python, and .NET**. Two layers:
+Drop-in **Microsoft governance for any custom AI agent** — in **TypeScript/Node, Python, and .NET**. Three layers:
 
 - **Purview guard** — runs every prompt and reply through Microsoft Purview (Graph `processContent`) so they're audited, classified, captured for DSPM-for-AI, and **blocked inline** by your DLP policies. Works on *any* channel, including non-Microsoft surfaces (web portals, APIs). Available in all three languages.
-- **Agent 365 identity + observability** — wiring so a registered agent's authenticated turns light up the admin-center **Activity tab**. Node + .NET (the languages with a Microsoft Agents SDK).
+- **Agent 365 identity + registration** — creates the agent identity blueprint and registers the agent (and its A2A card) in the Agent 365 registry through Graph, so admins can see and govern it. Plus observability wiring so authenticated turns light up the admin-center **Activity tab**.
+- **Governance proxy** — the same Purview checks applied to an agent **you cannot modify**. A third-party or vendor agent gets governed without touching its code; register the proxy's URL and the registry itself points at a governed endpoint.
 
-A one-time **wizard** provisions the whole Microsoft side after a tenant admin signs in, then writes your config and prints the remaining manual Agent 365 steps.
+A one-time **wizard** provisions the whole Microsoft side after a tenant admin signs in, writes your config, and registers the agent. It runs from a terminal or from a **browser form the customer double-clicks**.
 
 ```
 agent365-governance-kit/
-├── wizard/              # shared setup wizard (Node CLI) — provisions any tenant
+├── wizard/
+│   ├── agent365-govern.mjs   # the setup wizard — provisions any tenant
+│   └── lib/
+│       ├── agent365.mjs      # Agent 365 blueprint + registry registration
+│       └── capabilities.mjs  # tenant capability probe (--check)
+├── installer/                # double-click launchers + browser wizard
+│   ├── macos/                #   Agent 365 Setup.app
+│   └── windows/              #   Agent 365 Setup.vbs
 ├── packages/
-│   ├── typescript/      # @zaatarlabs/agent365-governance-kit  (Purview + Agent 365)
-│   ├── python/          # agent365-governance-kit              (Purview)
-│   └── dotnet/          # ZaatarLabs.Agent365.Governance       (Purview)
-├── AGENT365_SETUP.md    # manual onboarding steps the wizard can't automate
+│   ├── typescript/           # @zaatarlabs/agent365-governance-kit  (Purview + Agent 365)
+│   ├── python/               # agent365-governance-kit              (Purview)
+│   ├── dotnet/               # ZaatarLabs.Agent365.Governance       (Purview)
+│   └── proxy/                # @zaatarlabs/agent365-governance-proxy
+├── AGENT365_SETUP.md         # the admin steps that genuinely still need a human
 └── README.md
 ```
 
@@ -91,20 +100,28 @@ The wizard signs you in (`az login` as Global Admin), asks for your variables, y
 agent's language, **who the policy applies to**, and **whether it enforces**, then:
 
 1. creates a dedicated app registration + secret + certificate,
-2. grants `Content.Process.All`, `ProtectionScopes.Compute.All`, `Exchange.ManageAsApp`,
-3. assigns the **Compliance Administrator** role (provisioning only — see step 7),
+2. grants `Content.Process.All`, `ProtectionScopes.Compute.All`, `Exchange.ManageAsApp` —
+   plus `AgentInstance.ReadWrite.All` and the blueprint roles when you ask for
+   Agent 365 registration,
+3. assigns the **Compliance Administrator** role (provisioning only — see step 8),
 4. creates a DLP policy + rules (Credit Card and/or your custom keywords) and, if you
    ask for it, a DSPM collection policy,
-5. writes all `PURVIEW_*` (and optional `agent365Observability__*`) values into your
-   app's `.env` — **replacing** any previous block it wrote, after taking a `.bak`,
-6. validates end to end: **token → `protectionScopes/compute` → `processContent`**,
-7. offers to **revoke** Compliance Administrator + `Exchange.ManageAsApp`, which are
+5. **registers the agent in Agent 365** — creates the identity blueprint, mints its
+   credential, POSTs the agent instance with its A2A card, and reads it back to verify,
+6. writes all `PURVIEW_*`, `agent365Observability__*` and `AGENT365_INSTANCE_ID` values
+   into your app's `.env` — **replacing** any previous block it wrote, after a `.bak`,
+7. validates end to end: **token → `protectionScopes/compute` → `processContent`**,
+8. offers to **revoke** Compliance Administrator + `Exchange.ManageAsApp`, which are
    only needed to create policies, never at runtime,
-8. prints the integration snippet for your language **and the manual Agent 365 steps**
-   (also saved to `AGENT365_SETUP.md`).
+9. prints the integration snippet for your language and writes `AGENT365_SETUP.md`.
 
-**Requirements:** Azure CLI (`az`), PowerShell 7 (`pwsh`), `openssl`, a tenant **Global Admin**,
-and PowerShell Gallery reachability (the wizard checks this up front and tells you if it's blocked).
+Registration is performed **app-only, as the connector app** — not through `az rest`.
+The Azure CLI is a first-party app whose token carries no agent scopes at all, so
+registry calls made through it fail in every tenant, however well licensed.
+
+**Requirements:** Azure CLI (`az`), PowerShell 7 (`pwsh`), a tenant **Global Admin**, and
+PowerShell Gallery reachability (checked up front). On macOS/Linux `openssl` is also
+needed; on Windows the certificate comes from `New-SelfSignedCertificate` instead.
 
 > **Why a dedicated app, not your agent's identity?** Agentic identities can't mint app-only tokens (`AADSTS82001`). The guard uses a normal app registration with app-only client credentials.
 
@@ -117,6 +134,7 @@ Pick your language — full instructions in each package README:
 | TypeScript / Node | [`packages/typescript`](packages/typescript/README.md) | `guard.evaluate(text, "uploadText", { correlationId })` |
 | Python | [`packages/python`](packages/python/README.md) | `guard.evaluate(text, "uploadText", correlation_id=cid)` |
 | .NET | [`packages/dotnet`](packages/dotnet/README.md) | `await guard.EvaluateAsync(text, "uploadText", correlationId: cid)` |
+| **Can't change the code** | [`packages/proxy`](packages/proxy/README.md) | Run the guard in a reverse proxy — no integration at all |
 
 The pattern is the same everywhere:
 
@@ -145,9 +163,31 @@ if (guard.state !== "ready") {
 Alert on `degraded === "error"` in production: it means the governance plane was
 unreachable for that turn.
 
-## 3. Finish Agent 365 onboarding (if you want the Activity tab)
+## 3. Govern an agent you can't modify
 
-The wizard provisions Purview but **cannot** upload a manifest or assign licenses. Those admin steps — create/upload manifest, create instance, assign **Frontier**, wire observability — are in **[AGENT365_SETUP.md](AGENT365_SETUP.md)** (the wizard also writes a copy next to your `.env`).
+The guard is a library your agent calls, which only works when you own the source.
+For a third-party or vendor agent, run it in a proxy instead:
+
+```bash
+GOVERNANCE_UPSTREAM=https://vendor.example.com node packages/proxy/src/bin.mjs --port 8787
+```
+
+Then register **the proxy's URL** as the agent's endpoint, and the Agent 365
+registry record points at a governed address. Full details, wire formats and
+limits in [`packages/proxy`](packages/proxy/README.md).
+
+## 4. What the wizard can't do for you
+
+Agent registration itself is automated (blueprint, credential, instance and card,
+all through Graph, then read back to verify). Two things still need a person:
+
+- **Admin consent** for the blueprint's Graph permissions.
+- **Licence assignment**, if your tenant requires one.
+
+Both are written to **[AGENT365_SETUP.md](AGENT365_SETUP.md)** next to your `.env`.
+
+> The legacy Entra agent registry API retired **15 June 2026**. Agents registered
+> before then must be re-registered; re-running the wizard does that.
 
 ---
 
@@ -182,6 +222,8 @@ npm run test:all       # TypeScript + wizard + Python + .NET
 | Wizard | 51 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 payloads and call ordering |
 | Proxy | 20 | enforcement, protocol-shaped refusals, attribution, health |
 
+**128 tests total.**
+
 CI runs all of them on every push ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 ## Notes & limits
@@ -194,5 +236,7 @@ CI runs all of them on every push ([`.github/workflows/ci.yml`](.github/workflow
 - **Per-user scoping:** the managed-app plane doesn't accept user/group scoping via PowerShell for *all* policy types; the wizard sets it in the policy `Locations`, and you can refine it in the Purview portal.
 - **Billing:** Purview API calls for custom apps are metered (pay-as-you-go on the Azure subscription).
 - **PowerShell:** the wizard pins ExchangeOnlineManagement `3.5.1` (newer 3.10.x throws on PowerShell 7.6).
+- **Registration uses `/beta` Graph endpoints**, which Microsoft labels subject to change. It runs app-only under the connector app — the Azure CLI's own token carries no agent scopes, so `az rest` cannot make these calls.
+- **The proxy only governs traffic that traverses it.** A vendor SaaS agent users hit directly in a browser bypasses it; use endpoint DLP or Agent 365's block control there.
 - **Certificate:** used only for policy provisioning. The runtime authenticates with the client secret; remove the cert afterwards if you won't re-run the wizard.
 - **Not published to npm/PyPI/NuGet.** Install from this repo (see each package README); `npx agent365-govern` will not resolve.
