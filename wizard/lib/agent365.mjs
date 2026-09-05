@@ -60,7 +60,14 @@ export function slugify(name) {
 /** Entra replication signatures worth waiting out. */
 function isReplicationLag(err) {
   const msg = String(err?.body?.error?.message ?? err?.message ?? "").toLowerCase();
-  return err?.status === 404 || (err?.status === 400 && msg.includes("does not exist"));
+  // Every wording Entra has used, live, for "the object you created seconds ago
+  // is not visible on this replica yet":
+  //   404; 400 "... does not exist"; 400 "The appId '…' of the service
+  //   principal does not reference a valid application object";
+  //   "Resource '…' does not exist or one of its queried reference-property
+  //   objects are not present"; Request_ResourceNotFound.
+  return err?.status === 404
+    || (err?.status === 400 && /does not exist|not found|does not reference a valid|not present|request_resourcenotfound|could not be found/.test(msg));
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

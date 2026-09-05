@@ -251,3 +251,18 @@ describe("identifier URI for Teams SSO", () => {
     assert.equal(g.calls.some((c) => c.method === "PATCH"), false);
   });
 });
+
+
+describe("replication-lag wording", () => {
+  test("a principal created seconds after its blueprint is retried, not failed", async () => {
+    // First POST of the principal is refused with Entra's live wording; the retry succeeds.
+    let n = 0;
+    const g = stubGraph({ ...OK, "POST /v1.0/serviceprincipals/microsoft.graph.agentIdentityBlueprintPrincipal": () => {
+      if (++n === 1) throw Object.assign(new Error("HTTP 400"), { status: 400, body: { error: { message: "The appId 'x' of the service principal does not reference a valid application object." } } });
+      return { id: "prin-1" };
+    } });
+    const orig = global.setTimeout; global.setTimeout = (fn) => orig(fn, 0);
+    try { const r = await registerAgent(g, BASE); assert.equal(r.blueprintPrincipalId, "prin-1"); assert.equal(n, 2); }
+    finally { global.setTimeout = orig; }
+  });
+});
