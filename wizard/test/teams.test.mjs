@@ -186,3 +186,65 @@ describe("Developer Portal bot registration (the messaging endpoint)", () => {
     assert.equal(await getMessagingEndpoint(stubGraph([["GET", "/api/botframework/", err(404)]]), APP), null);
   });
 });
+
+describe("AI teammate path (the one Microsoft supports for agent identities)", () => {
+  test("registers the endpoint with the Agent 365 service using the schema it validates", async () => {
+    const svc = stubGraph([["POST", "/agents/botManagement/createAgentBlueprint", { callbackUri: "https://hr.contoso.com/api/messages", type: "apiBased", message: "Backend configuration set successfully" }]]);
+    const { registerAgent365Endpoint } = await import("../lib/teams.mjs");
+    const r = await registerAgent365Endpoint(svc, { tenantId: "t-1", blueprintAppId: APP, callbackUri: "https://hr.contoso.com/api/messages" });
+    assert.equal(r.type, "apiBased");
+    assert.deepEqual(svc.calls[0].body, { tenantId: "t-1", callbackUri: "https://hr.contoso.com/api/messages", agentIdentityBlueprintId: APP });
+    await assert.rejects(registerAgent365Endpoint(svc, { tenantId: "t-1", blueprintAppId: APP, callbackUri: "http://plain" }), /https/);
+  });
+  test("creates the agent user as an agentUser under the agent identity, enabled, with a usage location", async () => {
+    const g = stubGraph([
+      ["GET", "/beta/users?$filter=userPrincipalName", { value: [] }],
+      ["POST", "/beta/users/microsoft.graph.agentUser", { id: "au-1", userPrincipalName: "hr-assistant@contoso.onmicrosoft.com" }],
+      ["PATCH", "/v1.0/users/au-1", null],
+    ]);
+    const { ensureAgentUser } = await import("../lib/teams.mjs");
+    const r = await ensureAgentUser(g, { displayName: "HR Assistant", mailNickname: "hr-assistant", domain: "contoso.onmicrosoft.com", agentIdentityId: "ident-1", usageLocation: "AE" });
+    assert.deepEqual(r, { id: "au-1", userPrincipalName: "hr-assistant@contoso.onmicrosoft.com", created: true });
+    const post = g.calls.find((c) => c.method === "POST");
+    assert.equal(post.body["@odata.type"], "#microsoft.graph.agentUser");
+    assert.equal(post.body.identityParentId, "ident-1");
+    assert.equal(post.body.accountEnabled, true);
+    assert.deepEqual(g.calls.find((c) => c.method === "PATCH").body, { usageLocation: "AE" });
+  });
+  test("reuses an existing agent user by UPN", async () => {
+    const g = stubGraph([["GET", "/beta/users?$filter=userPrincipalName", { value: [{ id: "au-1", userPrincipalName: "hr-assistant@contoso.onmicrosoft.com", usageLocation: "AE" }] }]]);
+    const { ensureAgentUser } = await import("../lib/teams.mjs");
+    const r = await ensureAgentUser(g, { displayName: "HR Assistant", mailNickname: "hr-assistant", domain: "contoso.onmicrosoft.com", agentIdentityId: "ident-1" });
+    assert.equal(r.created, false); assert.equal(g.calls.length, 1);
+  });
+  test("assigns the tenant's Agent 365 licence, once, and says when there is none", async () => {
+    const skus = { value: [{ skuId: "s-e5", skuPartNumber: "SPE_E5", prepaidUnits: { enabled: 10 }, consumedUnits: 1 }, { skuId: "s-a365", skuPartNumber: "MICROSOFT_AGENT_FRONTIER_NO_TEAMS", prepaidUnits: { enabled: 25 }, consumedUnits: 0 }] };
+    const { assignAgentLicence } = await import("../lib/teams.mjs");
+    const g = stubGraph([["GET", "/subscribedSkus", skus], ["GET", "/v1.0/users/au-1?$select=assignedLicenses", { assignedLicenses: [] }], ["POST", "/assignLicense", {}]]);
+    assert.deepEqual(await assignAgentLicence(g, "au-1"), { status: "assigned", sku: "MICROSOFT_AGENT_FRONTIER_NO_TEAMS" });
+    assert.deepEqual(g.calls.find((c) => c.method === "POST").body.addLicenses, [{ skuId: "s-a365", disabledPlans: [] }]);
+    const g2 = stubGraph([["GET", "/subscribedSkus", skus], ["GET", "/v1.0/users/au-1?$select=assignedLicenses", { assignedLicenses: [{ skuId: "s-a365" }] }]]);
+    assert.equal((await assignAgentLicence(g2, "au-1")).status, "already");
+    const g3 = stubGraph([["GET", "/subscribedSkus", { value: [skus.value[0]] }]]);
+    assert.equal((await assignAgentLicence(g3, "au-1")).status, "none");
+  });
+  test("consents the setup sign-in to the Agent 365 service once", async () => {
+    const { ensureAgent365ServiceConsent, CLIENTS, AGENT_TOOLS_APP } = await import("../lib/auth.mjs");
+    const g = stubGraph([
+      ["GET", `appId eq '${CLIENTS.graphCli}'`, { value: [{ id: "cli-sp" }] }],
+      ["GET", `appId eq '${AGENT_TOOLS_APP}'`, { value: [{ id: "tools-sp" }] }],
+      ["GET", "oauth2PermissionGrants?$filter", { value: [] }],
+      ["POST", "/v1.0/oauth2PermissionGrants", { id: "g-1" }],
+    ]);
+    assert.equal(await ensureAgent365ServiceConsent(g), "granted");
+    const post = g.calls.find((c) => c.method === "POST");
+    assert.equal(post.body.clientId, "cli-sp"); assert.equal(post.body.resourceId, "tools-sp");
+    assert.match(post.body.scope, /AgentTools\.AgentBluePrint\.Create/);
+    const g2 = stubGraph([
+      ["GET", `appId eq '${CLIENTS.graphCli}'`, { value: [{ id: "cli-sp" }] }],
+      ["GET", `appId eq '${AGENT_TOOLS_APP}'`, { value: [{ id: "tools-sp" }] }],
+      ["GET", "oauth2PermissionGrants?$filter", { value: [{ id: "g-1", scope: "AgentTools.AgentBluePrint.Create AgentTools.AgentBluePrint.Delete" }] }],
+    ]);
+    assert.equal(await ensureAgent365ServiceConsent(g2), "present");
+  });
+});

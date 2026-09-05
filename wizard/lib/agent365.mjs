@@ -229,29 +229,7 @@ export async function registerAgent(graph, opts, log = () => {}) {
   }
   r.blueprintPrincipalId = prin.id;
 
-  // ---- 4. agent identity: reuse by name under this blueprint, else create ----
-  let ident = null;
-  try {
-    const list = await graph("GET",
-      `/beta/servicePrincipals/microsoft.graph.agentIdentity?$filter=agentIdentityBlueprintId eq '${bp.appId}'&$select=id,displayName`);
-    ident = (list?.value ?? []).find((i) => i.displayName === agentName) ?? null;
-  } catch { /* filter may be unsupported; fall through to create */ }
-  if (ident) {
-    r.steps.push(`found existing agent identity ${ident.id}`);
-  } else {
-    ident = await withReplication(
-      () => graph("POST", "/beta/servicePrincipals/microsoft.graph.agentIdentity", {
-        displayName: agentName,
-        agentIdentityBlueprintId: bp.appId,
-        "sponsors@odata.bind": sponsorIds.map((id) => `${GRAPH}/v1.0/users/${id}`),
-      }),
-      log, "agent identity");
-    r.steps.push(`created agent identity ${ident.id}`);
-  }
-  r.agentIdentityId = ident.id;
-  log(`agent identity ${ident.id}`);
-
-  // ---- 4b. inheritable permissions: agent identities inherit these scopes from
+  // ---- 3b. inheritable permissions: agent identities inherit these scopes from
   //          the blueprint without a separate consent each ----
   const inheritable = opts.inheritable ?? A365_RESOURCES;
   // Idempotent: read what's already inheritable and post only what's missing.
@@ -305,6 +283,33 @@ export async function registerAgent(graph, opts, log = () => {}) {
       ? `WARNING: inheritable permissions not yet visible on read-back: ${missing.join(", ")} (eventual consistency — re-run later to confirm)`
       : `inheritable permissions verified (${inheritable.length}/${inheritable.length})`);
   } catch { r.steps.push("WARNING: could not read back inheritable permissions"); }
+
+  // ---- 4. agent identity: reuse by name under this blueprint, else create ----
+  // AFTER the inheritable permissions and (via the hook) the blueprint's consent:
+  // an identity created before them inherits nothing — observed live as
+  // AADSTS65001 on the agentic user token until consent was granted to the
+  // identity itself.
+  if (opts.beforeIdentity) await opts.beforeIdentity(r);
+  let ident = null;
+  try {
+    const list = await graph("GET",
+      `/beta/servicePrincipals/microsoft.graph.agentIdentity?$filter=agentIdentityBlueprintId eq '${bp.appId}'&$select=id,displayName`);
+    ident = (list?.value ?? []).find((i) => i.displayName === agentName) ?? null;
+  } catch { /* filter may be unsupported; fall through to create */ }
+  if (ident) {
+    r.steps.push(`found existing agent identity ${ident.id}`);
+  } else {
+    ident = await withReplication(
+      () => graph("POST", "/beta/servicePrincipals/microsoft.graph.agentIdentity", {
+        displayName: agentName,
+        agentIdentityBlueprintId: bp.appId,
+        "sponsors@odata.bind": sponsorIds.map((id) => `${GRAPH}/v1.0/users/${id}`),
+      }),
+      log, "agent identity");
+    r.steps.push(`created agent identity ${ident.id}`);
+  }
+  r.agentIdentityId = ident.id;
+  log(`agent identity ${ident.id}`);
 
   // ---- 5. Agent 365 registration: keyed by sourceAgentId, so reuse if present ----
   let reg = null;

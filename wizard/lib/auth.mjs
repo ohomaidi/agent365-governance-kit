@@ -48,6 +48,18 @@ export const GRAPH_SCOPE_STRING = GRAPH_SCOPES.map((s) => `https://graph.microso
 export const DEVPORTAL_SCOPE = "https://dev.teams.microsoft.com/AppDefinitions.ReadWrite";
 export const DEVPORTAL_BASE = "https://dev.teams.microsoft.com";
 
+/**
+ * Microsoft's Agent 365 service (the API its own `a365` CLI calls to register
+ * an M365 agent's messaging endpoint). Its "Agent Tools" resource exposes
+ * AgentTools.AgentBluePrint.Create/Delete as DELEGATED scopes only, and the
+ * kit's sign-in client is not pre-authorised for them — but a Global Admin
+ * can grant that consent, and the wizard does (ensureAgent365ServiceConsent).
+ */
+export const AGENT_TOOLS_APP = "ea9ffc3e-8a23-4a7d-836d-234d7c7565c1";
+export const A365_SERVICE_BASE = "https://agent365.svc.cloud.microsoft";
+export const A365_SERVICE_SCOPE = `${A365_SERVICE_BASE}/.default`;
+export const A365_SERVICE_DELEGATED = ["AgentTools.AgentBluePrint.Create", "AgentTools.AgentBluePrint.Delete"];
+
 const LOGIN = "https://login.microsoftonline.com";
 
 function form(body) {
@@ -214,5 +226,48 @@ export function makeDevPortal(cache, { clientId = CLIENTS.teamsToolkit } = {}) {
     if (res.ok) return parsed;
     throw Object.assign(new Error(`${method} ${path} -> HTTP ${res.status}: ${(parsed?.error?.message ?? parsed?.message ?? text).slice(0, 300)}`),
       { status: res.status, body: parsed });
+  };
+}
+
+/**
+ * Tenant-wide consent for the kit's sign-in client to call the Agent 365
+ * service. Idempotent. `graph` is the delegated Graph client.
+ * @returns {Promise<"granted"|"updated"|"present">}
+ */
+export async function ensureAgent365ServiceConsent(graph, clientId = CLIENTS.graphCli) {
+  const sp = async (appId) => (await graph("GET", `/v1.0/servicePrincipals?$filter=appId eq '${appId}'&$select=id`))?.value?.[0]
+    ?? await graph("POST", "/v1.0/servicePrincipals", { appId });
+  const client = await sp(clientId), tools = await sp(AGENT_TOOLS_APP);
+  const found = (await graph("GET", `/v1.0/oauth2PermissionGrants?$filter=clientId eq '${client.id}' and resourceId eq '${tools.id}' and consentType eq 'AllPrincipals'`))?.value?.[0];
+  if (!found) {
+    await graph("POST", "/v1.0/oauth2PermissionGrants", { clientId: client.id, consentType: "AllPrincipals", resourceId: tools.id, scope: A365_SERVICE_DELEGATED.join(" ") });
+    return "granted";
+  }
+  const have = new Set(String(found.scope || "").split(" ").filter(Boolean));
+  if (A365_SERVICE_DELEGATED.every((x) => have.has(x))) return "present";
+  await graph("PATCH", `/v1.0/oauth2PermissionGrants/${found.id}`, { scope: [...new Set([...have, ...A365_SERVICE_DELEGATED])].join(" ") });
+  return "updated";
+}
+
+/** Agent 365 service client (bot management). Same contract as the others. */
+export function makeAgent365Service(cache, { clientId = CLIENTS.graphCli } = {}) {
+  return async function svc(method, path, body, headers = {}) {
+    // A consent granted seconds ago can take a moment to be honoured by the token endpoint.
+    let last;
+    for (const d of [0, 5000, 15000]) {
+      if (d) await new Promise((r) => setTimeout(r, d));
+      let t;
+      try { t = await cache.token(A365_SERVICE_SCOPE, clientId); }
+      catch (e) { last = e; if (!/65001|consent/i.test(e.message)) throw e; continue; }
+      const res = await fetch(`${A365_SERVICE_BASE}${path}`, {
+        method, headers: { authorization: `Bearer ${t}`, ...(body ? { "content-type": "application/json" } : {}), ...headers },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      const text = await res.text();
+      let parsed = null; try { parsed = text ? JSON.parse(text) : null; } catch { parsed = { raw: text }; }
+      if (res.ok) return parsed;
+      throw Object.assign(new Error(`${method} ${path} -> HTTP ${res.status}: ${(parsed?.title ?? parsed?.message ?? text).slice(0, 300)}${parsed?.errors ? " " + JSON.stringify(parsed.errors).slice(0, 200) : ""}`), { status: res.status, body: parsed });
+    }
+    throw last;
   };
 }

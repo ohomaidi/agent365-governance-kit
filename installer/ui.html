@@ -179,10 +179,20 @@
         <div class="check"><input type="checkbox" id="wantObservability" checked><label for="wantObservability">Turn on observability — turns appear in the Agent 365 Activity tab</label></div>
         <div class="check"><input type="checkbox" id="wantTeams" checked><label for="wantTeams"><strong>Publish to Teams</strong></label></div>
         <div id="teamsFields" style="margin-left:1.6rem">
-          <div class="check"><input type="checkbox" id="teamsPublish" checked><label for="teamsPublish">Add the app to the organisation&rsquo;s app catalog</label></div>
-          <div class="check"><input type="checkbox" id="teamsInstall" checked><label for="teamsInstall">Install it for the people in scope (their Teams app bar)</label></div>
-          <div class="check"><input type="checkbox" id="teamsEndpoint" checked><label for="teamsEndpoint">Register the messaging endpoint in the Teams Developer Portal</label></div>
-          <div class="check"><input type="checkbox" id="teamsHello" checked><label for="teamsHello">Send me a hello from the agent in Teams, as proof</label></div>
+          <div class="row"><label for="teamsMode">How it appears</label>
+            <select id="teamsMode">
+              <option value="teammate">As an AI teammate — a person in Teams you chat with (Microsoft&rsquo;s supported path)</option>
+              <option value="bot">As a Teams app / bot — classic channel (Microsoft: &ldquo;not yet implemented&rdquo; for agent identities)</option>
+            </select></div>
+          <div id="teammateFields">
+            <div class="check"><input type="checkbox" id="wantLicence" checked><label for="wantLicence">Assign the tenant&rsquo;s Agent 365 licence to the agent user</label></div>
+          </div>
+          <div id="botFields" hidden>
+            <div class="check"><input type="checkbox" id="teamsPublish" checked><label for="teamsPublish">Add the app to the organisation&rsquo;s app catalog</label></div>
+            <div class="check"><input type="checkbox" id="teamsInstall" checked><label for="teamsInstall">Install it for the people in scope (their Teams app bar)</label></div>
+          </div>
+          <div class="check"><input type="checkbox" id="teamsEndpoint" checked><label for="teamsEndpoint">Register the messaging endpoint (Agent 365 service, or the Teams Developer Portal for a bot)</label></div>
+          <div class="check"><input type="checkbox" id="teamsHello" checked><label for="teamsHello">Tell me how to say hello to it in Teams</label></div>
         </div>
       </div>
     </fieldset>
@@ -362,6 +372,7 @@ $("scopeChoice").onchange = (e) => {
 $("modeChoice").onchange = (e) => { $("modeWarn").hidden = e.target.value !== "3"; };
 $("wantAgent365").onchange = (e) => { $("a365Fields").hidden = !e.target.checked; };
 $("wantTeams").onchange = (e) => { $("teamsFields").hidden = !e.target.checked; };
+$("teamsMode").onchange = (e) => { const bot = e.target.value === "bot"; $("botFields").hidden = !bot; $("teammateFields").hidden = bot; };
 $("wantPurview").onchange = (e) => { $("purviewFields").hidden = !e.target.checked; };
 $("showAdv").onchange = (e) => { $("advFields").hidden = !e.target.checked; };
 
@@ -432,6 +443,7 @@ function answers() {
     wantConsent: $("wantConsent").checked, wantObservability: $("wantObservability").checked,
     teamsPublish: $("teamsPublish").checked, teamsInstall: $("teamsInstall").checked,
     teamsEndpoint: $("teamsEndpoint").checked, teamsHello: $("teamsHello").checked,
+    teamsMode: $("teamsMode").value === "bot" ? "2" : "1", wantLicence: $("wantLicence").checked,
     wantAgent365: $("wantAgent365").checked,
     agentName: name, agentUrl: $("agentUrl").value.trim().replace(/\/+$/, ""),
     transport: or("transport", "JSONRPC"),

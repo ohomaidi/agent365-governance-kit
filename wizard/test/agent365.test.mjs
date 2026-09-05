@@ -88,12 +88,23 @@ describe("registration flow", () => {
       "/v1.0/applications/microsoft.graph.agentIdentityBlueprint",
       "/v1.0/applications/bp-obj/microsoft.graph.agentIdentityBlueprint/addPassword",
       "/v1.0/serviceprincipals/microsoft.graph.agentIdentityBlueprintPrincipal",
+      "/beta/applications/bp-obj/microsoft.graph.agentIdentityBlueprint/inheritablePermissions",
+      "/beta/applications/bp-obj/microsoft.graph.agentIdentityBlueprint/inheritablePermissions",
+      "/beta/applications/bp-obj/microsoft.graph.agentIdentityBlueprint/inheritablePermissions",
       "/beta/servicePrincipals/microsoft.graph.agentIdentity",
-      "/beta/applications/bp-obj/microsoft.graph.agentIdentityBlueprint/inheritablePermissions",
-      "/beta/applications/bp-obj/microsoft.graph.agentIdentityBlueprint/inheritablePermissions",
-      "/beta/applications/bp-obj/microsoft.graph.agentIdentityBlueprint/inheritablePermissions",
       "/beta/copilot/agentRegistrations",
     ]);
+  });
+
+  test("the identity is created after the inheritable permissions, and the consent hook runs in between", async () => {
+    const g = stubGraph(OK);
+    const seen = [];
+    await registerAgent(g, { ...BASE, beforeIdentity: async (r) => { seen.push({ principal: r.blueprintPrincipalId, identity: r.agentIdentityId, posts: g.calls.filter((c) => c.method === "POST").map((c) => c.path) }); } });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].principal, "prin-1", "blueprint principal exists when the hook runs");
+    assert.equal(seen[0].identity, "", "identity does not exist yet when the hook runs");
+    assert.ok(seen[0].posts.some((p) => p.endsWith("/inheritablePermissions")), "inheritable permissions were set before the hook");
+    assert.equal(seen[0].posts.some((p) => p.endsWith("microsoft.graph.agentIdentity")), false);
   });
 
   test("sends OData-Version: 4.0 on the calls Microsoft requires it for", async () => {

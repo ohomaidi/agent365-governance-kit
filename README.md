@@ -76,24 +76,40 @@ to verify. Nothing on this list is a manual step.
     with an A2A agent card, verified by reading it back. The agent appears in
     **Microsoft 365 admin center → Agents → All agents**.
 
-### In Teams
+### In Teams — as an AI teammate (default)
 
-14. **App package** built from the blueprint (manifest id = bot id = blueprint
-    appId, `webApplicationInfo.resource = api://botid-<appId>`, generated icons)
-    and **published to the organisation's app catalog** — a new version is
-    added if the app already exists.
-15. **Messaging endpoint registered** in the Teams Developer Portal (bot id =
-    blueprint appId, endpoint `https://<agent>/api/messages`) — before the
-    install, because Teams opens the chat with the bot when it installs the app.
-16. **Installed** in the personal scope of the admin, the attributed user and
-    every member of the pilot group, so it is in their Teams app bar; retried
-    while the bot registration propagates.
-17. **Proof attempt**: the installer mints a token *as the agent identity* (the
-    SDK's two-step agentic flow) and tries to send a hello into the admin's
-    Teams. Teams' generic connector currently refuses proactive messages from
-    an agent identity, so the installer says so and points the admin at the
-    app, already in their Teams app bar: the first message is theirs, and the
-    reply proves the path. Each step is an individual checkbox.
+This is the path Microsoft supports for agent identities today, and the one
+verified live end to end: a Teams message reached the agent, and the agent's
+reply was accepted by Teams *as the agent*.
+
+14. **Messaging endpoint registered with Microsoft's Agent 365 service** (the
+    call `a365 setup all --m365` makes). The installer consents its own
+    sign-in to that service once, tenant-wide, then registers
+    `https://<agent>/api/messages` for the blueprint.
+15. **Agent user created** (`POST /beta/users/microsoft.graph.agentUser`) under
+    the agent identity: `<agent-slug>@<tenant>.onmicrosoft.com`, enabled, with
+    the admin's usage location. This is the "person" people chat with in Teams.
+16. **Agent 365 licence assigned** to the agent user from the tenant's
+    Frontier / Agent 365 SKU (skipped, and said, when none has free seats).
+17. **Consent granted to the agent identity itself**, not just the blueprint —
+    an identity created before the blueprint's inheritable permissions inherits
+    nothing (seen live as AADSTS65001 on the agentic token until fixed). The
+    installer now sets inheritable permissions and blueprint consent *before*
+    creating the identity, then consents the identity as well.
+
+The first message is the admin's: open a chat with the agent user in Teams and
+say hello. Teams delivers it with the agentic role, the SDK mints the
+agentic-user token, the reply goes through Purview and back. Each step is an
+individual checkbox.
+
+### In Teams — as a classic app/bot (option)
+
+Also automated (org app catalog publish, Developer Portal bot, install for the
+pilot users), but **not usable by a blueprint identity**: Teams delivers through
+the classic Bot Framework channel, where the reply needs a plain app-only token
+that Entra refuses for agentic apps (AADSTS82001). Microsoft's own CLI lists
+"app-based non-DW publish" as not yet implemented. Keep it for non-agentic bot
+identities; the page says so next to the option.
 
 ### On the agent
 
@@ -104,8 +120,8 @@ to verify. Nothing on this list is a manual step.
 19. For a **vendor agent**: the same `.env` plus `GOVERNANCE_UPSTREAM` and the
     wire format, ready for the governance proxy (below).
 
-**Licences:** blueprint-based agents (this kind) need no per-agent licence.
-Microsoft's `a365` CLI assigns licences only to AI-teammate agent *users*.
+**Licences** apply to the agent *user* (AI teammate) and the installer assigns
+one. A bot-only blueprint carries none.
 
 ---
 
@@ -270,13 +286,13 @@ npm run test:all       # TypeScript + wizard + Python + .NET + proxy
 | TypeScript guard | 20 | defaults, misconfiguration, verdicts, retries, timeouts, caching, payload, redaction |
 | Python guard | 19 | same behaviours, mirrored |
 | .NET guard | 18 | same behaviours, mirrored |
-| Wizard | 78 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 call order + replication, inheritable permissions, consent, Teams package/catalog/install/endpoint, tenant probe |
+| Wizard | 84 | quoting/injection, `.env` replacement, policy mode + scope, cross-platform certs, Agent 365 call order + replication, inheritable permissions, consent, Teams package/catalog/install/endpoint, tenant probe |
 | Proxy | 29 | enforcement, protocol-shaped refusals, attribution, health, Teams bridge through the real Agents SDK adapter |
 
-**164 tests.** CI runs all of them on every push. The tenant-side flow
+**170 tests.** CI runs all of them on every push. The tenant-side flow
 (Purview policies, DSPM recreate, blueprint, identity, consent, registration,
-Teams catalog, installs, endpoint) was exercised live against a licensed
-tenant with two agents before this release.
+Agent 365 endpoint, agent user, licence, and a real Teams round-trip) was
+exercised live against a licensed tenant with two agents before this release.
 
 ### Cleaning a tenant up
 
@@ -299,5 +315,6 @@ Administrator to the connector first); the pilot group; the connector app.
 - **Billing:** Purview API calls for custom apps are metered (pay-as-you-go on the Azure subscription).
 - **PowerShell:** ExchangeOnlineManagement `3.5.1` is pinned (3.10.x throws on PowerShell 7.6); the downloaded portable PowerShell is 7.4.6.
 - **Registration** uses `/beta/copilot/agentRegistrations`, which Microsoft labels subject to change; identity steps are on `v1.0`. The older `/beta/agentRegistry/*` surface retired on 15 June 2026 — re-running the wizard re-registers.
-- **The messaging endpoint** is registered through the Teams Developer Portal API (the same call Teams Toolkit makes). Microsoft's `a365` CLI still prints a manual step here for tenants without its automated path; the kit does not need that path.
+- **The messaging endpoint** is registered with Microsoft's Agent 365 service (the API its `a365` CLI uses), under the kit's own sign-in after a one-time delegated consent the installer grants. The classic Teams Developer Portal route is kept only for the bot option.
+- **No proactive hello.** Teams' connector does not accept a first message from an agent identity; the admin opens the chat. Teammate packages cannot be uploaded by API either (Teams refuses agentic apps; the Copilot packages endpoint returns 501), and they are not needed for the chat to work.
 - **Not published to npm/PyPI/NuGet.** Install from this repo (see each package README).

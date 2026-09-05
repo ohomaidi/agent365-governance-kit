@@ -35,8 +35,9 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { registerAgent, slugify, A365_RESOURCES, MESSAGING_BOT_API_APP } from "./lib/agent365.mjs";
 import { probeTenant } from "./lib/capabilities.mjs";
-import { TokenCache, startDeviceCode, pollDeviceCode, makeDelegatedGraph, makeDevPortal, CLIENTS, GRAPH_SCOPE_STRING } from "./lib/auth.mjs";
-import { buildTeamsPackage, publishToOrgCatalog, installForUsers, registerMessagingEndpoint, proactiveHello } from "./lib/teams.mjs";
+import { TokenCache, startDeviceCode, pollDeviceCode, makeDelegatedGraph, makeDevPortal, makeAgent365Service, ensureAgent365ServiceConsent, CLIENTS, GRAPH_SCOPE_STRING } from "./lib/auth.mjs";
+import { buildTeamsPackage, publishToOrgCatalog, installForUsers, registerMessagingEndpoint, proactiveHello,
+         registerAgent365Endpoint, ensureAgentUser, assignAgentLicence } from "./lib/teams.mjs";
 
 // --- Microsoft constants (stable GUIDs) ---
 const GRAPH_APP = "00000003-0000-0000-c000-000000000000";
@@ -560,7 +561,7 @@ async function main(work) {
 
   let agentName = "", agentUrl = "", sponsorUpn = "", existingBlueprintId = "", transport = "JSONRPC", messagingEndpoint = "";
   let wantTeams = false, agentDescription = "";
-  let wantConsent = false, wantObservability = false, teamsPublish = false, teamsInstall = false, teamsEndpoint = false, teamsHello = false;
+  let wantConsent = false, wantObservability = false, teamsPublish = false, teamsInstall = false, teamsEndpoint = false, teamsHello = false, teamsMode = "teammate", wantLicence = true;
   if (wantAgent365) {
     agentName = await ask("  Agent display name:", purviewAppName, "agentName");
     agentUrl = await ask("  Agent endpoint URL (https):", "", "agentUrl");
@@ -579,10 +580,15 @@ async function main(work) {
     wantObservability = await yes("  Turn on observability (Agent 365 Activity tab)?", true, "wantObservability");
     wantTeams = await yes("  Publish to Teams?", true, "wantTeams");
     if (wantTeams) {
+      console.log(`    ${C.d}1) As an AI teammate — a person in Teams you chat with (Microsoft's supported path for agent identities)`);
+      console.log(`    2) As a Teams app / bot — classic channel; Microsoft's own CLI calls this "not yet implemented" for blueprint agents${C.reset}`);
+      teamsMode = (await ask("    How should it appear in Teams? (1/2):", "1", "teamsMode")) === "2" ? "bot" : "teammate";
+      if (teamsMode === "bot") warn("    Classic bots cannot mint a reply token as an agentic blueprint (AADSTS82001) — this mode is for non-agentic bot identities.");
       teamsPublish = await yes("    Publish the app to the org app catalog?", true, "teamsPublish");
       teamsInstall = await yes("    Install it for the pilot users?", true, "teamsInstall");
       teamsEndpoint = await yes("    Register the messaging endpoint (Teams Developer Portal)?", true, "teamsEndpoint");
       teamsHello = await yes("    Send a hello from the agent into your Teams?", true, "teamsHello");
+      if (teamsMode === "teammate") wantLicence = await yes("    Assign the tenant's Agent 365 licence to the agent user?", true, "wantLicence");
     }
   }
   if (!wantPurview && !wantAgent365) { closeInput(); die("Nothing selected: turn on Purview, Agent 365, or both."); }
@@ -611,7 +617,9 @@ async function main(work) {
     console.log(`  • Agent 365: ${existingBlueprintId ? `reuse blueprint ${existingBlueprintId}` : "create identity blueprint + secret"}`);
     console.log(`               register instance "${agentName}" at ${agentUrl} (${transport})`);
     console.log(`               consent ${wantConsent ? "yes" : "no"}, observability ${wantObservability ? "on" : "off"}`);
-    console.log(`  • Teams: ${wantTeams ? [teamsPublish && "publish to the org app catalog", teamsInstall && "install for the pilot users", teamsEndpoint && `register ${messagingEndpoint}`, teamsHello && "send a hello"].filter(Boolean).join(", ") : `${C.y}not published${C.reset}`}`);
+    console.log(`  • Teams: ${wantTeams ? (teamsMode === "teammate"
+      ? [`AI teammate: register ${messagingEndpoint} with the Agent 365 service`, "create the agent user", wantLicence && "assign the Agent 365 licence", teamsHello && "send a hello"].filter(Boolean).join(", ")
+      : [teamsPublish && "publish to the org app catalog", teamsInstall && "install for the pilot users", teamsEndpoint && `register ${messagingEndpoint} (Developer Portal)`, teamsHello && "send a hello"].filter(Boolean).join(", ")) : `${C.y}not published${C.reset}`}`);
   } else {
     console.log(`  • Agent 365: ${C.y}not registered${C.reset}`);
   }
@@ -631,10 +639,16 @@ async function main(work) {
       plan(`create the agent identity blueprint and register "${agentName}" at ${agentUrl}`);
       plan("verify the registration by reading it back from the Agent 365 registry");
       if (wantConsent) plan("grant tenant-wide admin consent from the blueprint to the Agent 365 resources");
-      if (teamsPublish) plan("build the Teams app package (id = blueprint appId) and publish it to the org app catalog");
-      if (teamsInstall) plan("install the Teams app for the pilot users");
-      if (teamsEndpoint) plan("register the messaging endpoint in the Teams Developer Portal");
-      if (teamsHello) plan("send a hello from the agent into your Teams to prove the path");
+      if (wantTeams && teamsMode === "teammate") {
+        if (teamsEndpoint) plan("register the messaging endpoint with Microsoft's Agent 365 service (consenting the setup sign-in to it once)");
+        plan(`create the agent user ${slugify(agentName)}@${org} under the agent identity${wantLicence ? " and assign the Agent 365 licence" : ""}`);
+        if (teamsHello) plan("tell you how to open a chat with it in Teams");
+      } else if (wantTeams) {
+        if (teamsPublish) plan("build the Teams app package (id = blueprint appId) and publish it to the org app catalog");
+        if (teamsInstall) plan("install the Teams app for the pilot users");
+        if (teamsEndpoint) plan("register the messaging endpoint in the Teams Developer Portal");
+        if (teamsHello) plan("send a hello from the agent into your Teams to prove the path");
+      }
     }
     console.log(`\n${C.c}Dry run complete — nothing was changed.${C.reset}\n`);
     closeInput();
@@ -806,15 +820,22 @@ async function main(work) {
         managedByAppId: appId,
         organization: purviewAppName,
         existingBlueprintId,
+        // Consent the blueprint principal BEFORE the identity exists, so the
+        // identity inherits it; then consent the identity itself as well.
+        beforeIdentity: async (r) => {
+          if (!wantConsent) return;
+          try { for (const line of await grantBlueprintConsent({ blueprintPrincipalId: r.blueprintPrincipalId })) (line.startsWith("WARNING") ? warn : ok)(`  ${line}`); }
+          catch (e) { warn(`  consent grants (blueprint) failed: ${String(e.message || e).slice(0, 200)}`); }
+        },
       }, (m) => info(`  ${m}`));
       for (const st of a365.steps) ok(`  ${st}`);
       // Admin consent — the step that makes the Activity tab and Teams delivery possible.
       if (wantConsent) {
         try {
-          for (const line of await grantBlueprintConsent({ blueprintPrincipalId: a365.blueprintPrincipalId })) {
-            (line.startsWith("WARNING") ? warn : ok)(`  ${line}`);
+          for (const line of await grantBlueprintConsent({ blueprintPrincipalId: a365.agentIdentityId })) {
+            (line.startsWith("WARNING") ? warn : ok)(`  ${line.replace(/^consent/, "identity consent")}`);
           }
-        } catch (e) { warn(`  consent grants failed: ${String(e.message || e).slice(0, 200)}`); }
+        } catch (e) { warn(`  consent grants (identity) failed: ${String(e.message || e).slice(0, 200)}`); }
       } else {
         warn("  admin consent skipped by choice — Teams delivery and the Activity tab need it; grant it in Entra later or re-run.");
       }
@@ -834,8 +855,32 @@ async function main(work) {
   let teams = null;
   if (a365 && wantTeams) {
     info("Publishing to Teams…");
-    teams = { teamsAppId: "", installed: [], endpoint: null, errors: [] };
-    if (teamsPublish) try {
+    teams = { teamsAppId: "", installed: [], endpoint: null, errors: [], mode: teamsMode, agentUser: null, licence: null };
+    if (teamsMode === "teammate") {
+      // ---- AI teammate: Agent 365 service endpoint → agent user → licence ----
+      try {
+        const c = await ensureAgent365ServiceConsent(dg);
+        if (c !== "present") ok(`  consented the setup sign-in to the Agent 365 service (${c})`);
+        const svc = makeAgent365Service(cache);
+        if (teamsEndpoint) {
+          teams.endpoint = { action: "registered", ...(await registerAgent365Endpoint(svc, { tenantId, blueprintAppId: a365.blueprintAppId, callbackUri: messagingEndpoint })) };
+          ok(`  messaging endpoint registered with the Agent 365 service: ${messagingEndpoint}`);
+          record(`Agent 365 messaging endpoint for blueprint ${a365.blueprintAppId} — remove with POST ${"https://agent365.svc.cloud.microsoft"}/agents/botManagement/deleteAgentBlueprint`);
+        }
+      } catch (e) { teams.errors.push(`endpoint: ${String(e.message || e).slice(0, 300)}`); warn(`  Agent 365 endpoint registration failed: ${String(e.message || e).slice(0, 300)}`); }
+      try {
+        const me = await dg("GET", "/v1.0/me?$select=usageLocation");
+        teams.agentUser = await ensureAgentUser(dg, { displayName: agentName, mailNickname: slugify(agentName), domain: org, agentIdentityId: a365.agentIdentityId, usageLocation: me?.usageLocation || "US" });
+        ok(`  agent user ${teams.agentUser.created ? "created" : "reused"}: ${teams.agentUser.userPrincipalName}`);
+        record(`agent user ${teams.agentUser.userPrincipalName} (${teams.agentUser.id}) — delete in Entra → Users`);
+        if (wantLicence) {
+          teams.licence = await assignAgentLicence(dg, teams.agentUser.id);
+          if (teams.licence.status === "none") warn("  no Agent 365 / Frontier licence with free seats in this tenant — assign one to the agent user by hand");
+          else ok(`  licence ${teams.licence.status}: ${teams.licence.sku}`);
+        }
+      } catch (e) { teams.errors.push(`agent user: ${String(e.message || e).slice(0, 300)}`); warn(`  agent user step failed: ${String(e.message || e).slice(0, 300)}`); }
+    }
+    if (teamsMode === "bot" && teamsPublish) try {
       const { zip } = buildTeamsPackage({
         blueprintAppId: a365.blueprintAppId, agentName, description: agentDescription, agentUrl,
         developer: { name: orgName || purviewAppName },
@@ -846,7 +891,7 @@ async function main(work) {
       record(`Teams app ${pub.teamsAppId} in the org catalog — remove in Teams admin center → Manage apps`);
     } catch (e) { teams.errors.push(`publish: ${String(e.message || e).slice(0, 300)}`); warn(`  Teams publish failed: ${String(e.message || e).slice(0, 300)}`); }
 
-    if (teamsEndpoint) try {
+    if (teamsMode === "bot" && teamsEndpoint) try {
       if (!(await devPortalSignIn())) throw new Error("no Teams Developer Portal sign-in (the installer asks for it)");
       teams.endpoint = await registerMessagingEndpoint(devPortal, {
         botId: a365.blueprintAppId, name: agentName, description: agentDescription, messagingEndpoint,
@@ -932,6 +977,9 @@ async function main(work) {
       `AGENT365_MESSAGING_ENDPOINT=${messagingEndpoint}`,
       `AGENT365_IDENTIFIER_URI=${a365.identifierUri ?? ""}`,
       `AGENT365_TEAMS_APP_ID=${teams?.teamsAppId ?? ""}`,
+      `AGENT365_TEAMS_MODE=${teams?.mode ?? ""}`,
+      `AGENT365_AGENT_USER_ID=${teams?.agentUser?.id ?? ""}`,
+      `AGENT365_AGENT_USER_UPN=${teams?.agentUser?.userPrincipalName ?? ""}`,
       "",
       "# --- Agents SDK runtime connection (Teams / Bot Framework path) ---",
       `agent_id=${a365.blueprintAppId}`,
@@ -976,7 +1024,10 @@ async function main(work) {
 
   // ---- 6b. prove the Teams path from the agent's side ----
   let hello = null;
-  if (teams?.teamsAppId && a365?.blueprintSecret && teamsHello) {
+  if (teams?.mode === "teammate" && teamsHello && teams.agentUser) {
+    hello = { ok: false, detail: `chat with ${teams.agentUser.userPrincipalName} in Teams — a proactive first message from an agent user is not offered by Microsoft's connector yet` };
+    info(`  Teams: open a chat with "${agentName}" (${teams.agentUser.userPrincipalName}) and send the first message.`);
+  } else if (teams?.teamsAppId && a365?.blueprintSecret && teamsHello) {
     info("Sending a hello from the agent into your Teams…");
     hello = await proactiveHello({
       tenantId, blueprintAppId: a365.blueprintAppId, blueprintSecret: a365.blueprintSecret, agentIdentityId: a365.agentIdentityId,
@@ -1011,7 +1062,7 @@ async function main(work) {
       warn(`Could not revoke automatically: ${String(e.message || e).trim()}`);
       warn(`  Remove them by hand in Entra → ${appRegName} → Permissions / Assigned roles.`);
     }
-  } else if (!revokeAfter) {
+  } else if (wantPurview && !revokeAfter) {
     warn(`Connector ${appId} keeps Compliance Administrator at tenant scope. Remove it when provisioning is done.`);
   }
 
@@ -1055,7 +1106,13 @@ async function main(work) {
       console.log(`  identity     : ${a365.agentIdentityId}`);
       console.log(`  registration : ${a365.registrationId}${a365.verified ? "  (verified)" : ""}`);
       console.log(`  endpoint     : ${agentUrl}`);
-      if (teams) {
+      if (teams?.mode === "teammate") {
+        console.log(`  Teams         : AI teammate ${teams.agentUser ? `${C.g}${teams.agentUser.userPrincipalName}${C.reset}` : `${C.y}agent user NOT created — see above${C.reset}`}`);
+        console.log(`  licence       : ${teams.licence ? `${teams.licence.status}${teams.licence.sku ? ` (${teams.licence.sku})` : ""}` : "not assigned"}`);
+        console.log(`  endpoint      : ${teams.endpoint ? `${messagingEndpoint} (Agent 365 service)` : `${C.y}NOT registered — see above${C.reset}`}`);
+        if (teams.agentUser) console.log(`  ${C.g}In Teams, start a chat with "${agentName}" and say hello — the reply comes back through Purview.${C.reset}`);
+        for (const err of teams.errors) console.log(`  ${C.y}!${C.reset} ${err}`);
+      } else if (teams) {
         console.log(`  Teams app     : ${teams.teamsAppId || `${C.y}not published${C.reset}`}`);
         console.log(`  installed for : ${teams.installed.filter((x) => x.status !== "failed").length} user(s)`);
         console.log(`  endpoint      : ${teams.endpoint ? `${messagingEndpoint} (${teams.endpoint.action})` : `${C.y}NOT registered — see above${C.reset}`}`);
@@ -1064,7 +1121,7 @@ async function main(work) {
       } else {
         console.log(`\n  ${C.y}Not published to Teams.${C.reset} Re-run and answer yes to "Publish to Teams" when you want it there.`);
       }
-      console.log(`\n  ${C.d}Blueprint-based agents need no per-agent licence (Microsoft's own CLI assigns licences only to AI-teammate users).${C.reset}`);
+      console.log(`\n  ${C.d}Licences apply to the agent USER (AI teammate). A bot-only blueprint carries none.${C.reset}`);
       console.log(`\n  Verify: M365 admin center -> Agents -> All agents -> "${agentName}"; Teams -> Apps -> Built for your org.\n`);
     } else {
       console.log(`\n${C.b}${C.y}Agent 365 was NOT registered.${C.reset} To do it by hand, see AGENT365_SETUP.md\n`);

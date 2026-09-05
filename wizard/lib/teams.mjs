@@ -155,10 +155,42 @@ export function buildTeamsManifest({ blueprintAppId, agentName, description, age
   };
 }
 
-/** The four-file package Teams expects, as a zip Buffer. */
+/**
+ * AI-teammate manifest (devPreview): the shape Microsoft's a365 CLI emits with
+ * --aiteammate and the only Teams path Microsoft fully supports for blueprint
+ * agents today ("app-based non-DW publish … not yet implemented" in their CLI).
+ * The template links the app to the blueprint; an agent USER is created from
+ * it, and Teams delivers messages with the agentic role the SDK requires.
+ */
+export function buildTeammateManifest(opts) {
+  const m = buildTeamsManifest(opts);
+  const templateId = opts.templateId || m.id;
+  const { bots, webApplicationInfo, permissions, validDomains, ...rest } = m;
+  return {
+    manifest: {
+      ...rest,
+      $schema: "https://developer.microsoft.com/en-us/json-schemas/teams/vdevPreview/MicrosoftTeams.schema.json",
+      manifestVersion: "devPreview",
+      agenticUserTemplates: [{ id: templateId, file: "agenticUserTemplateManifest.json" }],
+    },
+    template: { id: templateId, schemaVersion: "0.1.0-preview", agentIdentityBlueprintId: opts.blueprintAppId, communicationProtocol: "activityProtocol" },
+  };
+}
+
+/** The package Teams expects, as a zip Buffer. `teammate: true` builds the AI-teammate form. */
 export function buildTeamsPackage(opts) {
-  const manifest = buildTeamsManifest(opts);
   const icons = opts.icons ?? defaultIcons(opts.accentColor);
+  if (opts.teammate) {
+    const { manifest, template } = buildTeammateManifest(opts);
+    const zip = makeZip([
+      { name: "manifest.json", data: JSON.stringify(manifest, null, 2) },
+      { name: "agenticUserTemplateManifest.json", data: JSON.stringify(template, null, 2) },
+      { name: "color.png", data: icons.color },
+      { name: "outline.png", data: icons.outline },
+    ]);
+    return { manifest, template, zip };
+  }
+  const manifest = buildTeamsManifest(opts);
   const zip = makeZip([
     { name: "manifest.json", data: JSON.stringify(manifest, null, 2) },
     { name: "color.png", data: icons.color },
@@ -315,4 +347,61 @@ export async function proactiveHello({ tenantId, blueprintAppId, blueprintSecret
   const msgText = await msg.text();
   if (!msg.ok) return { ok: false, detail: `send HTTP ${msg.status}: ${msgText.slice(0, 300)}` };
   return { ok: true, detail: `message delivered (conversation ${convId})` };
+}
+
+/* ---------------------------------------------- Agent 365 (M365) path --- */
+
+/**
+ * Register the agent's messaging endpoint with Microsoft's Agent 365 service —
+ * what `a365 setup all --m365` does. This is the path that delivers Teams
+ * messages with the agentic role the Agents SDK needs; a Developer Portal bot
+ * delivers through the classic channel, where a blueprint identity cannot
+ * mint the reply token (AADSTS82001, observed live). Idempotent.
+ */
+export async function registerAgent365Endpoint(svc, { tenantId, blueprintAppId, callbackUri }) {
+  if (!/^https:\/\//i.test(callbackUri)) throw new Error("callbackUri must be https");
+  const r = await svc("POST", "/agents/botManagement/createAgentBlueprint", { tenantId, callbackUri, agentIdentityBlueprintId: blueprintAppId });
+  return { callbackUri: r?.callbackUri ?? callbackUri, type: r?.type ?? "", message: r?.message ?? "" };
+}
+
+export async function deleteAgent365Endpoint(svc, { tenantId, blueprintAppId }) {
+  try { await svc("POST", "/agents/botManagement/deleteAgentBlueprint", { tenantId, agentIdentityBlueprintId: blueprintAppId }); return true; }
+  catch (e) { if (e.status === 404) return false; throw e; }
+}
+
+/**
+ * The agent USER — an Entra user of type agentUser whose identity parent is
+ * the agent identity. This is what Teams talks to on the Agent 365 path; the
+ * SDK answers with the agentic-user token flow. Idempotent by UPN.
+ * @returns {Promise<{id:string, userPrincipalName:string, created:boolean}>}
+ */
+export async function ensureAgentUser(graph, { displayName, mailNickname, domain, agentIdentityId, usageLocation = "US" }) {
+  const upn = `${mailNickname}@${domain}`;
+  const found = (await graph("GET", `/beta/users?$filter=userPrincipalName eq '${upn.replace(/'/g, "''")}'&$select=id,userPrincipalName,usageLocation`))?.value?.[0];
+  if (found) {
+    if (!found.usageLocation) await graph("PATCH", `/v1.0/users/${found.id}`, { usageLocation });
+    return { id: found.id, userPrincipalName: found.userPrincipalName, created: false };
+  }
+  const u = await graph("POST", "/beta/users/microsoft.graph.agentUser", {
+    "@odata.type": "#microsoft.graph.agentUser",
+    displayName, mailNickname, userPrincipalName: upn, accountEnabled: true, identityParentId: agentIdentityId,
+  });
+  await graph("PATCH", `/v1.0/users/${u.id}`, { usageLocation });
+  return { id: u.id, userPrincipalName: u.userPrincipalName ?? upn, created: true };
+}
+
+/**
+ * Assign the tenant's Agent 365 licence to the agent user. Picks the first
+ * subscribed SKU whose part number looks like an Agent 365 / Frontier SKU
+ * unless `skuId` is given. Reports "none available" instead of guessing.
+ * @returns {Promise<{status:"assigned"|"already"|"none", sku?:string}>}
+ */
+export async function assignAgentLicence(graph, userId, { skuId, match = /AGENT_FRONTIER|AGENT365|A365|COPILOT_AGENT/i } = {}) {
+  const skus = (await graph("GET", "/v1.0/subscribedSkus?$select=skuId,skuPartNumber,prepaidUnits,consumedUnits"))?.value ?? [];
+  const sku = skuId ? skus.find((s) => s.skuId === skuId) : skus.find((s) => match.test(s.skuPartNumber) && s.consumedUnits < (s.prepaidUnits?.enabled ?? 0));
+  if (!sku) return { status: "none" };
+  const have = (await graph("GET", `/v1.0/users/${userId}?$select=assignedLicenses`))?.assignedLicenses ?? [];
+  if (have.some((l) => l.skuId === sku.skuId)) return { status: "already", sku: sku.skuPartNumber };
+  await graph("POST", `/v1.0/users/${userId}/assignLicense`, { addLicenses: [{ skuId: sku.skuId, disabledPlans: [] }], removeLicenses: [] });
+  return { status: "assigned", sku: sku.skuPartNumber };
 }
