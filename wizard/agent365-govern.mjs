@@ -47,6 +47,8 @@ const ROLE_AGENT_BLUEPRINT_RW = "7fddd33b-d884-4ec0-8696-72cff90ff825";     // A
 const ROLE_AGENT_BLUEPRINT_CREATE = "ea4b2453-ad2d-4d94-9155-10d5d9493ce9"; // AgentIdentityBlueprint.Create
 const ROLE_AGENT_BLUEPRINT_CREDS = "0510736e-bdfb-4b37-9a1f-89b4a074763a";  // AgentIdentityBlueprint.AddRemoveCreds.All
 const ROLE_AGENT_CARD_RW = "228b1a03-f7ca-4348-b50d-e8a547ab61af";          // AgentCardManifest.ReadWrite.All
+// The Agent 365 inventory API that REPLACED the retired Entra agent registry.
+const ROLE_COPILOT_PACKAGES_RW = "ed31732f-9495-47ed-ba3b-4ed0948c1c64";    // CopilotPackages.ReadWrite.All
 const EXO_MODULE_VERSION = "3.5.1"; // 3.10.x throws NullRef on PowerShell 7.6
 
 const IS_WINDOWS = process.platform === "win32";
@@ -97,6 +99,9 @@ function azJson(args) { const out = az(args).trim(); return out ? JSON.parse(out
  *
  * Injected into registerAgent, so the flow stays unit-testable without a tenant.
  */
+/** Thrown when registration is impossible rather than merely failing. */
+class SkipRegistration extends Error {}
+
 function makeGraphClient({ tenantId, clientId, clientSecret }) {
   let token = "", expires = 0;
 
@@ -117,14 +122,14 @@ function makeGraphClient({ tenantId, clientId, clientSecret }) {
     return token;
   }
 
-  return async function graph(method, path, body) {
+  const call = async (base, method, path, body) => {
     // Freshly granted app roles take a little while to reach a minted token.
     const delays = [0, 5000, 10000, 20000, 30000];
     let last;
     for (const d of delays) {
       if (d) await new Promise((r) => setTimeout(r, d));
       const t = await getToken();
-      const res = await fetch(`${GRAPH_BETA}${path}`, {
+      const res = await fetch(`${base}${path}`, {
         method,
         headers: { authorization: `Bearer ${t}`, ...(body ? { "content-type": "application/json" } : {}) },
         body: body ? JSON.stringify(body) : undefined,
@@ -137,6 +142,10 @@ function makeGraphClient({ tenantId, clientId, clientSecret }) {
     }
     throw new Error(last);
   };
+
+  const graph = (method, path, body) => call(GRAPH_BETA, method, path, body);
+  graph.v1 = (method, path, body) => call("https://graph.microsoft.com/v1.0", method, path, body);
+  return graph;
 }
 
 /** Quote a value for safe embedding in a PowerShell single-quoted literal. */
@@ -412,6 +421,10 @@ async function main(work) {
     plan(`create DLP policy in ${dlpMode} mode scoped to ${scopeLabel}`);
     plan(`write ${envPath}`);
     plan("validate with token → protectionScopes/compute → processContent");
+    // Render the closing output now (nothing is written) so a rehearsal
+    // exercises the same reporting code a real run finishes with.
+    void integrationSnippet(lang);
+    void agent365Checklist({ agentName: agentName || purviewAppName, lang, blueprintId: "" });
     if (wantAgent365) {
       plan(`create the agent identity blueprint and register "${agentName}" at ${agentUrl}`);
       plan("verify the registration by reading it back from the Agent 365 registry");
@@ -464,6 +477,7 @@ async function main(work) {
     assignRole(graphSp, ROLE_AGENT_BLUEPRINT_CREATE, "AgentIdentityBlueprint.Create");
     assignRole(graphSp, ROLE_AGENT_BLUEPRINT_CREDS, "AgentIdentityBlueprint.AddRemoveCreds.All");
     assignRole(graphSp, ROLE_AGENT_CARD_RW, "AgentCardManifest.ReadWrite.All");
+    assignRole(graphSp, ROLE_COPILOT_PACKAGES_RW, "CopilotPackages.ReadWrite.All");
   }
   ok("App-role assignments granted");
 
@@ -539,6 +553,7 @@ async function main(work) {
       const sponsorId = azJson(["ad", "user", "show", "--id", sponsorUpn, "--query", "id", "-o", "json"]);
       if (!sponsorId) throw new Error(`sponsor "${sponsorUpn}" not found in this tenant`);
       const graph = makeGraphClient({ tenantId, clientId: appId, clientSecret });
+      const graphV1 = graph.v1;
 
       // A stale instance from the retired (pre-June-2026) registry will collide.
       try {
@@ -558,6 +573,29 @@ async function main(work) {
         info(`  (could not list existing instances: ${String(e.message).slice(0, 120)})`);
       }
 
+      // The Entra agent registry (/beta/agentRegistry/*) was RETIRED on
+      // 2026-06-15 and now returns 404 for everyone. Check before attempting a
+      // registration that cannot succeed, and fall back to reporting the
+      // tenant's live Agent 365 inventory instead of failing the whole run.
+      let registryLive = true;
+      try {
+        await graph("GET", "/agentRegistry/agentInstances");
+      } catch (e) {
+        if (/HTTP (404|400)/.test(String(e.message))) registryLive = false;
+      }
+      if (!registryLive) {
+        warn("  The Entra agent registry API retired on 15 June 2026 and no longer accepts registrations.");
+        warn("  Purview governance is fully configured; Agent 365 registration must be done in the");
+        warn("  Microsoft 365 admin center → Agents, until Microsoft documents the replacement write API.");
+        try {
+          const cat = await graphV1("GET", "/copilot/admin/catalog/packages?$top=1");
+          const n = cat?.["@odata.count"];
+          if (n !== undefined) ok(`  Agent 365 inventory reachable — ${n} agents/apps currently registered in this tenant.`);
+        } catch { /* inventory is a nicety, not a requirement */ }
+        a365 = null;
+        throw new SkipRegistration();
+      }
+
       a365 = await registerAgent(graph, {
         agentName,
         agentDescription: `${agentName} — governed by the Agent 365 Governance Kit`,
@@ -575,10 +613,14 @@ async function main(work) {
       if (!a365.verified) warn("  Registration could not be read back — check the Agent 365 registry manually.");
     } catch (e) {
       a365 = null;
+      if (e instanceof SkipRegistration) {
+        // Already explained above; not a failure of this run.
+      } else {
       warn(`Agent 365 registration failed: ${String(e.message).slice(0, 400)}`);
       warn("  These are /beta endpoints. The connector app was granted");
       warn("  AgentInstance.ReadWrite.All and the blueprint roles; a new assignment can");
       warn("  take a few minutes to reach a token. Purview provisioning is unaffected.");
+      }
     }
   }
 
@@ -675,7 +717,9 @@ async function main(work) {
 
   // ---- Agent 365 manual completion steps ----
   if (wantObservability) {
-    const checklist = agent365Checklist({ agentName: agentName || purviewAppName, lang, blueprintId });
+    const checklist = agent365Checklist({
+      agentName: agentName || purviewAppName, lang, blueprintId: a365?.blueprintId ?? "",
+    });
     const setupPath = join(envPath.replace(/[^/\\]*$/, ""), "AGENT365_SETUP.md");
     try { writeFileSync(setupPath, checklist); ok(`Agent 365 completion steps written to ${setupPath}`); }
     catch { /* non-fatal */ }

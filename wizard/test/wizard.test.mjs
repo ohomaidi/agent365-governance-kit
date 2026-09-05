@@ -8,7 +8,8 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { psLit, odata, writeEnvBlock, buildProvisionScript, makeCertificate, BEGIN, END } from "../agent365-govern.mjs";
+import { psLit, odata, writeEnvBlock, buildProvisionScript, makeCertificate,
+         agent365Checklist, integrationSnippet, BEGIN, END } from "../agent365-govern.mjs";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "a365-wiztest-"));
 
@@ -191,5 +192,23 @@ describe("certificate generation", () => {
     const r = makeCertificate({ work: "/tmp/w", subjectName: "A", pfxPw: "x", run });
     assert.match(r.certPem, /cert\.pem$/);
     assert.match(r.pfxPath, /cert\.pfx$/);
+  });
+});
+
+describe("closing output", () => {
+  // A ReferenceError here only surfaces at the very end of a real provision,
+  // after the tenant has already been changed — so it gets its own coverage.
+  test("the checklist renders with and without a blueprint id", () => {
+    for (const id of ["", undefined, "bp-123"]) {
+      const out = agent365Checklist({ agentName: "Abbas", lang: "typescript", blueprintId: id });
+      assert.match(out, /Completing Agent 365 setup/);
+      assert.match(out, id ? /bp-123/ : /your blueprint/);
+    }
+  });
+
+  test("an integration snippet exists for every language the wizard offers", () => {
+    for (const lang of ["typescript", "python", "dotnet", "csharp", "unknown"]) {
+      assert.ok(integrationSnippet(lang).includes("guard"), `no snippet for ${lang}`);
+    }
   });
 });

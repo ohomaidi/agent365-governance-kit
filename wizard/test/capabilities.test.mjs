@@ -76,7 +76,7 @@ describe("catches the failures that would otherwise surface mid-demo", () => {
         { value: "Content.Process.All" }, { value: "ProtectionScopes.Compute.All" },
       ] },
     }));
-    assert.equal(status(r, "Agent 365 registry"), "fail");
+    assert.equal(status(r, "Agent 365 registration"), "fail");
     assert.equal(r.canRegisterAgent365, false);
     assert.equal(r.canProvisionPurview, true, "Purview must not be blocked by an absent registry");
   });

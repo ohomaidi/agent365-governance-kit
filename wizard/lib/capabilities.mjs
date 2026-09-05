@@ -116,11 +116,19 @@ export async function probeTenant(azJson) {
             "The Purview SDK surface isn't available to this tenant.")
       : ok("Purview Graph API", "Content.Process.All + ProtectionScopes.Compute.All available"));
 
+    // The Entra agent registry API retired on 2026-06-15. The permissions are
+    // still published, so their presence proves nothing — say so plainly rather
+    // than promising a registration that will 404.
     const a365Missing = AGENT365_ROLES.filter((n) => !graphRoles.includes(n));
     checks.push(a365Missing.length
-      ? bad("Agent 365 registry", `missing app role(s): ${a365Missing.join(", ")}`,
-            "Agent 365 registration will be skipped. Purview still works.")
-      : ok("Agent 365 registry", "AgentInstance + blueprint permissions available"));
+      ? bad("Agent 365 registration", `missing app role(s): ${a365Missing.join(", ")}`,
+            "Registration will be skipped. Purview is unaffected.")
+      : warn("Agent 365 registration", "permissions present; endpoint checked during provisioning",
+             "The Entra agent registry retired 15 June 2026. If it no longer answers, register in the M365 admin center."));
+    checks.push(graphRoles.includes("CopilotPackages.ReadWrite.All")
+      ? ok("Agent 365 inventory", "CopilotPackages.ReadWrite.All available")
+      : warn("Agent 365 inventory", "CopilotPackages.ReadWrite.All not offered",
+             "The agent inventory API won't be readable."));
   }
 
   // --- roles actually held ---
@@ -161,6 +169,6 @@ function finish(checks, account) {
     checks, summary,
     // Purview needs Exchange Online + the Graph roles; Agent 365 needs the registry.
     canProvisionPurview: !failed("Exchange Online") && !failed("Purview Graph API") && !failed("Licences"),
-    canRegisterAgent365: !failed("Agent 365 registry"),
+    canRegisterAgent365: !failed("Agent 365 registration"),
   };
 }
