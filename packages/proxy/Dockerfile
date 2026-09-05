@@ -11,11 +11,10 @@ WORKDIR /src
 COPY package.json package-lock.json ./
 COPY packages/typescript ./packages/typescript
 COPY packages/proxy ./packages/proxy
-RUN node -v && npm -v \
- && npm ci --no-audit --no-fund \
- && node node_modules/typescript/bin/tsc -v \
- && (cd packages/typescript && node ../../node_modules/typescript/bin/tsc -p tsconfig.json --listEmittedFiles | tail -n 3) \
- && npm pack --silent --workspace @zaatarlabs/agent365-governance-kit --pack-destination /out >/dev/null
+RUN set -x; node -v; npm -v; npm ci --no-audit --no-fund; echo "ci=$?"; \
+    (cd packages/typescript && node ../../node_modules/typescript/bin/tsc -p tsconfig.json); echo "tsc=$?"; ls packages/typescript/dist | head -n 3; \
+    mkdir -p /out; (cd packages/typescript && npm pack --pack-destination /out); echo "pack=$?"; ls -la /out; \
+    test -s /out/zaatarlabs-agent365-governance-kit-*.tgz
 
 FROM node:22-bookworm-slim
 WORKDIR /app
