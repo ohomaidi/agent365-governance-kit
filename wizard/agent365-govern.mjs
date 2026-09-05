@@ -313,14 +313,21 @@ async function main(work) {
   } else if (scopeChoice === "2") {
     const upns = (await ask("Pilot user UPNs (comma-separated):", attribUpn, "pilotUsers")).split(",").map((s) => s.trim()).filter(Boolean);
     if (!upns.length) { closeInput(); die("No users given."); }
+    for (const u of upns) {
+      try { azJson(["ad", "user", "show", "--id", u, "--query", "id", "-o", "json"]); }
+      catch { closeInput(); die(`User "${u}" not found in this tenant.`); }
+    }
     scopeInclusions = upns.map((u) => ({ Type: "User", Identity: u }));
     scopeLabel = `${upns.length} user(s): ${upns.join(", ")}`;
   } else {
     const grp = await ask("Pilot group email / object id:", "", "pilotGroup");
     if (!grp) { closeInput(); die("A pilot group is required for scope 1. Create one in Entra, or pick option 2 or 3."); }
-    if (!DRY_RUN) {
-      try { azJson(["ad", "group", "show", "--group", grp, "--query", "id", "-o", "json"]); }
-      catch { closeInput(); die(`Group "${grp}" not found in this tenant.`); }
+    // Checked even in a dry run: it's a read-only lookup, and a rehearsal that
+    // can't catch what provisioning would fail on is worthless.
+    try { azJson(["ad", "group", "show", "--group", grp, "--query", "id", "-o", "json"]); }
+    catch {
+      closeInput();
+      die(`Group "${grp}" not found in this tenant. Pick "Just me", or create the group in Entra first.`);
     }
     scopeInclusions = [{ Type: "Group", Identity: grp }];
     scopeLabel = `group ${grp}`;

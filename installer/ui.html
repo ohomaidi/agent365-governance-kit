@@ -105,12 +105,14 @@
       <legend>3 · Who the policy applies to</legend>
       <div class="row"><label for="scopeChoice">Scope</label>
         <select id="scopeChoice">
-          <option value="1">A pilot group (recommended)</option>
-          <option value="2">Specific users</option>
+          <option value="me">Just me (recommended for a first run)</option>
+          <option value="2">Specific people</option>
+          <option value="1">A group</option>
           <option value="3">Everyone in the tenant</option>
         </select></div>
-      <div class="row" id="rowGroup"><label for="pilotGroup">Pilot group</label><input type="text" id="pilotGroup" placeholder="group@contoso.com or object id"></div>
-      <div class="row" id="rowUsers" hidden><label for="pilotUsers">Pilot users</label><input type="text" id="pilotUsers" placeholder="a@contoso.com, b@contoso.com"></div>
+      <div class="row" id="rowGroup" hidden><label for="pilotGroup">Group</label><input type="text" id="pilotGroup" placeholder="group@contoso.com or object id">
+        <span class="hint">Must already exist in your tenant.</span></div>
+      <div class="row" id="rowUsers" hidden><label for="pilotUsers">People</label><input type="text" id="pilotUsers" placeholder="a@contoso.com, b@contoso.com"></div>
       <div id="scopeWarn" class="warn" hidden>Tenant-wide applies to <strong>every user</strong> in the organisation.</div>
     </fieldset>
 
@@ -172,6 +174,7 @@
     <span id="status" class="sub"></span>
   </div>
 
+  <div id="errBox" hidden class="bad"></div>
   <pre id="log" hidden></pre>
 </div>
 
@@ -326,10 +329,12 @@ function answers() {
     attribUpn: or("attribUpn", me),
     envPath: or("envPath", detected?.envPath || ""),
     lang: or("lang", detected?.language || "typescript"),
-    scopeChoice: scope,
-    pilotGroup: $("pilotGroup").value, pilotUsers: $("pilotUsers").value,
+    scopeChoice: scope === "me" ? "2" : scope,
+    pilotGroup: $("pilotGroup").value,
+    pilotUsers: scope === "me" ? me : $("pilotUsers").value,
     // The CLI asks for these confirmations; the UI already made them explicit choices.
     confirmTenantWide: scope === "3", typeTenantWide: scope === "3" ? "TENANT-WIDE" : "",
+    reuseExistingApp: true,
     modeChoice: mode,
     confirmEnforce: mode === "3", typeEnforce: mode === "3" ? "ENFORCE" : "",
     wantCreditCard: $("wantCreditCard").checked,
@@ -347,12 +352,24 @@ function answers() {
   };
 }
 
+// [pattern, what to do about it] — matched against the wizard's fatal line.
+const HINTS = [
+  [/Group .* not found/i, 'That group doesn\u2019t exist in this tenant. Choose <strong>Just me</strong>, or create the group in Entra first.'],
+  [/not found in this tenant/i, 'Check the spelling, or pick <strong>Just me</strong> for a first run.'],
+  [/Compliance Administrator/i, 'Your account needs Global Administrator, or Privileged Role Administrator, to grant this.'],
+  [/PowerShell Gallery|Install-Module/i, 'This machine can\u2019t reach the PowerShell Gallery. Run setup somewhere with access, or pre-install ExchangeOnlineManagement 3.5.1.'],
+  [/Connect-IPPSSession|Security & Compliance/i, 'Couldn\u2019t reach Security &amp; Compliance PowerShell. Usually permissions still propagating \u2014 wait a few minutes and run again.'],
+  [/not signed in|az login/i, 'Sign in to Azure using the button at the top, then try again.'],
+  [/Aborted/i, 'Setup was stopped before anything was created.'],
+  [/https/i, 'The agent\u2019s web address must start with https://'],
+];
+
 function validate(a) {
   if (!$("agentDir").value.trim()) return "Point me at your agent's folder first.";
   if (!a.envPath) return "Couldn't work out where to write the settings file — set it under Advanced.";
   if (!$("agentName").value.trim()) return "Give the agent a name.";
-  if (a.scopeChoice === "1" && !a.pilotGroup) return "A pilot group is required for that scope.";
-  if (a.scopeChoice === "2" && !a.pilotUsers) return "List at least one pilot user.";
+  if ($("scopeChoice").value === "1" && !a.pilotGroup) return "Name the group, or choose \u201cJust me\u201d.";
+  if ($("scopeChoice").value === "2" && !a.pilotUsers) return "List at least one person.";
   if (a.wantAgent365 && !/^https:\/\//i.test(a.agentUrl)) return "The agent's web address must start with https://";
   return null;
 }
@@ -375,18 +392,39 @@ async function run(dryRun) {
     body: JSON.stringify({ answers: a, dryRun }),
   })).json();
 
+  const lines = [];
   const es = new EventSource(`/api/log?id=${id}`);
   es.onmessage = (e) => {
-    $("log").textContent += JSON.parse(e.data) + "\n";
+    const line = JSON.parse(e.data);
+    lines.push(line);
+    $("log").textContent += line + "\n";
     $("log").scrollTop = $("log").scrollHeight;
   };
   es.addEventListener("done", (e) => {
     es.close();
     const { code } = JSON.parse(e.data);
-    $("status").textContent = code === 0
-      ? (dryRun ? "Rehearsal complete — nothing was changed." : "Done.")
-      : `Finished with errors (exit ${code}). Read the log above.`;
     $("btnGo").disabled = false; $("btnDry").disabled = false;
+
+    if (code === 0) {
+      $("errBox").hidden = true;
+      $("status").textContent = dryRun ? "Rehearsal complete — nothing was changed." : "Done.";
+      return;
+    }
+
+    // Pull the reason out of the log rather than telling them to go and find it.
+    const fatal = [...lines].reverse().find((l) => l.trim().startsWith("\u2717"));
+    const warns = lines.filter((l) => l.trim().startsWith("!")).slice(-3);
+    const created = lines.filter((l) => /^\s+\u2022 /.test(l));
+
+    let html = `<strong>${fatal ? fatal.replace(/^\s*\u2717\s*/, "") : `Setup stopped (exit ${code}).`}</strong>`;
+    const hint = fatal && HINTS.find(([re]) => re.test(fatal));
+    if (hint) html += `<div style="margin-top:.45rem">${hint[1]}</div>`;
+    if (warns.length) html += `<div style="margin-top:.5rem" class="hint">${warns.map(w => w.replace(/^\s*!\s*/, "")).join("<br>")}</div>`;
+    if (created.length) html += `<div style="margin-top:.5rem">Created before stopping — undo if you want a clean slate:<br>${created.join("<br>")}</div>`;
+    $("errBox").innerHTML = html;
+    $("errBox").hidden = false;
+    $("errBox").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    $("status").textContent = "";
   });
 }
 
