@@ -399,3 +399,21 @@ describe("guard wiring — the customer never pastes code", () => {
     assert.match(w.warnings[0], /--import/);
   });
 });
+
+describe("agent restart detection", () => {
+  test("prefers a pm2 process whose cwd is the agent folder", async () => {
+    const { detectRunner } = await import("../lib/restart.mjs");
+    const calls = [];
+    const deps = { has: (c) => c === "pm2", sh: (cmd, args) => { calls.push([cmd, ...args]); return cmd === "pm2" && args[0] === "jlist" ? JSON.stringify([{ name: "hr-bot", pm2_env: { pm_cwd: "/srv/hr" } }]) : ""; }, home: "/nonexistent", processes: [] };
+    const r = detectRunner("/srv/hr", deps);
+    assert.equal(r.kind, "pm2"); await r.restart();
+    assert.ok(calls.some((c) => c.join(" ") === "pm2 restart hr-bot"));
+  });
+  test("falls back to a running node process in that folder, and says so when nothing is found", async () => {
+    const { detectRunner } = await import("../lib/restart.mjs");
+    const r = detectRunner("/srv/x", { has: () => false, sh: () => "", home: "/nonexistent", processes: [{ pid: 1, args: ["node", "dist/index.js"] }] });
+    assert.equal(r.kind, "process"); assert.match(r.detail, /dist\/index\.js/);
+    const none = detectRunner("/srv/x", { has: () => false, sh: () => "", home: "/nonexistent", processes: [] });
+    assert.equal(none.kind, ""); assert.match(none.detail, /no pm2/);
+  });
+});

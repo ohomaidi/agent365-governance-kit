@@ -218,6 +218,7 @@
 
     <fieldset style="margin-top:1.5rem">
       <legend>6 · Afterwards</legend>
+      <div class="check"><input type="checkbox" id="wantRestart" checked><label for="wantRestart">Restart the agent when done so it loads the new settings (works when it runs under pm2, launchd, systemd, or as a node process started in its folder; otherwise you&rsquo;re told to restart it)</label></div>
       <div class="check"><input type="checkbox" id="revokeAfter" checked><label for="revokeAfter">Revoke the connector's Compliance Administrator and Exchange access once provisioning finishes — the runtime needs neither.</label></div>
     </fieldset>
   </form>
@@ -459,7 +460,7 @@ function answers() {
     messagingEndpoint: or("messagingEndpoint", $("agentUrl").value.trim().replace(/\/+$/, "") + "/api/messages"),
     agentDescription: or("agentDescription", `${name} — governed by Microsoft Agent 365`),
     wantTeams: $("wantAgent365").checked && $("wantTeams").checked,
-    revokeAfter: $("revokeAfter").checked,
+    revokeAfter: $("revokeAfter").checked, wantRestart: $("wantRestart").checked,
     reuseExistingApp: true, replaceInstance: false,
     proceed: true,
   };
