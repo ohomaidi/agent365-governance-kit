@@ -414,13 +414,22 @@ async function run(dryRun) {
     // Pull the reason out of the log rather than telling them to go and find it.
     const fatal = [...lines].reverse().find((l) => l.trim().startsWith("\u2717"));
     const warns = lines.filter((l) => l.trim().startsWith("!")).slice(-3);
-    const created = lines.filter((l) => /^\s+\u2022 /.test(l));
+    // Only what was ACTUALLY created — i.e. lines after the wizard's journal
+    // header. The "About to provision" summary uses the same bullet character,
+    // and scooping both up reports work that never happened.
+    const jStart = lines.findIndex((l) => /Created before stopping/i.test(l));
+    const created = jStart === -1 ? []
+      : lines.slice(jStart + 1).filter((l) => /^\s*\u2022 /.test(l));
 
     let html = `<strong>${fatal ? fatal.replace(/^\s*\u2717\s*/, "") : `Setup stopped (exit ${code}).`}</strong>`;
     const hint = fatal && HINTS.find(([re]) => re.test(fatal));
     if (hint) html += `<div style="margin-top:.45rem">${hint[1]}</div>`;
     if (warns.length) html += `<div style="margin-top:.5rem" class="hint">${warns.map(w => w.replace(/^\s*!\s*/, "")).join("<br>")}</div>`;
-    if (created.length) html += `<div style="margin-top:.5rem">Created before stopping — undo if you want a clean slate:<br>${created.join("<br>")}</div>`;
+    if (created.length) {
+      html += `<div style="margin-top:.5rem">Actually created before stopping — undo these for a clean slate:<br>${created.join("<br>")}</div>`;
+    } else {
+      html += `<div style="margin-top:.5rem" class="hint">Nothing was created in your tenant.</div>`;
+    }
     $("errBox").innerHTML = html;
     $("errBox").hidden = false;
     $("errBox").scrollIntoView({ behavior: "smooth", block: "nearest" });
