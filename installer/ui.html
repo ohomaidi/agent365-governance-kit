@@ -200,6 +200,7 @@
       <div class="check"><input type="checkbox" id="wantAgent365" checked><label for="wantAgent365"><strong>Register in Agent 365</strong> — identity blueprint, agent identity, inheritable permissions, registry entry (shows under Agents → All agents).</label></div>
       <div id="a365Fields">
         <div class="row" style="margin-top:.6rem"><label for="agentDescription">One-line description</label><input type="text" id="agentDescription" placeholder="auto: &lt;name&gt; — governed by Microsoft Agent 365"><span class="hint">Shown in Teams and in the Agent 365 inventory.</span></div>
+        <div class="row"><label for="platformName">Platform name</label><input type="text" id="platformName" placeholder="Agent 365 Governance Kit"><span class="hint">What the Microsoft 365 admin center shows in the agent&rsquo;s <b>Platform</b> column (e.g. your product or team name).</span></div>
         <div class="check"><input type="checkbox" id="wantConsent" checked><label for="wantConsent">Grant tenant-wide admin consent to the Messaging Bot API, Observability API and Agent 365 Tools (needed for Teams delivery and the Activity tab)</label></div>
         <div class="check"><input type="checkbox" id="wantObservability" checked><label for="wantObservability">Turn on observability — turns appear in the Agent 365 Activity tab</label></div>
         <div class="check"><input type="checkbox" id="wantTeams" checked><label for="wantTeams"><strong>Publish to Teams</strong></label></div>
@@ -524,6 +525,7 @@ function answers() {
     existingBlueprintId: $("existingBlueprintId").value,
     messagingEndpoint: or("messagingEndpoint", $("agentUrl").value.trim().replace(/\/+$/, "") + "/api/messages"),
     agentDescription: or("agentDescription", `${name} — governed by Microsoft Agent 365`),
+    platformName: or("platformName", "Agent 365 Governance Kit"),
     wantTeams: $("wantAgent365").checked && $("wantTeams").checked,
     revokeAfter: $("revokeAfter").checked, wantRestart: $("wantRestart").checked,
     reuseExistingApp: true, replaceInstance: false,

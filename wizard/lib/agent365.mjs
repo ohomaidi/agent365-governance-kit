@@ -152,6 +152,7 @@ export async function registerAgent(graph, opts, log = () => {}) {
   const {
     agentName, agentDescription, agentUrl, sponsorIds = [], ownerIds = [],
     managedByAppId, organization, skills = [],
+    originatingStore = "Agent 365 Governance Kit",   // the "Platform" column in the admin center
     sourceAgentId = slugify(agentName),
     existingBlueprintId = "",
   } = opts;
@@ -331,7 +332,7 @@ export async function registerAgent(graph, opts, log = () => {}) {
       () => graph("POST", "/beta/copilot/agentRegistrations", buildRegistrationPayload({
         displayName: agentName, description: agentDescription, sourceAgentId,
         ownerIds: owners, createdBy, managedByAppId,
-        agentIdentityId: ident.id, agentIdentityBlueprintId: bp.appId, card,
+        agentIdentityId: ident.id, agentIdentityBlueprintId: bp.appId, card, originatingStore,
       })),
       log, "registration");
     r.steps.push(`registered in Agent 365 as ${reg.id}`);

@@ -656,7 +656,7 @@ async function main(work) {
   const wantAgent365 = await yes("Register this agent in Agent 365?", true, "wantAgent365");
 
   let agentName = "", agentUrl = "", sponsorUpn = "", existingBlueprintId = "", transport = "JSONRPC", messagingEndpoint = "";
-  let wantTeams = false, agentDescription = "";
+  let wantTeams = false, agentDescription = "", platformName = "";
   let wantConsent = false, wantObservability = false, teamsPublish = false, teamsInstall = false, teamsEndpoint = false, teamsHello = false, teamsMode = "teammate", wantLicence = true;
   if (wantAgent365) {
     agentName = await ask("  Agent display name:", purviewAppName, "agentName");
@@ -673,6 +673,7 @@ async function main(work) {
     existingBlueprintId = await ask("  Reuse an existing blueprint object id [blank = create new]:", "", "existingBlueprintId");
     messagingEndpoint = await ask("  Messaging endpoint (where Teams delivers messages):", `${agentUrl.replace(/\/+$/, "")}/api/messages`, "messagingEndpoint");
     agentDescription = await ask("  One-line description (shown in Teams):", `${agentName} — governed by Microsoft Agent 365`, "agentDescription");
+    platformName = await ask("  Platform name (the admin center's \"Platform\" column):", "Agent 365 Governance Kit", "platformName");
     wantConsent = await yes("  Grant tenant-wide admin consent (Messaging Bot API, Observability API, Agent 365 Tools)?", true, "wantConsent");
     wantObservability = await yes("  Turn on observability (Agent 365 Activity tab)?", true, "wantObservability");
     wantTeams = await yes("  Publish to Teams?", true, "wantTeams");
@@ -932,6 +933,7 @@ async function main(work) {
         ownerIds: [sponsorId],
         managedByAppId: appId,
         organization: purviewAppName,
+        originatingStore: platformName || "Agent 365 Governance Kit",
         existingBlueprintId,
         // Consent the blueprint principal BEFORE the identity exists, so the
         // identity inherits it; then consent the identity itself as well.

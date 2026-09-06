@@ -66,6 +66,10 @@ to verify. Nothing on this list is a manual step.
 
 ### In Agent 365
 
+The admin center's **Platform** column shows the registration's originating
+store. The installer asks for it (*Platform name*, default "Agent 365
+Governance Kit"), so a product or team name can appear there instead.
+
 9. **Agent identity blueprint** (`applications/microsoft.graph.agentIdentityBlueprint`)
    with a sponsor, a secret, and the identifier URI `api://botid-<appId>` with
    an `access_as_user` scope — what Microsoft's own `a365` CLI configures.
